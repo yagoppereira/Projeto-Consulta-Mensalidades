@@ -100,34 +100,45 @@ def extrair_serial_de_texto(texto: str):
     return m.group(1) if m else None
 
 
-def cruzar_contratos_com_equipamentos(df_contratos, df_equipamentos, coluna_origem="Descricao"):
+def ordenar_equipamentos_por_contrato(df_contratos, df_equipamentos, coluna_origem="Descricao"):
     """
-    Adiciona a coluna 'Equipamento (cruzado)' na tabela de contratos,
-    tentando achar qual equipamento físico corresponde a cada linha —
-    via o número de série mencionado na descrição do contrato, cruzado
-    com serial_equipamento da tabela de equipamentos. Fica em branco
-    quando não acha correspondência (não força um match errado).
+    Reordena a tabela de EQUIPAMENTOS pra seguir a mesma ordem da tabela
+    de CONTRATOS, sempre que dá pra cruzar (via número de série
+    mencionado na descrição do contrato, batendo com serial_equipamento).
+    Assim a correspondência fica visual — as duas tabelas lado a lado,
+    linha com linha — sem precisar de uma coluna de texto extra cruzando
+    as duas (isso poluía demais a tabela de contratos, com nomes de
+    local longos deixando a leitura pesada).
+    Equipamentos sem contrato correspondente ficam no final, na ordem
+    original.
     """
-    df = df_contratos.copy()
-    if df_equipamentos is None or df_equipamentos.empty or coluna_origem not in df.columns:
-        df["Equipamento (cruzado)"] = ""
-        return df
+    if df_equipamentos is None or df_equipamentos.empty or coluna_origem not in df_contratos.columns:
+        return df_equipamentos
 
-    mapa_serial_para_texto = {}
-    for serial, grupo in df_equipamentos.groupby(df_equipamentos["serial_equipamento"].astype(str)):
-        locais = grupo["local_nome"].dropna().unique()
-        bombas = grupo["bomba_nome"].dropna().unique()
-        if len(locais) == 1:
-            mapa_serial_para_texto[serial] = f"{locais[0]} — {', '.join(bombas)}"
-        else:
-            mapa_serial_para_texto[serial] = ", ".join(locais)
+    seriais_na_ordem_do_contrato = [
+        extrair_serial_de_texto(t) for t in df_contratos[coluna_origem]
+    ]
+    seriais_na_ordem_do_contrato = [s for s in seriais_na_ordem_do_contrato if s]
 
-    def _resolver(texto):
-        serial = extrair_serial_de_texto(texto)
-        return mapa_serial_para_texto.get(serial, "") if serial else ""
+    df_eq = df_equipamentos.copy()
+    df_eq["_serial_str"] = df_eq["serial_equipamento"].astype(str)
 
-    df["Equipamento (cruzado)"] = df[coluna_origem].apply(_resolver)
-    return df
+    blocos_ordenados = []
+    seriais_ja_usados = set()
+    for serial in seriais_na_ordem_do_contrato:
+        if serial in seriais_ja_usados:
+            continue
+        bloco = df_eq[df_eq["_serial_str"] == serial]
+        if len(bloco):
+            blocos_ordenados.append(bloco)
+            seriais_ja_usados.add(serial)
+
+    restante = df_eq[~df_eq["_serial_str"].isin(seriais_ja_usados)]
+    if blocos_ordenados:
+        resultado = pd.concat(blocos_ordenados + [restante], ignore_index=True)
+    else:
+        resultado = df_eq
+    return resultado.drop(columns=["_serial_str"])
 
 
 def parse_data_flexivel(serie: pd.Series) -> pd.Series:
@@ -2409,17 +2420,17 @@ def relatorio_cliente(
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
-                contratos_ativos_cruzado = cruzar_contratos_com_equipamentos(contratos_ativos, equipamentos)
                 st.dataframe(
-                    renomear_para_exibicao(contratos_ativos_cruzado[[
-                        "Descricao_Material", "Descricao", "Equipamento (cruzado)", "Mensalidade", "diaVencimento", "observacao",
+                    renomear_para_exibicao(contratos_ativos[[
+                        "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao",
                     ]]),
                     use_container_width=True, hide_index=True,
                 )
             with col_b:
                 st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
                 if len(equipamentos):
-                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+                    equipamentos_ordenados = ordenar_equipamentos_por_contrato(contratos_ativos, equipamentos)
+                    st.dataframe(_tabela_equipamentos_colorida(equipamentos_ordenados), use_container_width=True, hide_index=True)
                 else:
                     st.caption("Nenhum equipamento.")
         else:
