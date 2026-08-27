@@ -2598,8 +2598,24 @@ with st.form("busca_cliente_form"):
     with col1:
         buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
 
+# guarda o cliente buscado (e as opções escolhidas) em session_state — o
+# Streamlit reroda o script INTEIRO a cada interação, inclusive quando
+# se clica num ponto do gráfico (recurso de detalhe do ponto clicado).
+# Sem guardar isso aqui, a variável `buscar_clicado` volta a ser False
+# em qualquer rerun que não seja o exato clique no botão "Buscar", e a
+# tela inteira do cliente sumia — parecia que "resetava a pesquisa",
+# porque, tecnicamente, resetava mesmo: o relatório só era desenhado
+# dentro do `if buscar_clicado`.
 if buscar_clicado:
     if not identificador_input.strip():
         st.warning("Digite um cliente pra buscar.")
+        st.session_state["identificador_buscado"] = None
     else:
-        relatorio_cliente(identificador_input.strip(), mostrar_eventos_cancelamento=mostrar_eventos_cancelamento_input)
+        st.session_state["identificador_buscado"] = identificador_input.strip()
+        st.session_state["mostrar_eventos_cancelamento"] = mostrar_eventos_cancelamento_input
+
+if st.session_state.get("identificador_buscado"):
+    relatorio_cliente(
+        st.session_state["identificador_buscado"],
+        mostrar_eventos_cancelamento=st.session_state.get("mostrar_eventos_cancelamento", True),
+    )
