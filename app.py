@@ -73,6 +73,25 @@ def formatar_moeda(valor: float) -> str:
     return f"R$ {s}"
 
 
+def mostrar_tabela_com_download(df_ou_styler, nome_arquivo: str, chave: str, **kwargs_dataframe):
+    """
+    Mostra a tabela normalmente (st.dataframe) E, logo abaixo, um botão de
+    download em CSV com ';' como separador — o ícone de exportar que o
+    Streamlit já mostra nativamente ao passar o mouse na tabela SEMPRE usa
+    vírgula e não dá pra configurar, o que abre errado no Excel BR (que
+    espera ';', já que a vírgula é o separador decimal por aqui). Esse
+    botão próprio resolve isso; o ícone nativo continua existindo do lado
+    (não dá pra removê-lo), mas agora tem a opção certa também.
+    """
+    df_exportar = df_ou_styler.data if hasattr(df_ou_styler, "data") else df_ou_styler
+    st.dataframe(df_ou_styler, **kwargs_dataframe)
+    csv_bytes = df_exportar.to_csv(sep=";", index=False).encode("utf-8-sig")  # utf-8-sig: Excel BR abre acentuação certo
+    st.download_button(
+        "⬇️ Baixar CSV (separado por ;)", data=csv_bytes, file_name=nome_arquivo,
+        mime="text/csv", key=chave,
+    )
+
+
 def parse_data_flexivel(serie: pd.Series) -> pd.Series:
     """
     Datas vindas do Google Sheets podem voltar tanto em ISO (quando o
@@ -1249,13 +1268,15 @@ def plotar_historico_multi(
     def _relayout_do_filtro(indice_selecionado, rotulo_filtro):
         return {**_estilo_dos_3_botoes(indice_selecionado), "title.text": _titulo_com_filtro(rotulo_filtro)}
 
-    # posições fixas lado a lado (âncora à esquerda, com folga generosa
-    # entre elas — cada rótulo tem um tamanho bem diferente: "Todos" é
-    # curto, "Só Encerrados" é bem mais longo)
+    # posições fixas lado a lado (âncora à esquerda) — a primeira
+    # tentativa deixou folga grande demais entre os botões (achando que
+    # precisava de mais "colchão" de segurança contra sobreposição);
+    # aperta bem mais aqui, ficando com cara de grupo de abas coladas,
+    # não botões soltos e desalinhados
     _config_botoes = [
-        ("Todos", None, 0, 0.775),
-        ("Só Ativos", "A", 1, 0.828),
-        ("Só Encerrados", "E", 2, 0.901),
+        ("Todos", None, 0, 0.800),
+        ("Só Ativos", "A", 1, 0.833),
+        ("Só Encerrados", "E", 2, 0.882),
     ]
 
     updatemenus_filtro = []
@@ -1273,7 +1294,7 @@ def plotar_historico_multi(
             bordercolor=COR_BOTAO_ATIVO_BORDA if ativo_inicial else COR_BOTAO_INATIVO_BORDA,
             borderwidth=1,
             font=dict(size=13, color="#F1F1F1"),
-            pad=dict(t=8, b=8, l=10, r=10),
+            pad=dict(t=8, b=8, l=8, r=8),
         ))
 
     passo = max(1, len(todos_meses_str) // 24)
@@ -1546,14 +1567,23 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
     else:
         linhas.append("**Valor médio por equipamento:** N/D (sem equipamentos cadastrados como pagante)")
 
+    # "Principal motivo de cancelamento" (com contagem simples) foi
+    # removido — mesmo motivo da linha "Grupos de contrato no gráfico"
+    # que já tinha saído daqui: um número baixo (ex: "1 contrato(s)") não
+    # é um sinal útil por si só, e pode até enganar (parece indicar perda
+    # de cliente quando às vezes é só uma baixa administrativa, tipo um
+    # cancelamento parcial de um componente de um grupo que continua
+    # ativo). A informação individual continua na tabela de itens/
+    # contratos encerrados, lá embaixo. O que vale destacar aqui é só o
+    # PADRÃO (5+ contratos com o mesmo motivo administrativo) — isso sim
+    # é um sinal real de algo sistemático acontecendo.
     motivos = contratos.loc[contratos["situacaoContrato"] == "E", "Descricao_Cancelamento"].value_counts()
     if len(motivos):
         principal = motivos.index[0]
-        linhas.append(f"**Principal motivo de cancelamento:** {principal} ({motivos.iloc[0]} contrato(s))")
         if motivos.iloc[0] >= 5 and principal in ("CONTRATO ESTAVA COM ERRO", "CONTRATO DUPLICADO"):
             linhas.append(
-                "> Padrão de contratos recriados por erro cadastral detectado — "
-                "os valores desses contratos foram agrupados em 'Outros' no gráfico."
+                f"**Padrão de contratos recriados detectado:** {motivos.iloc[0]} contrato(s) cancelado(s) "
+                f"por '{principal}' — os valores desses contratos foram agrupados em 'Outros' no gráfico."
             )
 
     datas_validas = contratos["primeira_parcela"].dropna()
@@ -2053,25 +2083,39 @@ def relatorio_cliente(
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
-                st.dataframe(contratos_ativos[[
-                    "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao",
-                ]], use_container_width=True, hide_index=True)
+                mostrar_tabela_com_download(
+                    contratos_ativos[["Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao"]],
+                    f"contratos_ativos_{nome_cliente}.csv", "download_contratos_ativos",
+                    use_container_width=True, hide_index=True,
+                )
             with col_b:
                 st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
                 if len(equipamentos):
-                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+                    mostrar_tabela_com_download(
+                        _tabela_equipamentos_colorida(equipamentos),
+                        f"equipamentos_{nome_cliente}.csv", "download_equip_1",
+                        use_container_width=True, hide_index=True,
+                    )
                 else:
                     st.caption("Nenhum equipamento.")
         else:
             st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
             if len(equipamentos):
-                st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+                mostrar_tabela_com_download(
+                    _tabela_equipamentos_colorida(equipamentos),
+                    f"equipamentos_{nome_cliente}.csv", "download_equip_2",
+                    use_container_width=True, hide_index=True,
+                )
             else:
                 st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
     else:
         st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
         if len(equipamentos):
-            st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+            mostrar_tabela_com_download(
+                _tabela_equipamentos_colorida(equipamentos),
+                f"equipamentos_{nome_cliente}.csv", "download_equip_3",
+                use_container_width=True, hide_index=True,
+            )
         else:
             st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
 
@@ -2120,11 +2164,15 @@ def relatorio_cliente(
     qtd_encerrados_itens = (contratos["situacaoContrato"] == "E").sum()
     qtd_encerrados_grupos = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].nunique()
     st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))", anchor=False)
-    st.dataframe(contratos[contratos["situacaoContrato"] == "E"][[
-        "codigoContrato", "Descricao_Material", "Descricao",
-        "Descricao_Cancelamento", "Data Cancelamento", "Data Criação",
-        "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
-    ]].sort_values("codigoContrato"), use_container_width=True, hide_index=True)
+    mostrar_tabela_com_download(
+        contratos[contratos["situacaoContrato"] == "E"][[
+            "codigoContrato", "Descricao_Material", "Descricao",
+            "Descricao_Cancelamento", "Data Cancelamento", "Data Criação",
+            "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
+        ]].sort_values("codigoContrato"),
+        f"contratos_encerrados_{nome_cliente}.csv", "download_encerrados",
+        use_container_width=True, hide_index=True,
+    )
 
 
 # ============================================================================
