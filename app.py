@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from googleapiclient.discovery import build
 import gspread
 from gspread_dataframe import get_as_dataframe
 import streamlit as st
@@ -26,11 +27,19 @@ st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wid
 # --- 1. Configuração ---
 PROJECT_ID = "hip-bonito-453017-m2"
 
+# SHEET_ID_BOMBAS / ABA_BOMBAS não são mais usadas pra CARREGAR dados —
+# o app busca equipamentos direto do DW agora (carregar_bombas_do_dw).
+# A planilha continua existindo e sendo usada por fora do app; deixamos
+# as constantes aqui só de referência, caso precise voltar a usá-la.
 SHEET_ID_BOMBAS = "1k_-lA-wBq4E9_qLuWFBQUGzUwfA56vtmIlWsPhw130Y"
 ABA_BOMBAS = "Bombas_Alocadas"
 
 SHEET_ID_MENSALIDADES = "1zzz2lXQ0aZuADYaA-uPMuQ58yUBhEqO8H-KdOYwEmWY"
 ABA_MENSALIDADES = "Base_Clientes"
+# idem — não são mais usadas pra carregar dados, o app busca contratos
+# direto do DW agora (buscar_itens_contrato_do_dw / carregar_diretorio_
+# clientes_dw). A planilha continua existindo e sendo usada por fora do
+# app; deixamos as constantes de referência.
 
 PRIORIDADE_TIPO = ["E", "c", "R"]
 TAMANHO_CODIGO_CONTRATO = 8
@@ -124,14 +133,20 @@ def obter_clientes():
         scopes=[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/spreadsheets.readonly",
+            # metadata.readonly (não drive.readonly completo) — só o
+            # suficiente pra perguntar "quando essa planilha foi
+            # modificada pela última vez", sem dar acesso a conteúdo de
+            # outros arquivos do Drive
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
         ],
     )
     client_bq = bigquery.Client(project=PROJECT_ID, credentials=creds)
     client_gs = gspread.authorize(creds)
-    return client_bq, client_gs
+    client_drive = build("drive", "v3", credentials=creds)
+    return client_bq, client_gs, client_drive
 
 
-client_bq, client_gs = (None, None) if MODO_DEMO else obter_clientes()
+client_bq, client_gs, client_drive = (None, None, None) if MODO_DEMO else obter_clientes()
 
 
 def cnpj_invalido(cnpj: str) -> bool:
@@ -219,37 +234,308 @@ def gerar_planilhas_demo():
     return pd.DataFrame(linhas_mensalidades), pd.DataFrame(linhas_bombas)
 
 
-@st.cache_data(ttl=3600, show_spinner="Carregando planilhas (Base_Clientes + Bombas_Alocadas)...")
+@st.cache_data(ttl=1800, show_spinner=False)
+def obter_data_ultima_modificacao(sheet_id: str):
+    """
+    Pergunta pra API do Drive quando essa planilha foi modificada pela
+    última vez — a API do Sheets/gspread não expõe isso diretamente, só
+    a do Drive (files.get com fields='modifiedTime'). Cache curto (30 min)
+    porque essa informação é barata de buscar e a gente quer refletir uma
+    atualização recente sem esperar 1h (o cache das planilhas em si).
+    Retorna um datetime (UTC) ou None se não conseguir descobrir.
+    """
+    if MODO_DEMO or client_drive is None:
+        return None
+    try:
+        metadata = client_drive.files().get(fileId=sheet_id, fields="modifiedTime").execute()
+        return pd.to_datetime(metadata["modifiedTime"])
+    except Exception:
+        return None
+
+
+def mostrar_aviso_atualidade():
+    """
+    Agora que tanto Base_Clientes quanto Bombas_Alocadas foram migradas
+    pro DW direto (sem passar por planilha nenhuma), o app não depende
+    mais da atualidade de nenhuma planilha — os dois sempre refletem o
+    estado mais recente do BigQuery no momento da consulta. Esta função
+    fica só de "cabo solto" (não é mais chamada em lugar nenhum) — mantida
+    caso a gente volte a depender de alguma planilha no futuro.
+    """
+    return
+
+
+@st.cache_data(ttl=3600, show_spinner="Carregando equipamentos (direto do BigQuery)...")
+def carregar_bombas_do_dw():
+    """
+    Busca bombas alocadas DIRETO do DW (gold.bombas_alocadas + JOIN com
+    bronze.cigam__empresas pra nome/CNPJ) — sem passar pela planilha
+    Bombas_Alocadas. A planilha continua existindo e sendo atualizada
+    normalmente pra quem mais usa ela, só o APP não depende mais da
+    atualidade dela: aqui a gente sempre lê o dado mais recente do DW.
+
+    Já retorna exatamente as colunas que o resto do app espera
+    (bomba_nome, serial_equipamento, cliente_cigam_local,
+    cliente_cigam_pagante, local_nome, pagante_nome, local_cnpj,
+    pagante_cnpj) — mesmo formato de antes, só a origem que muda.
+    """
+    query = f"""
+    SELECT
+      b.bomba_nome,
+      b.serial_equipamento,
+      CAST(b.cliente_cigam_local AS STRING) AS cliente_cigam_local,
+      CAST(b.cliente_cigam_pagante AS STRING) AS cliente_cigam_pagante,
+      local.nomeCompleto AS local_nome,
+      pagante.nomeCompleto AS pagante_nome,
+      CAST(local.cnpjCpf AS STRING) AS local_cnpj,
+      CAST(pagante.cnpjCpf AS STRING) AS pagante_cnpj
+    FROM `{PROJECT_ID}.gold.bombas_alocadas` b
+    LEFT JOIN `{PROJECT_ID}.bronze.cigam__empresas` local
+      ON CAST(b.cliente_cigam_local AS STRING) = CAST(local.codigo AS STRING)
+    LEFT JOIN `{PROJECT_ID}.bronze.cigam__empresas` pagante
+      ON CAST(b.cliente_cigam_pagante AS STRING) = CAST(pagante.codigo AS STRING)
+    """
+    return client_bq.query(query).to_dataframe(create_bqstorage_client=False)
+
+
+@st.cache_data(ttl=3600, show_spinner="Carregando diretório de clientes (direto do BigQuery)...")
+def carregar_diretorio_clientes_dw():
+    """
+    Versão LEVE (só codigo_cliente, nome, CNPJ — sem os itens de cada
+    contrato) de cigam__contratos + cigam__empresas, usada só pra RESOLVER
+    quem é o cliente (busca por nome/código/CNPJ em buscar_cliente). Os
+    itens de contrato de verdade são buscados sob demanda, só do cliente
+    já resolvido, por buscar_itens_contrato_do_dw — não faz sentido puxar
+    o parcelasPadrao_json de TODOS os contratos só pra montar uma lista
+    de nomes pra busca.
+    """
+    query = f"""
+    SELECT DISTINCT
+      SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) AS codigo_cliente,
+      COALESCE(c.cliente.nomeCompleto, c.contratante.nomeCompleto) AS Cliente_Nome,
+      REGEXP_REPLACE(CAST(e.cnpjCpf AS STRING), r'\\D', '') AS _cnpj_norm
+    FROM `{PROJECT_ID}.bronze.cigam__contratos` c
+    LEFT JOIN `{PROJECT_ID}.bronze.cigam__empresas` e
+      ON SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) = SAFE_CAST(e.codigo AS INT64)
+    WHERE COALESCE(c.cliente.codigo, c.contratante.codigo) IS NOT NULL
+    """
+    df = client_bq.query(query).to_dataframe(create_bqstorage_client=False)
+    df["codigo_cliente"] = pd.to_numeric(df["codigo_cliente"], errors="coerce").astype("Int64")
+    df.loc[df["_cnpj_norm"].apply(cnpj_invalido), "_cnpj_norm"] = ""
+    return df
+
+
+def _mapa_material_e_cancelamento():
+    """Mesmas tabelas do script que alimentava a Base_Clientes."""
+    mapa_material = {
+        "90000100001": "LICENCIAMENTO", "90000100002": "ALUGUEL", "90000100010": "ALUGUEL",
+        "90000100012": "LICENCIAMENTO PEDESTAL SIMPLES", "90000100013": "LICENCIAMENTO PEDESTAL DUPLO",
+        "90000100014": "LICENCIAMENTO PEDESTAL TRIPLO", "90000100015": "LICENCIAMENTO PEDESTAL QUADRUPLO",
+        "90000100016": "LICENCIAMENTO MOBILE SIMPLES", "90000100017": "LICENCIAMENTO MOBILE DUPLO",
+        "90000100018": "LICENCIAMENTO JOBSITE SIMPLES", "90000100019": "LICENCIAMENTO JOBSITE DUPLO",
+        "90000100020": "LICENCIAMENTO JOBSITE TRIPLO", "90000100021": "LICENCIAMENTO JOBSITE QUADRUPLO",
+        "90000100022": "LICENCIAMENTO SONDA", "90000100023": "LICENCIAMENTO DATA BI",
+    }
+    mapa_cancelamento = {
+        "01": "SOLICITOU CANCELAMENTO", "02": "TROCOU CNPJ FATURAMENTO", "03": "CONTRATO DUPLICADO",
+        "04": "CONTRATO ESTAVA COM ERRO", "05": "UNIFICAÇÃO DE CONTRATOS", "06": "INADIMPLÊNCIA FINANCEIRA",
+    }
+    return mapa_material, mapa_cancelamento
+
+
+@st.cache_data(ttl=1800, show_spinner="Buscando contratos do cliente (direto do BigQuery)...")
+def buscar_itens_contrato_do_dw(codigos_cliente: tuple) -> pd.DataFrame:
+    """
+    Busca os itens/contratos ATUAIS de um ou mais codigo_cliente (tupla,
+    não lista — pra dar pra cachear) — validado contra o script que
+    alimentava a Base_Clientes: mesma extração de parcelasPadrao_json,
+    mesmo mapeamento de material/motivo de cancelamento, mesma
+    unificação aluguel+licenciamento (janela ±5, só entre contratos
+    ATIVOS). Testado ponta a ponta com clientes reais e bateu 100% com o
+    que já estava na planilha.
+
+    NÃO inclui primeira_parcela/ultima_parcela (isso ficou fora de
+    escopo por enquanto) — quem usa esse resultado precisa lidar com a
+    ausência dessas duas colunas com graça (o resumo do cliente já faz
+    isso, mostrando "Período coberto" só quando a informação existe).
+    """
+    if MODO_DEMO:
+        return df_mensalidades_demo[df_mensalidades_demo["codigo_cliente"].isin(codigos_cliente)].copy()
+
+    query = f"""
+    SELECT
+      c.codigoContrato,
+      SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) AS codigo_cliente,
+      COALESCE(c.cliente.nomeCompleto, c.contratante.nomeCompleto) AS cliente_nome,
+      c.situacaoContrato,
+      c.dataCriacao,
+      c.observacao,
+      c.contratoTerceiro,
+      c.motivoCancelamento,
+      c.diaVencimento,
+      c.parcelasPadrao_json,
+      CAST(e.cnpjCpf AS STRING) AS cnpjCpf
+    FROM `{PROJECT_ID}.bronze.cigam__contratos` c
+    LEFT JOIN `{PROJECT_ID}.bronze.cigam__empresas` e
+      ON SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) = SAFE_CAST(e.codigo AS INT64)
+    WHERE SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) IN UNNEST(@codigos)
+      AND c.parcelasPadrao_json IS NOT NULL
+      AND c.parcelasPadrao_json != ''
+      AND c.parcelasPadrao_json != '[]'
+      AND c.parcelasPadrao_json != 'null'
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    df_raw = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df_raw.empty:
+        return pd.DataFrame(columns=[
+            "codigoContrato", "codigo_cliente", "CNPJ_CPF", "Codigo_Material", "Descricao_Material",
+            "Quantidade", "Preco_Unitario", "Descricao", "Cliente_Nome",
+            "observacao", "contratoTerceiro", "situacaoContrato",
+            "dataCriacao", "motivoCancelamento", "Descricao_Cancelamento", "diaVencimento",
+        ])
+
+    df_raw["cnpjCpf"] = df_raw["cnpjCpf"].apply(formatar_cpf_cnpj_texto_puro)
+
+    def _extrair_itens(row):
+        linhas = []
+        try:
+            parcelas = json.loads(row["parcelasPadrao_json"])
+            if not isinstance(parcelas, list):
+                parcelas = [parcelas]
+            for p in parcelas:
+                if isinstance(p, dict):
+                    linhas.append({
+                        "codigoContrato": str(row.get("codigoContrato", "")).strip(),
+                        "codigo_cliente": row.get("codigo_cliente"),
+                        "CNPJ_CPF": row.get("cnpjCpf"),
+                        "Cliente_Nome": row.get("cliente_nome"),
+                        "situacaoContrato": str(row.get("situacaoContrato", "")).strip(),
+                        "dataCriacao": row.get("dataCriacao"),
+                        "observacao": row.get("observacao"),
+                        "contratoTerceiro": row.get("contratoTerceiro"),
+                        "motivoCancelamento": row.get("motivoCancelamento"),
+                        "diaVencimento": row.get("diaVencimento"),
+                        "Codigo_Material": str(p.get("codigoMaterial", "")).strip(),
+                        "Quantidade": p.get("quantidade"),
+                        "Preco_Unitario": p.get("precoUnitario"),
+                        "Descricao": p.get("descricao"),
+                        "codigo_num": pd.to_numeric(str(row.get("codigoContrato", "")).lstrip("0"), errors="coerce"),
+                    })
+            return linhas
+        except Exception:
+            return []
+
+    todas_linhas = []
+    for _, row in df_raw.iterrows():
+        todas_linhas.extend(_extrair_itens(row))
+
+    df = pd.DataFrame(todas_linhas)
+    if df.empty:
+        return df
+
+    mapa_material, mapa_cancelamento = _mapa_material_e_cancelamento()
+    df["Quantidade"] = pd.to_numeric(df["Quantidade"], errors="coerce")
+    df["Preco_Unitario"] = pd.to_numeric(df["Preco_Unitario"], errors="coerce")
+    df["Descricao_Material"] = df["Codigo_Material"].map(mapa_material)
+    df["Descricao_Cancelamento"] = df["motivoCancelamento"].astype(str).map(mapa_cancelamento)
+
+    # unificação aluguel+licenciamento — mesma janela ±5, só pareia
+    # aluguéis ATIVOS (igual ao script original: contrato encerrado não
+    # entra nessa unificação automática, fica como linha própria)
+    JANELA = 5
+    is_ativo = df["situacaoContrato"].str.upper().str.startswith("A")
+    alugueis_a = df[(df["Descricao_Material"] == "ALUGUEL") & is_ativo].copy()
+
+    linhas_unificadas, idx_alug_usados, idx_lic_usados = [], set(), set()
+    for idx_alug, alug in alugueis_a.iterrows():
+        cod_alug = alug["codigo_num"]
+        candidatos = df[
+            (df["Descricao_Material"].str.contains("LICENCIAMENTO", na=False))
+            & (df["codigo_num"].between(cod_alug - JANELA, cod_alug + JANELA))
+            & (~df.index.isin(idx_alug_usados)) & (~df.index.isin(idx_lic_usados))
+        ].copy()
+        if len(candidatos) > 0:
+            candidatos["distancia"] = (candidatos["codigo_num"] - cod_alug).abs()
+            idx_lic = candidatos.sort_values("distancia").index[0]
+            lic = df.loc[idx_lic]
+            codigo_unificado = f"{sem_zeros_esquerda(alug['codigoContrato'])}/{sem_zeros_esquerda(lic['codigoContrato'])}"
+            linhas_unificadas.append({
+                "codigoContrato": codigo_unificado, "codigo_cliente": lic["codigo_cliente"],
+                "CNPJ_CPF": lic["CNPJ_CPF"], "Codigo_Material": f"{alug['Codigo_Material']}/{lic['Codigo_Material']}",
+                "Descricao_Material": "Mensalidade Unificada", "Quantidade": lic["Quantidade"],
+                "Preco_Unitario": alug["Preco_Unitario"] + lic["Preco_Unitario"], "Descricao": lic["Descricao"],
+                "Cliente_Nome": lic["Cliente_Nome"], "observacao": lic["observacao"],
+                "contratoTerceiro": lic["contratoTerceiro"], "situacaoContrato": lic["situacaoContrato"],
+                "dataCriacao": lic["dataCriacao"], "motivoCancelamento": lic["motivoCancelamento"],
+                "Descricao_Cancelamento": lic.get("Descricao_Cancelamento"), "diaVencimento": lic["diaVencimento"],
+            })
+            idx_alug_usados.add(idx_alug)
+            idx_lic_usados.add(idx_lic)
+
+    df_restante = df[~df.index.isin(idx_alug_usados) & ~df.index.isin(idx_lic_usados)].copy()
+    df_restante["codigoContrato"] = df_restante["codigoContrato"].apply(sem_zeros_esquerda)
+    df_final = pd.concat([df_restante, pd.DataFrame(linhas_unificadas)], ignore_index=True)
+
+    return df_final[[
+        "codigoContrato", "codigo_cliente", "CNPJ_CPF", "Codigo_Material", "Descricao_Material",
+        "Quantidade", "Preco_Unitario", "Descricao", "Cliente_Nome",
+        "observacao", "contratoTerceiro", "situacaoContrato",
+        "dataCriacao", "motivoCancelamento", "Descricao_Cancelamento", "diaVencimento",
+    ]]
+
+
+def sem_zeros_esquerda(codigo):
+    s = str(codigo).strip()
+    s_limpo = s.lstrip("0")
+    return s_limpo if s_limpo else "0"
+
+
+def formatar_cpf_cnpj_texto_puro(valor):
+    """Só os dígitos, sem máscara — a formatação visual (pontuação) fica
+    a cargo de quem exibe, não de quem busca o dado."""
+    if valor is None or pd.isna(valor):
+        return None
+    s = str(valor).strip()
+    if s == "" or s.lower() == "none":
+        return None
+    if s.endswith(".0"):
+        s = s[:-2]
+    apenas_digitos = "".join(ch for ch in s if ch.isdigit())
+    return apenas_digitos or None
+
+
+@st.cache_data(ttl=3600, show_spinner="Carregando dados de clientes...")
 def carregar_dados_base():
     if MODO_DEMO:
         df_mensalidades, df_bombas = gerar_planilhas_demo()
+        df_mensalidades["codigo_cliente"] = pd.to_numeric(df_mensalidades["codigo_cliente"], errors="coerce").astype("Int64")
+        df_mensalidades["Preco_Unitario"] = pd.to_numeric(df_mensalidades["Preco_Unitario"], errors="coerce")
+        df_mensalidades["situacaoContrato"] = df_mensalidades["situacaoContrato"].astype(str).str.strip().str.upper()
+        df_mensalidades["primeira_parcela"] = parse_data_flexivel(df_mensalidades["primeira_parcela"])
+        df_mensalidades["ultima_parcela"] = parse_data_flexivel(df_mensalidades["ultima_parcela"])
+        df_mensalidades["_cnpj_norm"] = df_mensalidades["CNPJ_CPF"].astype(str).str.replace(r"\D", "", regex=True)
+        df_mensalidades.loc[df_mensalidades["_cnpj_norm"].apply(cnpj_invalido), "_cnpj_norm"] = ""
+        diretorio_clientes = df_mensalidades[["codigo_cliente", "Cliente_Nome", "_cnpj_norm"]].drop_duplicates(subset="codigo_cliente").copy()
     else:
-        df_mensalidades = carregar_aba(SHEET_ID_MENSALIDADES, ABA_MENSALIDADES)
-        df_bombas = carregar_aba(SHEET_ID_BOMBAS, ABA_BOMBAS)
-
-    df_mensalidades["codigo_cliente"] = pd.to_numeric(df_mensalidades["codigo_cliente"], errors="coerce").astype("Int64")
-    df_mensalidades["Preco_Unitario"] = pd.to_numeric(df_mensalidades["Preco_Unitario"], errors="coerce")
-    df_mensalidades["situacaoContrato"] = df_mensalidades["situacaoContrato"].astype(str).str.strip().str.upper()
-    df_mensalidades["primeira_parcela"] = parse_data_flexivel(df_mensalidades["primeira_parcela"])
-    df_mensalidades["ultima_parcela"] = parse_data_flexivel(df_mensalidades["ultima_parcela"])
+        # em modo real, NÃO carregamos mais a Base_Clientes inteira — só
+        # o diretório leve (pra busca) + equipamentos direto do DW. Os
+        # itens de cada contrato são buscados sob demanda, só do cliente
+        # já resolvido, via buscar_itens_contrato_do_dw.
+        df_mensalidades = None
+        diretorio_clientes = carregar_diretorio_clientes_dw()
+        df_bombas = carregar_bombas_do_dw()
 
     df_bombas["cliente_cigam_pagante"] = pd.to_numeric(df_bombas["cliente_cigam_pagante"], errors="coerce").astype("Int64")
     df_bombas["cliente_cigam_local"] = pd.to_numeric(df_bombas["cliente_cigam_local"], errors="coerce").astype("Int64")
-
-    # colunas de CNPJ/CPF normalizadas (só dígitos) para permitir busca e
-    # consolidação de cadastros duplicados (mesmo CNPJ, codigo_cliente diferente)
-    df_mensalidades["_cnpj_norm"] = df_mensalidades["CNPJ_CPF"].astype(str).str.replace(r"\D", "", regex=True)
     df_bombas["_pagante_cnpj_norm"] = df_bombas["pagante_cnpj"].astype(str).str.replace(r"\D", "", regex=True)
-
-    # invalida placeholders (ex: '00.000.000/0000-00') nas colunas
-    # normalizadas, pra não serem usados na consolidação por CNPJ
-    df_mensalidades.loc[df_mensalidades["_cnpj_norm"].apply(cnpj_invalido), "_cnpj_norm"] = ""
     df_bombas.loc[df_bombas["_pagante_cnpj_norm"].apply(cnpj_invalido), "_pagante_cnpj_norm"] = ""
 
-    return df_mensalidades, df_bombas
+    return diretorio_clientes, df_mensalidades, df_bombas
 
 
-df_mensalidades, df_bombas = carregar_dados_base()
+diretorio_clientes, df_mensalidades_demo, df_bombas = carregar_dados_base()
 
 
 # --- 4. Localizar cliente por nome, código CIGAM ou CNPJ/CPF ---
@@ -261,7 +547,7 @@ def codigos_pelo_cnpj(cnpj: str) -> set:
     """Todos os codigo_cliente (nas duas bases) que têm esse CNPJ/CPF."""
     if cnpj_invalido(cnpj):
         return set()
-    m = df_mensalidades[df_mensalidades["_cnpj_norm"] == cnpj]
+    m = diretorio_clientes[diretorio_clientes["_cnpj_norm"] == cnpj]
     b = df_bombas[df_bombas["_pagante_cnpj_norm"] == cnpj]
     return set(m["codigo_cliente"].dropna().astype(int)) | set(b["cliente_cigam_pagante"].dropna().astype(int))
 
@@ -285,7 +571,7 @@ def buscar_cliente(identificador: str):
         if not codigos:
             st.error(f"Nenhum cliente encontrado com CNPJ/CPF {digitos}.")
             return None
-        m = df_mensalidades[df_mensalidades["codigo_cliente"].isin(codigos)]
+        m = diretorio_clientes[diretorio_clientes["codigo_cliente"].isin(codigos)]
         nome = m["Cliente_Nome"].iloc[0] if len(m) else \
             df_bombas[df_bombas["cliente_cigam_pagante"].isin(codigos)]["pagante_nome"].iloc[0]
         return sorted(codigos), nome, digitos
@@ -293,7 +579,7 @@ def buscar_cliente(identificador: str):
     # --- código CIGAM exato ---
     if identificador.isdigit():
         cod = int(identificador)
-        candidatos_m = df_mensalidades[df_mensalidades["codigo_cliente"] == cod]
+        candidatos_m = diretorio_clientes[diretorio_clientes["codigo_cliente"] == cod]
         candidatos_b = df_bombas[df_bombas["cliente_cigam_pagante"] == cod]
         if candidatos_m.empty and candidatos_b.empty:
             st.error(f"Nenhum cliente encontrado com código {cod}.")
@@ -307,7 +593,7 @@ def buscar_cliente(identificador: str):
         return [cod], nome, None
 
     # --- nome (parcial, case-insensitive) ---
-    m = df_mensalidades[df_mensalidades["Cliente_Nome"].str.upper().str.contains(identificador.upper(), na=False)]
+    m = diretorio_clientes[diretorio_clientes["Cliente_Nome"].str.upper().str.contains(identificador.upper(), na=False)]
     b = df_bombas[df_bombas["pagante_nome"].str.upper().str.contains(identificador.upper(), na=False)]
 
     candidatos = pd.concat([
@@ -1265,15 +1551,15 @@ def plotar_historico_multi(
     def _relayout_do_filtro(indice_selecionado, rotulo_filtro):
         return {**_estilo_dos_3_botoes(indice_selecionado), "title.text": _titulo_com_filtro(rotulo_filtro)}
 
-    # posições fixas lado a lado (âncora à esquerda) — a primeira
-    # tentativa deixou folga grande demais entre os botões (achando que
-    # precisava de mais "colchão" de segurança contra sobreposição);
-    # aperta bem mais aqui, ficando com cara de grupo de abas coladas,
-    # não botões soltos e desalinhados
+    # posições fixas lado a lado (âncora à esquerda) — a tentativa
+    # anterior apertou demais (o texto real ocupa mais espaço do que eu
+    # tinha estimado, então "Todos" e "Só Ativos" ficaram quase colados).
+    # Volta a abrir um pouco, com uma estimativa de largura de caractere
+    # mais generosa dessa vez.
     _config_botoes = [
-        ("Todos", None, 0, 0.800),
-        ("Só Ativos", "A", 1, 0.833),
-        ("Só Encerrados", "E", 2, 0.882),
+        ("Todos", None, 0, 0.780),
+        ("Só Ativos", "A", 1, 0.820),
+        ("Só Encerrados", "E", 2, 0.877),
     ]
 
     updatemenus_filtro = []
@@ -1951,7 +2237,15 @@ def relatorio_cliente(
     else:
         st.caption(f"Código CIGAM: {codigos_cliente[0]}")
 
-    contratos = df_mensalidades[df_mensalidades["codigo_cliente"].isin(codigos_cliente)].copy()
+    contratos = buscar_itens_contrato_do_dw(tuple(sorted(codigos_cliente)))
+    # primeira_parcela/ultima_parcela não vêm mais do caminho novo (DW
+    # direto — ficou fora do escopo da migração por enquanto). Só cria
+    # as colunas vazias quando elas realmente não existem (caminho novo);
+    # no modo demo elas já vêm preenchidas de verdade, não sobrescreve.
+    if "primeira_parcela" not in contratos.columns:
+        contratos["primeira_parcela"] = pd.NaT
+    if "ultima_parcela" not in contratos.columns:
+        contratos["ultima_parcela"] = pd.NaT
     contratos["Situação"] = contratos["situacaoContrato"].map(SITUACAO_CONTRATO_LABELS).fillna(contratos["situacaoContrato"])
     contratos["Mensalidade"] = contratos["Preco_Unitario"].apply(lambda v: formatar_moeda(v) if pd.notna(v) else "")
     contratos["dataCriacao"] = parse_data_flexivel(contratos["dataCriacao"])
@@ -2184,6 +2478,7 @@ def _renderizar_cabecalho():
 
 
 _renderizar_cabecalho()
+mostrar_aviso_atualidade()
 st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
 with st.form("busca_cliente_form"):
