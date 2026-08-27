@@ -17,7 +17,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
 import gspread
 from gspread_dataframe import get_as_dataframe
 import streamlit as st
@@ -133,20 +132,14 @@ def obter_clientes():
         scopes=[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/spreadsheets.readonly",
-            # metadata.readonly (não drive.readonly completo) — só o
-            # suficiente pra perguntar "quando essa planilha foi
-            # modificada pela última vez", sem dar acesso a conteúdo de
-            # outros arquivos do Drive
-            "https://www.googleapis.com/auth/drive.metadata.readonly",
         ],
     )
     client_bq = bigquery.Client(project=PROJECT_ID, credentials=creds)
     client_gs = gspread.authorize(creds)
-    client_drive = build("drive", "v3", credentials=creds)
-    return client_bq, client_gs, client_drive
+    return client_bq, client_gs
 
 
-client_bq, client_gs, client_drive = (None, None, None) if MODO_DEMO else obter_clientes()
+client_bq, client_gs = (None, None) if MODO_DEMO else obter_clientes()
 
 
 def cnpj_invalido(cnpj: str) -> bool:
@@ -232,37 +225,6 @@ def gerar_planilhas_demo():
     ]
 
     return pd.DataFrame(linhas_mensalidades), pd.DataFrame(linhas_bombas)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def obter_data_ultima_modificacao(sheet_id: str):
-    """
-    Pergunta pra API do Drive quando essa planilha foi modificada pela
-    última vez — a API do Sheets/gspread não expõe isso diretamente, só
-    a do Drive (files.get com fields='modifiedTime'). Cache curto (30 min)
-    porque essa informação é barata de buscar e a gente quer refletir uma
-    atualização recente sem esperar 1h (o cache das planilhas em si).
-    Retorna um datetime (UTC) ou None se não conseguir descobrir.
-    """
-    if MODO_DEMO or client_drive is None:
-        return None
-    try:
-        metadata = client_drive.files().get(fileId=sheet_id, fields="modifiedTime").execute()
-        return pd.to_datetime(metadata["modifiedTime"])
-    except Exception:
-        return None
-
-
-def mostrar_aviso_atualidade():
-    """
-    Agora que tanto Base_Clientes quanto Bombas_Alocadas foram migradas
-    pro DW direto (sem passar por planilha nenhuma), o app não depende
-    mais da atualidade de nenhuma planilha — os dois sempre refletem o
-    estado mais recente do BigQuery no momento da consulta. Esta função
-    fica só de "cabo solto" (não é mais chamada em lugar nenhum) — mantida
-    caso a gente volte a depender de alguma planilha no futuro.
-    """
-    return
 
 
 @st.cache_data(ttl=3600, show_spinner="Carregando equipamentos (direto do BigQuery)...")
@@ -2478,7 +2440,6 @@ def _renderizar_cabecalho():
 
 
 _renderizar_cabecalho()
-mostrar_aviso_atualidade()
 st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
 with st.form("busca_cliente_form"):
