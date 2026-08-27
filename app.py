@@ -17,28 +17,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
-import gspread
-from gspread_dataframe import get_as_dataframe
 import streamlit as st
 
 st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wide")
 
 # --- 1. Configuração ---
 PROJECT_ID = "hip-bonito-453017-m2"
-
-# SHEET_ID_BOMBAS / ABA_BOMBAS não são mais usadas pra CARREGAR dados —
-# o app busca equipamentos direto do DW agora (carregar_bombas_do_dw).
-# A planilha continua existindo e sendo usada por fora do app; deixamos
-# as constantes aqui só de referência, caso precise voltar a usá-la.
-SHEET_ID_BOMBAS = "1k_-lA-wBq4E9_qLuWFBQUGzUwfA56vtmIlWsPhw130Y"
-ABA_BOMBAS = "Bombas_Alocadas"
-
-SHEET_ID_MENSALIDADES = "1zzz2lXQ0aZuADYaA-uPMuQ58yUBhEqO8H-KdOYwEmWY"
-ABA_MENSALIDADES = "Base_Clientes"
-# idem — não são mais usadas pra carregar dados, o app busca contratos
-# direto do DW agora (buscar_itens_contrato_do_dw / carregar_diretorio_
-# clientes_dw). A planilha continua existindo e sendo usada por fora do
-# app; deixamos as constantes de referência.
 
 PRIORIDADE_TIPO = ["E", "c", "R"]
 TAMANHO_CODIGO_CONTRATO = 8
@@ -190,21 +174,16 @@ if MODO_DEMO:
     )
 
 
-@st.cache_resource(show_spinner="Conectando ao BigQuery e Google Sheets...")
+@st.cache_resource(show_spinner="Conectando ao BigQuery...")
 def obter_clientes():
     creds = service_account.Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=[
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-        ],
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
-    client_bq = bigquery.Client(project=PROJECT_ID, credentials=creds)
-    client_gs = gspread.authorize(creds)
-    return client_bq, client_gs
+    return bigquery.Client(project=PROJECT_ID, credentials=creds)
 
 
-client_bq, client_gs = (None, None) if MODO_DEMO else obter_clientes()
+client_bq = None if MODO_DEMO else obter_clientes()
 
 
 def cnpj_invalido(cnpj: str) -> bool:
@@ -212,15 +191,6 @@ def cnpj_invalido(cnpj: str) -> bool:
     dígitos iguais não é um CNPJ/CPF real e não deve ser usado como chave
     de busca/consolidação (senão junta clientes não relacionados)."""
     return not cnpj or len(set(cnpj)) == 1
-
-
-# --- 3. Carrega as planilhas (Base_Clientes + Bombas_Alocadas) ---
-def carregar_aba(sheet_id: str, aba: str) -> pd.DataFrame:
-    sh = client_gs.open_by_key(sheet_id)
-    ws = sh.worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str)
-    df = df.dropna(how="all").dropna(axis=1, how="all")
-    return df.reset_index(drop=True)
 
 
 def gerar_planilhas_demo():
@@ -1328,12 +1298,17 @@ def plotar_historico_multi(
         # connectgaps=False é explícito (já é o padrão) pra garantir que
         # meses sem parcela (valor=NaN, preenchidos no reindex acima)
         # quebrem a linha visualmente, em vez de serem "costurados"
+        #
+        # customdata carrega o MESMO texto do hover, mas persistente —
+        # ao clicar num ponto (via on_select do st.plotly_chart), dá pra
+        # mostrar esse detalhe fixo na tela em vez de precisar manter o
+        # mouse parado em cima do ponto pra ler
         fig.add_trace(go.Scatter(
             x=meses_str, y=valores, mode="lines+markers", connectgaps=False,
             name=f"{h['grupo']} — {h['descricao']}"[:40],
             legendgroup=grupo_legenda, showlegend=True,
             line=dict(color=cor, width=2), marker=dict(size=6, color=cor),
-            hovertext=hover_texts, hoverinfo="text",
+            hovertext=hover_texts, hoverinfo="text", customdata=hover_texts,
         ))
         trace_situacao.append(situacao_grupo)
 
@@ -1481,7 +1456,7 @@ def plotar_historico_multi(
             x=meses_str_t, y=valores_t, mode="lines", name=nome,
             legendgroup=legendgroup_total, showlegend=True, visible=visivel_inicialmente,
             line=dict(color="black", width=3, dash="dot"),
-            hovertext=hover_total, hoverinfo="text",
+            hovertext=hover_total, hoverinfo="text", customdata=hover_total,
         ))
         trace_situacao.append(tag)
 
@@ -2476,14 +2451,41 @@ def relatorio_cliente(
     # cards ao lado do gráfico (não dentro dele) — o detalhe "tipo BI"
     # (valor exato, situação, avisos) fica nos cards; o gráfico fica
     # livre pra ser só a representação visual da tendência, sem precisar
-    # caber tudo isso no hover/legenda quando tem muitos grupos
+    # caber tudo isso no hover/legenda quando tem muitos grupos.
+    #
+    # on_select="rerun": clicar num ponto do gráfico reroda o app com a
+    # informação de qual ponto foi clicado disponível — usamos isso pra
+    # mostrar o MESMO texto detalhado do hover só que FIXO na tela (não
+    # precisa manter o mouse parado em cima pra ler), no topo do painel
+    # lateral. Sem clique nenhum ainda, mostra a lista de cards normal.
     col_grafico, col_cards = st.columns([3, 1])
     with col_grafico:
+        evento_grafico = None
         if fig_principal is not None:
-            st.plotly_chart(fig_principal, use_container_width=True)
+            evento_grafico = st.plotly_chart(
+                fig_principal, use_container_width=True,
+                on_select="rerun", selection_mode="points", key=f"grafico_{nome_cliente}",
+            )
     with col_cards:
-        st.markdown("**Contratos**")
-        mostrar_cards_contratos(historicos)
+        pontos_selecionados = []
+        if evento_grafico is not None:
+            try:
+                pontos_selecionados = evento_grafico.selection.points
+            except AttributeError:
+                pontos_selecionados = evento_grafico.get("selection", {}).get("points", [])
+
+        if pontos_selecionados:
+            st.markdown("**Detalhe do ponto clicado**")
+            for ponto in pontos_selecionados:
+                texto_ponto = ponto.get("customdata")
+                if texto_ponto:
+                    with st.container(border=True):
+                        st.markdown(texto_ponto, unsafe_allow_html=True)
+            st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
+        else:
+            st.markdown("**Contratos**")
+            st.caption("Clique num ponto do gráfico pra ver o detalhe daquele mês aqui.")
+            mostrar_cards_contratos(historicos)
 
     if detalhes_md:
         with st.expander("📋 Detalhamento completo das mudanças de equipamento por mês (sem resumir)"):
