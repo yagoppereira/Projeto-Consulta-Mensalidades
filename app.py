@@ -686,27 +686,43 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
 
 
 # --- 6. Gráfico interativo (Plotly) ---
-# paleta de cores GENÉRICA (usada como fallback, quando não dá pra
-# identificar o tipo do grupo pelo texto) — de propósito SEM verde/
-# vermelho, já reservados aos marcadores de aumento/redução
+# Paleta oficial da CTA (Guia de Degradês e Identidade Visual, jul/2026):
+#   CTA Verde #19e098 · CTA Violeta #574ae2 · CTA Azul #382fd8 · CTA Preto
+#   #1E1E1E · CTA Cinza Claro #F1F1F1 — mais os tons das séries
+#   sequenciais (verde/azul, 5 tons cada) e a paleta derivada pra
+#   documentos formais (Azul Escuro #1a1a2e, Azul Muito Claro #f0f1fd).
+#
+# paleta GENÉRICA de fallback (usada só quando não dá pra identificar o
+# tipo do grupo pelo texto) — monta com o que sobra da paleta oficial
+# depois de reservar as cores semânticas abaixo (união/licenciamento/
+# aluguel/sonda/aumento/redução), pra nunca colidir com elas
 PALETA_CONTRATOS = [
-    "#2563eb", "#d97706", "#7c3aed", "#0891b2", "#db2777",
-    "#4f46e5", "#0d9488", "#9333ea", "#b45309", "#64748b",
+    "#574ae2",  # CTA Violeta
+    "#0fad72",  # série verde, tom 4
+    "#8f87ec",  # série azul, tom 2
+    "#087a50",  # série verde, tom 5 (mais escuro)
+    "#c4bff6",  # série azul, tom 1 (mais claro)
+    "#b3f7e0",  # série verde, tom 1 (mais claro)
 ]
 
-# cores reservadas exclusivamente para os marcadores de aumento/redução
-COR_AUMENTO = "#16a34a"
-COR_REDUCAO = "#dc2626"
+# cores reservadas exclusivamente para os marcadores de aumento/redução —
+# a própria CTA já define essa convenção na "Série Divergente" do guia de
+# cores: Azul = negativo, Verde = positivo (não vermelho/verde genérico)
+COR_AUMENTO = "#19e098"  # CTA Verde
+COR_REDUCAO = "#1a1a2e"  # Azul Escuro (documentos formais) — bem mais
+# escuro/dessaturado que o Azul Institucional (#382fd8) e o tom escuro da
+# série azul (#2318a8) já usados nas linhas de contrato, pra não colidir
+# visualmente com elas quando o marcador cai em cima de uma linha azul
 
 # cores por TIPO de contrato (identificado pelo texto — descrição,
 # composição, observação — não por ordem arbitrária). Se o tipo do grupo
 # mudar (ex: passou a ser "Mensalidade Unificada" recentemente, antes
 # era só licenciamento), a cor acompanha automaticamente, porque a
 # classificação é refeita a cada vez com o dado mais recente disponível.
-COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#382fd8"
-COR_SO_LICENCIAMENTO = "#2318a8"
-COR_SO_ALUGUEL = "#66efc1"
-COR_SONDA = "#F1F1F1"
+COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#382fd8"  # CTA Azul
+COR_SO_LICENCIAMENTO = "#2318a8"  # série azul, tom mais escuro
+COR_SO_ALUGUEL = "#66efc1"  # série verde, tom 2
+COR_SONDA = "#F1F1F1"  # CTA Cinza Claro
 
 
 def classificar_cor_grupo(h: dict) -> str:
@@ -1193,6 +1209,27 @@ def plotar_historico_multi(
 
     altura_fig = max(950, 65 * len(historicos_validos))
 
+    # limite de zoom-out: sem isso, o Plotly deixa a pessoa afastar o
+    # zoom indefinidamente, mostrando um espaço vazio gigante em volta de
+    # uma linha quase reta (como aconteceu com um cliente de valor
+    # praticamente constante). Calcula o min/max REAL de todos os traces
+    # já adicionados (incluindo a linha "Total") e trava o zoom/pan
+    # nesse intervalo, com uma margem pequena — dá pra afastar o
+    # suficiente pra ver tudo, mas não além disso.
+    todos_valores_y = []
+    for trace in fig.data:
+        if trace.y is not None:
+            todos_valores_y.extend(v for v in trace.y if v is not None and not (isinstance(v, float) and pd.isna(v)))
+    todos_valores_y = [v for v in todos_valores_y if isinstance(v, (int, float))]
+
+    if todos_valores_y:
+        y_min_real, y_max_real = min(todos_valores_y), max(todos_valores_y)
+        margem_y = (y_max_real - y_min_real) * 0.08 or max(y_max_real * 0.1, 50)
+        y_min_permitido = max(0, y_min_real - margem_y)
+        y_max_permitido = y_max_real + margem_y
+    else:
+        y_min_permitido = y_max_permitido = None
+
     fig.update_layout(
         title=dict(
             text=f"{titulo}<br><sup>{subtitulo}</sup>", x=0.01, y=0.98, yanchor="top",
@@ -1200,6 +1237,7 @@ def plotar_historico_multi(
         ),
         xaxis_title="Mês de referência", yaxis_title="Valor (R$)",
         yaxis_tickprefix="R$ ", yaxis_tickformat=",.2f",
+        yaxis=dict(minallowed=y_min_permitido, maxallowed=y_max_permitido) if y_min_permitido is not None else {},
         template="plotly_white", hovermode="closest",
         height=altura_fig,
         width=1900,  # bem mais largo — usa mais espaço da tela
@@ -1217,8 +1255,14 @@ def plotar_historico_multi(
         updatemenus=[
             dict(
                 type="buttons", direction="right", buttons=botoes_filtro,
-                x=1.0, y=1.05, xanchor="right", yanchor="top", showactive=True,
-                pad=dict(t=6, b=6, l=6, r=6),
+                x=1.0, y=1.05, xanchor="right", yanchor="top",
+                # showactive=False: o destaque do botão "ativo" muda a
+                # largura renderizada dele (borda extra), o que empurra
+                # os botões vizinhos e dá a impressão de "pular" a cada
+                # clique. Sem esse destaque, todos os botões sempre têm
+                # o mesmo tamanho, então nunca se deslocam.
+                showactive=False,
+                pad=dict(t=8, b=8, l=10, r=10),
             ),
         ],
         xaxis=dict(
@@ -1227,6 +1271,8 @@ def plotar_historico_multi(
             tickvals=todos_meses_str[::passo], ticktext=todos_eixo_labels[::passo],
             range=range_inicial,
             rangeslider=dict(visible=False),
+            minallowed=todos_meses_str[0] if todos_meses_str else None,
+            maxallowed=todos_meses_str[-1] if todos_meses_str else None,
         ),
     )
 
@@ -1841,6 +1887,26 @@ def relatorio_cliente(
     label_qtd_equip = str(qtd_equip_unicos)
     colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Múltiplo?"]
 
+    def _tabela_equipamentos_colorida(df_equip):
+        """Colore as linhas que compartilham o mesmo serial (equipamento
+        'múltiplo': duplo, triplo, quádruplo...) com a MESMA cor — dá pra
+        ver de cara quais linhas são o mesmo equipamento físico, sem
+        precisar comparar a coluna serial_equipamento manualmente."""
+        df_sel = df_equip[colunas_equip]
+        seriais_multiplos = df_sel.loc[df_sel["Múltiplo?"], "serial_equipamento"].unique()
+        if len(seriais_multiplos) == 0:
+            return df_sel
+        paleta_multiplos = [
+            COR_UNIAO_ALUGUEL_LICENCIAMENTO, COR_SO_LICENCIAMENTO, COR_SO_ALUGUEL,
+        ] + PALETA_CONTRATOS
+        mapa_cor = {serial: paleta_multiplos[i % len(paleta_multiplos)] for i, serial in enumerate(seriais_multiplos)}
+
+        def _estilo_linha(linha):
+            cor = mapa_cor.get(linha["serial_equipamento"])
+            return [f"background-color: {cor}33"] * len(linha) if cor else [""] * len(linha)
+
+        return df_sel.style.apply(_estilo_linha, axis=1)
+
     if mostrar_lado_a_lado:
         contratos_ativos = contratos[contratos["situacaoContrato"] == "A"].sort_values("codigoContrato")
         if len(contratos_ativos):
@@ -1854,19 +1920,19 @@ def relatorio_cliente(
             with col_b:
                 st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
                 if len(equipamentos):
-                    st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
+                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
                 else:
                     st.caption("Nenhum equipamento.")
         else:
             st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
             if len(equipamentos):
-                st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
+                st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
             else:
                 st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
     else:
         st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
         if len(equipamentos):
-            st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
+            st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
         else:
             st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
 
