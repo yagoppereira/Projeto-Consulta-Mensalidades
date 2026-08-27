@@ -73,25 +73,6 @@ def formatar_moeda(valor: float) -> str:
     return f"R$ {s}"
 
 
-def mostrar_tabela_com_download(df_ou_styler, nome_arquivo: str, chave: str, **kwargs_dataframe):
-    """
-    Mostra a tabela normalmente (st.dataframe) E, logo abaixo, um botão de
-    download em CSV com ';' como separador — o ícone de exportar que o
-    Streamlit já mostra nativamente ao passar o mouse na tabela SEMPRE usa
-    vírgula e não dá pra configurar, o que abre errado no Excel BR (que
-    espera ';', já que a vírgula é o separador decimal por aqui). Esse
-    botão próprio resolve isso; o ícone nativo continua existindo do lado
-    (não dá pra removê-lo), mas agora tem a opção certa também.
-    """
-    df_exportar = df_ou_styler.data if hasattr(df_ou_styler, "data") else df_ou_styler
-    st.dataframe(df_ou_styler, **kwargs_dataframe)
-    csv_bytes = df_exportar.to_csv(sep=";", index=False).encode("utf-8-sig")  # utf-8-sig: Excel BR abre acentuação certo
-    st.download_button(
-        "⬇️ Baixar CSV (separado por ;)", data=csv_bytes, file_name=nome_arquivo,
-        mime="text/csv", key=chave,
-    )
-
-
 def parse_data_flexivel(serie: pd.Series) -> pd.Series:
     """
     Datas vindas do Google Sheets podem voltar tanto em ISO (quando o
@@ -790,6 +771,7 @@ def classificar_cor_grupo(h: dict) -> str:
 def plotar_historico_multi(
     historicos: list, titulo: str, subtitulo: str = "", incluir_total: bool = True,
     mostrar_texto_variacao: bool = False, limiar_anotacao_pct: float = 5.0,
+    mostrar_eventos_cancelamento: bool = True,
 ):
     """
     Plota UM gráfico com uma linha por grupo de contrato (cada `historicos[i]`
@@ -827,6 +809,14 @@ def plotar_historico_multi(
     fig = go.Figure()
     trace_situacao = []  # paralelo a fig.data, para os botões de filtro
     detalhes_mudancas_console = []  # (grupo, mes_fmt, direcao, valor_bruto, pct, novos, removidos, alterados) — sem resumir, pra imprimir no console
+    # valores REAIS (não decorativos) de todas as linhas — usado só pra
+    # calcular o limite de zoom-out do eixo Y. Populado à parte, na hora
+    # em que cada linha é montada, em vez de escanear fig.data no final:
+    # escanear fig.data pegava TAMBÉM a linha vertical tracejada do
+    # marcador de cancelamento, que vai de y=0 até o topo de propósito
+    # (é só uma referência visual) — esse "0" contaminava o cálculo e
+    # fazia o zoom-out voltar a permitir ir até quase zero
+    todos_valores_y_reais = []
 
     for i, h in enumerate(historicos_validos):
         df_m = h["df"].sort_values("mes").reset_index(drop=True)
@@ -844,6 +834,7 @@ def plotar_historico_multi(
         meses_str = [str(m) for m in df_m["mes"]]
         eixo_labels = [formatar_mes_ano(p) for p in df_m["mes"]]
         valores = pd.to_numeric(df_m["valor"], errors="coerce").tolist()
+        todos_valores_y_reais.extend(v for v in valores if v is not None and not pd.isna(v))
         # "completo" = todos os subcontratos desse grupo emitiram NF nesse
         # mês. Quando não é completo (ex: só o aluguel rodou, o
         # licenciamento não), o valor somado fica artificialmente baixo —
@@ -1106,7 +1097,12 @@ def plotar_historico_multi(
         # quando não há mais nada depois.
         # (data_cancel/mes_cancel já foram calculados mais acima, junto
         # com o cabeçalho do hover — reaproveitados aqui)
-        if data_cancel and str(data_cancel).strip():
+        #
+        # mostrar_eventos_cancelamento=False deixa esse marcador de fora
+        # inteiro — útil quando os marcadores de cancelamento atrapalham
+        # a leitura de outros eventos (ex: variações de valor) nas mesmas
+        # datas, e a pessoa só quer ver a linha "limpa"
+        if mostrar_eventos_cancelamento and data_cancel and str(data_cancel).strip():
             if mes_cancel in meses_str:
                 idx = meses_str.index(mes_cancel)
                 motivo = h.get("motivo_cancelamento") or ""
@@ -1152,6 +1148,7 @@ def plotar_historico_multi(
         meses_str_t = [str(m) for m in df_total["mes"]]
         eixo_labels_t = [formatar_mes_ano(p) for p in df_total["mes"]]
         valores_t = df_total["valor"].tolist()
+        todos_valores_y_reais.extend(v for v in valores_t if v is not None and not pd.isna(v))
 
         var_pct_t, var_bruto_t = [None] * len(valores_t), [None] * len(valores_t)
         for j in range(1, len(valores_t)):
@@ -1313,18 +1310,15 @@ def plotar_historico_multi(
     # limite de zoom-out: sem isso, o Plotly deixa a pessoa afastar o
     # zoom indefinidamente, mostrando um espaço vazio gigante em volta de
     # uma linha quase reta (como aconteceu com um cliente de valor
-    # praticamente constante). Calcula o min/max REAL de todos os traces
-    # já adicionados (incluindo a linha "Total") e trava o zoom/pan
-    # nesse intervalo, com uma margem pequena — dá pra afastar o
-    # suficiente pra ver tudo, mas não além disso.
-    todos_valores_y = []
-    for trace in fig.data:
-        if trace.y is not None:
-            todos_valores_y.extend(v for v in trace.y if v is not None and not (isinstance(v, float) and pd.isna(v)))
-    todos_valores_y = [v for v in todos_valores_y if isinstance(v, (int, float))]
-
-    if todos_valores_y:
-        y_min_real, y_max_real = min(todos_valores_y), max(todos_valores_y)
+    # praticamente constante). Usa APENAS os valores reais coletados
+    # durante a montagem das linhas (todos_valores_y_reais) — NÃO escaneia
+    # fig.data no final, porque isso pegava também a linha vertical
+    # tracejada do marcador de cancelamento (que vai de y=0 até o topo de
+    # propósito, só como referência visual), fazendo o limite de zoom
+    # voltar a permitir ir até quase zero mesmo quando os dados reais
+    # nunca chegam perto disso.
+    if todos_valores_y_reais:
+        y_min_real, y_max_real = min(todos_valores_y_reais), max(todos_valores_y_reais)
         margem_y = (y_max_real - y_min_real) * 0.08 or max(y_max_real * 0.1, 50)
         y_min_permitido = max(0, y_min_real - margem_y)
         y_max_permitido = y_max_real + margem_y
@@ -1938,6 +1932,7 @@ def relatorio_cliente(
     mostrar_grade_individual: bool = True,
     mostrar_texto_variacao: bool = False,
     limiar_anotacao_pct: float = 5.0,
+    mostrar_eventos_cancelamento: bool = True,
 ):
     """Monta o relatório inteiro na tela (Streamlit) pro cliente informado."""
     resultado = buscar_cliente(identificador)
@@ -2083,39 +2078,26 @@ def relatorio_cliente(
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
-                mostrar_tabela_com_download(
+                st.dataframe(
                     contratos_ativos[["Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao"]],
-                    f"contratos_ativos_{nome_cliente}.csv", "download_contratos_ativos",
                     use_container_width=True, hide_index=True,
                 )
             with col_b:
                 st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
                 if len(equipamentos):
-                    mostrar_tabela_com_download(
-                        _tabela_equipamentos_colorida(equipamentos),
-                        f"equipamentos_{nome_cliente}.csv", "download_equip_1",
-                        use_container_width=True, hide_index=True,
-                    )
+                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
                 else:
                     st.caption("Nenhum equipamento.")
         else:
             st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
             if len(equipamentos):
-                mostrar_tabela_com_download(
-                    _tabela_equipamentos_colorida(equipamentos),
-                    f"equipamentos_{nome_cliente}.csv", "download_equip_2",
-                    use_container_width=True, hide_index=True,
-                )
+                st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
             else:
                 st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
     else:
         st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
         if len(equipamentos):
-            mostrar_tabela_com_download(
-                _tabela_equipamentos_colorida(equipamentos),
-                f"equipamentos_{nome_cliente}.csv", "download_equip_3",
-                use_container_width=True, hide_index=True,
-            )
+            st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
         else:
             st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
 
@@ -2130,6 +2112,7 @@ def relatorio_cliente(
         incluir_total=incluir_total,
         mostrar_texto_variacao=mostrar_texto_variacao,
         limiar_anotacao_pct=limiar_anotacao_pct,
+        mostrar_eventos_cancelamento=mostrar_eventos_cancelamento,
     )
     if fig_principal is not None:
         st.plotly_chart(fig_principal, use_container_width=True)
@@ -2164,13 +2147,12 @@ def relatorio_cliente(
     qtd_encerrados_itens = (contratos["situacaoContrato"] == "E").sum()
     qtd_encerrados_grupos = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].nunique()
     st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))", anchor=False)
-    mostrar_tabela_com_download(
+    st.dataframe(
         contratos[contratos["situacaoContrato"] == "E"][[
             "codigoContrato", "Descricao_Material", "Descricao",
             "Descricao_Cancelamento", "Data Cancelamento", "Data Criação",
             "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
         ]].sort_values("codigoContrato"),
-        f"contratos_encerrados_{nome_cliente}.csv", "download_encerrados",
         use_container_width=True, hide_index=True,
     )
 
@@ -2206,6 +2188,11 @@ st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Busc
 
 with st.form("busca_cliente_form"):
     identificador_input = st.text_input("Cliente:", placeholder="Ex: DNP TERRAPLANAGEM, 308, ou 57623761000117")
+    mostrar_eventos_cancelamento_input = st.checkbox(
+        "Mostrar marcadores de contrato cancelado no gráfico", value=True,
+        help="Desmarque pra esconder os losangos/círculos e a linha vertical de cancelamento — "
+             "útil quando eles atrapalham a leitura de outras variações de valor na mesma época.",
+    )
     col1, col2 = st.columns([1, 3])
     with col1:
         buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
@@ -2214,4 +2201,4 @@ if buscar_clicado:
     if not identificador_input.strip():
         st.warning("Digite um cliente pra buscar.")
     else:
-        relatorio_cliente(identificador_input.strip())
+        relatorio_cliente(identificador_input.strip(), mostrar_eventos_cancelamento=mostrar_eventos_cancelamento_input)
