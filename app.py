@@ -1255,13 +1255,20 @@ def plotar_historico_multi(
         updatemenus=[
             dict(
                 type="buttons", direction="right", buttons=botoes_filtro,
-                x=1.0, y=1.05, xanchor="right", yanchor="top",
-                # showactive=False: o destaque do botão "ativo" muda a
-                # largura renderizada dele (borda extra), o que empurra
-                # os botões vizinhos e dá a impressão de "pular" a cada
-                # clique. Sem esse destaque, todos os botões sempre têm
-                # o mesmo tamanho, então nunca se deslocam.
+                # xanchor="left" com x FIXO (em vez de "right"): se a
+                # largura do grupo de botões variar por qualquer motivo
+                # (fonte, renderização), o ponto de partida (esquerda)
+                # continua fixo — só o espaço vazio à direita cresce ou
+                # encolhe, os botões em si nunca mudam de lugar visível.
+                x=0.72, y=1.05, xanchor="left", yanchor="top",
                 showactive=False,
+                # cores/bordas explícitas pros 3 estados possíveis do
+                # botão (normal, hover, clicado) — sem isso, o Plotly usa
+                # valores padrão que podem variar sutilmente o tamanho
+                # renderizado de um estado pro outro, dando a impressão
+                # de "pular"
+                bgcolor="#26263A", bordercolor="#382fd8", borderwidth=1,
+                font=dict(size=13, color="#F1F1F1"),
                 pad=dict(t=8, b=8, l=10, r=10),
             ),
         ],
@@ -1271,8 +1278,12 @@ def plotar_historico_multi(
             tickvals=todos_meses_str[::passo], ticktext=todos_eixo_labels[::passo],
             range=range_inicial,
             rangeslider=dict(visible=False),
-            minallowed=todos_meses_str[0] if todos_meses_str else None,
-            maxallowed=todos_meses_str[-1] if todos_meses_str else None,
+            # minallowed/maxallowed REMOVIDO daqui de propósito — eixo do
+            # tipo "category" (não numérico) não respeita esse limite de
+            # forma confiável, causava um comportamento estranho de
+            # "ciclar" ao tentar dar zoom-out além do permitido repetidas
+            # vezes. No eixo Y (numérico de verdade, logo abaixo) esse
+            # mesmo recurso funciona corretamente.
         ),
     )
 
@@ -1844,7 +1855,7 @@ def relatorio_cliente(
         return
     codigos_cliente, nome_cliente, cnpj = resultado
 
-    st.header(nome_cliente)
+    st.header(nome_cliente, anchor=False)
     st.caption(f"CNPJ/CPF: {cnpj or 'N/D'}")
     if len(codigos_cliente) > 1:
         st.caption(f"Consolidando {len(codigos_cliente)} cadastros CIGAM sob o mesmo CNPJ: {codigos_cliente}")
@@ -1863,15 +1874,6 @@ def relatorio_cliente(
     for cod_grupo in grupos_encerrados:
         mapa_data_cancelamento[cod_grupo] = buscar_data_cancelamento_bq(cod_grupo)
     contratos["Data Cancelamento"] = contratos["codigoContrato"].map(mapa_data_cancelamento)
-
-    qtd_encerrados_itens = (contratos["situacaoContrato"] == "E").sum()
-    qtd_encerrados_grupos = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].nunique()
-    st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))")
-    st.dataframe(contratos[contratos["situacaoContrato"] == "E"][[
-        "codigoContrato", "Descricao_Material", "Descricao",
-        "Descricao_Cancelamento", "Data Cancelamento", "dataCriacao",
-        "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
-    ]].sort_values("codigoContrato"), use_container_width=True, hide_index=True)
 
     equipamentos = df_bombas[df_bombas["cliente_cigam_pagante"].isin(codigos_cliente)].copy()
     if len(equipamentos):
@@ -1907,36 +1909,11 @@ def relatorio_cliente(
 
         return df_sel.style.apply(_estilo_linha, axis=1)
 
-    if mostrar_lado_a_lado:
-        contratos_ativos = contratos[contratos["situacaoContrato"] == "A"].sort_values("codigoContrato")
-        if len(contratos_ativos):
-            st.subheader("Contratos ativos × Equipamentos")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
-                st.dataframe(contratos_ativos[[
-                    "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao",
-                ]], use_container_width=True, hide_index=True)
-            with col_b:
-                st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
-                if len(equipamentos):
-                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Nenhum equipamento.")
-        else:
-            st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
-            if len(equipamentos):
-                st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
-            else:
-                st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
-    else:
-        st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
-        if len(equipamentos):
-            st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
-        else:
-            st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
-
-    st.subheader("Histórico de mensalidade")
+    # --- monta o histórico (consultas ao BigQuery) ANTES de exibir
+    # qualquer coisa na tela — o Resumo (que sobe pra logo depois do
+    # cabeçalho) precisa dessa informação (quantidade de grupos), então
+    # não dá mais pra deixar esse cálculo só na hora de desenhar o
+    # gráfico, como era antes
     grupos = montar_grupos_contrato(contratos)
     _contador_fallback_json["qtd"] = 0
     with st.spinner(f"Buscando histórico de {len(grupos)} grupo(s) de contrato no BigQuery..."):
@@ -1987,6 +1964,42 @@ def relatorio_cliente(
             f"— array nativo vazio, comum em contratos mais antigos.)"
         )
 
+    # --- 1) Resumo (logo após o cabeçalho, como pedido) ---
+    st.subheader("Resumo", anchor=False)
+    st.markdown(montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equipamentos, historicos))
+
+    # --- 2) Contratos ativos × Equipamentos ---
+    if mostrar_lado_a_lado:
+        contratos_ativos = contratos[contratos["situacaoContrato"] == "A"].sort_values("codigoContrato")
+        if len(contratos_ativos):
+            st.subheader("Contratos ativos × Equipamentos", anchor=False)
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
+                st.dataframe(contratos_ativos[[
+                    "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao",
+                ]], use_container_width=True, hide_index=True)
+            with col_b:
+                st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
+                if len(equipamentos):
+                    st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Nenhum equipamento.")
+        else:
+            st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
+            if len(equipamentos):
+                st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
+    else:
+        st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})", anchor=False)
+        if len(equipamentos):
+            st.dataframe(_tabela_equipamentos_colorida(equipamentos), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
+
+    # --- 3) Histórico de mensalidade (gráfico principal) ---
+    st.subheader("Histórico de mensalidade", anchor=False)
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
 
     fig_principal, detalhes_md = plotar_historico_multi(
@@ -2017,14 +2030,24 @@ def relatorio_cliente(
                 f"veja na tabela de itens/contratos acima ou no hover do gráfico."
             )
 
-    st.subheader("Resumo")
-    st.markdown(montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equipamentos, historicos))
-
+    # --- 4) Histórico individual por contrato (mini-gráficos) ---
     if mostrar_grade_individual:
-        st.subheader("Histórico individual por contrato (mini-gráficos)")
+        st.subheader("Histórico individual por contrato (mini-gráficos)", anchor=False)
         fig_grade = plotar_contratos_lado_a_lado(historicos, nome_cliente, apenas_ativos=True)
         if fig_grade is not None:
             st.plotly_chart(fig_grade, use_container_width=True)
+
+    # --- 5) Itens/contratos encerrados/cancelados — movido pro final,
+    # como pedido; é informação de arquivo/histórico, não o primeiro que
+    # a pessoa precisa ver
+    qtd_encerrados_itens = (contratos["situacaoContrato"] == "E").sum()
+    qtd_encerrados_grupos = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].nunique()
+    st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))", anchor=False)
+    st.dataframe(contratos[contratos["situacaoContrato"] == "E"][[
+        "codigoContrato", "Descricao_Material", "Descricao",
+        "Descricao_Cancelamento", "Data Cancelamento", "dataCriacao",
+        "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
+    ]].sort_values("codigoContrato"), use_container_width=True, hide_index=True)
 
 
 # ============================================================================
@@ -2050,7 +2073,7 @@ def _renderizar_cabecalho():
             unsafe_allow_html=True,
         )
     else:
-        st.title("Histórico de Mensalidade — CIGAM")
+        st.title("Histórico de Mensalidade — CIGAM", anchor=False)
 
 
 _renderizar_cabecalho()
