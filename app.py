@@ -2478,20 +2478,40 @@ def relatorio_cliente(
                 on_select="rerun", selection_mode="points", key=f"grafico_{nome_cliente}",
             )
     with col_cards:
+        # extração bem defensiva do ponto clicado: o formato exato do
+        # objeto que o Streamlit devolve varia (acesso por atributo ou
+        # por chave, dependendo da versão) — qualquer coisa que dê
+        # errado aqui cai pra lista vazia (mostra os cards normais) em
+        # vez de quebrar a página inteira
         pontos_selecionados = []
         if evento_grafico is not None:
             try:
-                pontos_selecionados = evento_grafico.selection.points
-            except AttributeError:
-                pontos_selecionados = evento_grafico.get("selection", {}).get("points", [])
+                selecao = getattr(evento_grafico, "selection", None)
+                if selecao is not None:
+                    pontos_selecionados = getattr(selecao, "points", None)
+                    if pontos_selecionados is None and hasattr(selecao, "get"):
+                        pontos_selecionados = selecao.get("points", [])
+                elif hasattr(evento_grafico, "get"):
+                    pontos_selecionados = evento_grafico.get("selection", {}).get("points", [])
+                pontos_selecionados = pontos_selecionados or []
+            except Exception:
+                pontos_selecionados = []
 
         if pontos_selecionados:
             st.markdown("**Detalhe do ponto clicado**")
             for ponto in pontos_selecionados:
-                texto_ponto = ponto.get("customdata")
+                try:
+                    texto_ponto = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
+                except Exception:
+                    texto_ponto = None
+                # customdata pode vir como lista/tupla (o Plotly permite
+                # múltiplos valores por ponto) — normaliza pra string
+                # antes de tentar renderizar, senão o st.markdown quebra
+                if isinstance(texto_ponto, (list, tuple)):
+                    texto_ponto = texto_ponto[0] if texto_ponto else None
                 if texto_ponto:
                     with st.container(border=True):
-                        st.markdown(texto_ponto, unsafe_allow_html=True)
+                        st.markdown(str(texto_ponto), unsafe_allow_html=True)
             st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
         else:
             st.markdown("**Contratos**")
