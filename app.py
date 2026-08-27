@@ -924,7 +924,11 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
         for f in str(fatura_str).split(","):
             f = f.strip()
             if f in mapa_itens_por_nf:
-                itens_mes.extend(mapa_itens_por_nf[f])
+                # guarda o número da NF junto com cada item — precisa
+                # pra montar um card por item (aluguel/licenciamento
+                # separados) no detalhe do ponto clicado, cada um com
+                # sua própria nota fiscal demarcada
+                itens_mes.extend((f, desc, val, texto) for desc, val, texto in mapa_itens_por_nf[f])
         return itens_mes
 
     def _composicao_do_mes(fatura_str):
@@ -932,7 +936,7 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
         if len(itens_mes) < 2:
             return ""
         agregados = {}
-        for desc, val, _texto in itens_mes:
+        for _nf, desc, val, _texto in itens_mes:
             if val is None or pd.isna(val):
                 continue
             agregados[desc] = agregados.get(desc, 0) + val
@@ -958,7 +962,7 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
         por item, e sem cortar isso vira uma caixa de hover gigante e
         ilegível, cobrindo o gráfico inteiro."""
         itens_mes = _itens_do_mes(fatura_str)
-        textos = sorted(set(t for _, _, t in itens_mes if t))
+        textos = sorted(set(t for _nf, _d, _v, t in itens_mes if t))
         return resumir_lista(textos, max_itens=6, max_chars_item=60)
 
     if mapa_itens_por_nf:
@@ -1175,8 +1179,8 @@ def plotar_historico_multi(
                 return "", "", ""
             itens_ant = itens_mes_lista[idx_anterior] or []
             itens_atu = itens_mes_lista[idx_atual] or []
-            mapa_ant = {_extrair_id_equipamento(t): (v, t) for _, v, t in itens_ant if _extrair_id_equipamento(t)}
-            mapa_atu = {_extrair_id_equipamento(t): (v, t) for _, v, t in itens_atu if _extrair_id_equipamento(t)}
+            mapa_ant = {_extrair_id_equipamento(t): (v, t) for _nf, _d, v, t in itens_ant if _extrair_id_equipamento(t)}
+            mapa_atu = {_extrair_id_equipamento(t): (v, t) for _nf, _d, v, t in itens_atu if _extrair_id_equipamento(t)}
 
             novos = [
                 f"{mapa_atu[k][1]} ({formatar_moeda(mapa_atu[k][0])})" if pd.notna(mapa_atu[k][0]) else mapa_atu[k][1]
@@ -1247,13 +1251,16 @@ def plotar_historico_multi(
         faturas = df_m["fatura"].tolist() if "fatura" in df_m.columns else [""] * len(valores)
         composicoes_mes = df_m["composicao_mes"].fillna("").tolist() if "composicao_mes" in df_m.columns else [""] * len(valores)
         descricoes_mes = df_m["descricao_mes"].fillna("").tolist() if "descricao_mes" in df_m.columns else [""] * len(valores)
+        itens_mes_lista_pontos = df_m["itens_mes_lista"].tolist() if "itens_mes_lista" in df_m.columns else [[]] * len(valores)
 
         hover_texts = []
+        dados_estruturados = []  # customdata: cabeçalho + itens (nf, desc, valor) — pro detalhe do ponto clicado poder montar 1 card por item (ex: aluguel/licenciamento separados)
         for j, (mes_fmt, val) in enumerate(zip(eixo_labels, valores)):
             cabecalho_hover = _cabecalho_para_mes(meses_str[j])
             if pd.isna(val):
                 texto = f"{cabecalho_hover}<br>{mes_fmt}: <i>sem parcela emitida neste mês</i>"
                 hover_texts.append(texto)
+                dados_estruturados.append({"cabecalho": texto, "itens": []})
                 continue
             texto = f"{cabecalho_hover}<br>{mes_fmt}: {formatar_moeda(val)}"
             if faturas[j]:
@@ -1305,6 +1312,24 @@ def plotar_historico_multi(
                     ))
             hover_texts.append(texto)
 
+            # monta a lista de itens deste ponto (nf, descrição, valor) pro
+            # customdata — só interessa quando tem 2+ itens DIFERENTES
+            # (ex: aluguel + licenciamento); com 1 item só, não faz
+            # sentido quebrar em "cards", o cabeçalho já cobre
+            itens_do_ponto = itens_mes_lista_pontos[j] or []
+            itens_agregados_por_nf = {}
+            for nf_item, desc_item, val_item, texto_item in itens_do_ponto:
+                if val_item is None or pd.isna(val_item):
+                    continue
+                chave = (nf_item, desc_item)
+                if chave not in itens_agregados_por_nf:
+                    itens_agregados_por_nf[chave] = {"nf": nf_item, "descricao": desc_item, "valor": 0.0, "texto": texto_item}
+                itens_agregados_por_nf[chave]["valor"] += val_item
+            dados_estruturados.append({
+                "cabecalho": texto,
+                "itens": list(itens_agregados_por_nf.values()),
+            })
+
         # linha principal — única com showlegend=True do grupo.
         # connectgaps=False é explícito (já é o padrão) pra garantir que
         # meses sem parcela (valor=NaN, preenchidos no reindex acima)
@@ -1319,7 +1344,7 @@ def plotar_historico_multi(
             name=f"{h['grupo']} — {h['descricao']}"[:40],
             legendgroup=grupo_legenda, showlegend=True,
             line=dict(color=cor, width=2), marker=dict(size=6, color=cor),
-            hovertext=hover_texts, hoverinfo="text", customdata=hover_texts,
+            hovertext=hover_texts, hoverinfo="text", customdata=dados_estruturados,
         ))
         trace_situacao.append(situacao_grupo)
 
@@ -1453,12 +1478,17 @@ def plotar_historico_multi(
                 var_pct_t[j] = (atu - ant) / ant * 100
 
         hover_total = []
+        dados_estruturados_total = []
         for j, (m, v) in enumerate(zip(eixo_labels_t, valores_t)):
             texto = f"<b>{nome}</b><br>{m}: {formatar_moeda(v)}"
             if var_pct_t[j] is not None:
                 direcao = "Aumento" if var_bruto_t[j] > 0 else "Redução"
                 texto += f"<br>{direcao}: {formatar_moeda(abs(var_bruto_t[j]))} ({var_pct_t[j]:+.1f}%)"
             hover_total.append(texto)
+            # mesmo formato de customdata das linhas de grupo, só sem
+            # itens (é uma soma agregada de vários grupos, não faz
+            # sentido quebrar em cards de item aqui)
+            dados_estruturados_total.append({"cabecalho": texto, "itens": []})
 
         tag = f"total::{variante}"
         legendgroup_total = f"total_{variante}"
@@ -1467,7 +1497,7 @@ def plotar_historico_multi(
             x=meses_str_t, y=valores_t, mode="lines", name=nome,
             legendgroup=legendgroup_total, showlegend=True, visible=visivel_inicialmente,
             line=dict(color="black", width=3, dash="dot"),
-            hovertext=hover_total, hoverinfo="text", customdata=hover_total,
+            hovertext=hover_total, hoverinfo="text", customdata=dados_estruturados_total,
         ))
         trace_situacao.append(tag)
 
@@ -2501,17 +2531,56 @@ def relatorio_cliente(
             st.markdown("**Detalhe do ponto clicado**")
             for ponto in pontos_selecionados:
                 try:
-                    texto_ponto = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
+                    dado_ponto = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
                 except Exception:
-                    texto_ponto = None
-                # customdata pode vir como lista/tupla (o Plotly permite
-                # múltiplos valores por ponto) — normaliza pra string
-                # antes de tentar renderizar, senão o st.markdown quebra
-                if isinstance(texto_ponto, (list, tuple)):
-                    texto_ponto = texto_ponto[0] if texto_ponto else None
-                if texto_ponto:
+                    dado_ponto = None
+                # customdata pode vir embrulhado numa lista/tupla (o
+                # Plotly permite múltiplos valores por ponto) — desembrulha
+                # antes de processar
+                if isinstance(dado_ponto, (list, tuple)):
+                    dado_ponto = dado_ponto[0] if dado_ponto else None
+
+                # formato esperado: {"cabecalho": str, "itens": [{"nf":...,
+                # "descricao":...,"valor":...}, ...]}. Qualquer coisa fora
+                # desse formato (ex: versão antiga, ou algo inesperado no
+                # round-trip do navegador) cai no fallback de mostrar só
+                # o texto cru, sem quebrar a página.
+                cabecalho, itens = None, []
+                if isinstance(dado_ponto, dict):
+                    cabecalho = dado_ponto.get("cabecalho")
+                    itens = dado_ponto.get("itens") or []
+                elif dado_ponto:
+                    cabecalho = str(dado_ponto)
+
+                def _md_seguro(texto):
+                    """Escapa '$' antes de exibir via st.markdown — o
+                    Streamlit interpreta pares de '$' como fórmula
+                    matemática (LaTeX), e como o texto tem vários "R$"
+                    espalhados, isso "comia" pedaços do texto inteiro
+                    (inclusive as tags <br>). Só afeta esse ponto de
+                    exibição — o hover nativo do Plotly não passa por
+                    esse processamento, não precisa escapar lá."""
+                    st.markdown(str(texto).replace("$", "\\$"), unsafe_allow_html=True)
+
+                # descrições distintas (não NFs distintas) é o critério —
+                # a mesma NF pode ter 2 itens (ex: pedestal + sonda numa
+                # nota só), mas o que importa pro usuário é separar por
+                # TIPO de cobrança (aluguel vs licenciamento), não por NF
+                descricoes_distintas = {item.get("descricao") for item in itens if item.get("descricao")}
+                if cabecalho:
                     with st.container(border=True):
-                        st.markdown(str(texto_ponto), unsafe_allow_html=True)
+                        _md_seguro(cabecalho)
+                if len(descricoes_distintas) >= 2:
+                    for item in itens:
+                        with st.container(border=True):
+                            texto_item = (
+                                f"<b>{str(item.get('descricao', '')).capitalize()}</b><br>"
+                                f"Valor: {formatar_moeda(item.get('valor', 0))}<br>"
+                                f"NF: {item.get('nf', 'N/D')}"
+                            )
+                            if item.get("texto"):
+                                texto_item += f"<br>{item['texto']}"
+                            _md_seguro(texto_item)
             st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
         else:
             st.markdown("**Contratos**")
