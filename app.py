@@ -11,6 +11,7 @@
 
 import json
 import re
+import os
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -1819,7 +1820,7 @@ def relatorio_cliente(
         "codigoContrato", "Descricao_Material", "Descricao",
         "Descricao_Cancelamento", "Data Cancelamento", "dataCriacao",
         "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
-    ]].sort_values("codigoContrato"), use_container_width=True)
+    ]].sort_values("codigoContrato"), use_container_width=True, hide_index=True)
 
     equipamentos = df_bombas[df_bombas["cliente_cigam_pagante"].isin(codigos_cliente)].copy()
     if len(equipamentos):
@@ -1828,6 +1829,7 @@ def relatorio_cliente(
         # duplo/triplo: mesmo chassi físico, vários bicos/produtos) — pra
         # não parecer que são equipamentos diferentes
         equipamentos["Duplo/Triplo?"] = equipamentos.duplicated(subset="serial_equipamento", keep=False)
+        equipamentos = equipamentos.sort_values(["local_nome", "serial_equipamento"])
 
     qtd_equip_unicos = equipamentos["serial_equipamento"].nunique() if len(equipamentos) else 0
     label_qtd_equip = (
@@ -1837,31 +1839,31 @@ def relatorio_cliente(
     colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Duplo/Triplo?"]
 
     if mostrar_lado_a_lado:
-        contratos_ativos = contratos[contratos["situacaoContrato"] == "A"]
+        contratos_ativos = contratos[contratos["situacaoContrato"] == "A"].sort_values("codigoContrato")
         if len(contratos_ativos):
-            st.subheader(f"Contratos ativos × Equipamentos ({label_qtd_equip})")
+            st.subheader("Contratos ativos × Equipamentos")
             col_a, col_b = st.columns(2)
             with col_a:
-                st.markdown("**Contratos ativos**")
+                st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
                 st.dataframe(contratos_ativos[[
                     "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao",
-                ]], use_container_width=True)
+                ]], use_container_width=True, hide_index=True)
             with col_b:
-                st.markdown("**Equipamentos (pagante)**")
+                st.markdown(f"**Equipamentos — pagante ({label_qtd_equip})**")
                 if len(equipamentos):
-                    st.dataframe(equipamentos[colunas_equip], use_container_width=True)
+                    st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
                 else:
                     st.caption("Nenhum equipamento.")
         else:
-            st.subheader(f"Equipamentos sob responsabilidade (pagante) ({label_qtd_equip})")
+            st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
             if len(equipamentos):
-                st.dataframe(equipamentos[colunas_equip], use_container_width=True)
+                st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
             else:
                 st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
     else:
-        st.subheader(f"Equipamentos sob responsabilidade (pagante) ({label_qtd_equip})")
+        st.subheader(f"Equipamentos sob responsabilidade — pagante ({label_qtd_equip})")
         if len(equipamentos):
-            st.dataframe(equipamentos[colunas_equip], use_container_width=True)
+            st.dataframe(equipamentos[colunas_equip], use_container_width=True, hide_index=True)
         else:
             st.caption("Nenhum equipamento encontrado para este cliente como pagante.")
 
@@ -1900,7 +1902,14 @@ def relatorio_cliente(
                 "observacao": resumir_lista(observacoes),
                 "composicao": composicao,
                 "qtd_itens": len(subset),
-                "situacao": subset["situacaoContrato"].iloc[0],
+                # se QUALQUER linha do grupo ainda está ativa, o grupo
+                # inteiro conta como ativo — antes pegava só a primeira
+                # linha da lista, então um par aluguel(encerrado)/
+                # licenciamento(ativo) virava "encerrado" por inteiro só
+                # porque o aluguel aparecia primeiro, sumindo da grade de
+                # mini-gráficos (que só mostra os ativos) mesmo o
+                # licenciamento continuando cobrando
+                "situacao": "A" if (subset["situacaoContrato"] == "A").any() else subset["situacaoContrato"].iloc[0],
                 "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum() if not df_hist.empty else 0,
             })
     if _contador_fallback_json["qtd"] > 0:
@@ -1952,7 +1961,15 @@ def relatorio_cliente(
 # ============================================================================
 # --- 8. Interface (Streamlit) ---
 # ============================================================================
-st.title("📊 Histórico de Mensalidade — CIGAM")
+# logo: coloque um arquivo "logo.png" na raiz do repositório (mesma pasta
+# do app.py) que ele aparece automaticamente ao lado do título. Sem o
+# arquivo, o título aparece sozinho (sem quebrar nada).
+col_logo, col_titulo = st.columns([1, 8])
+with col_logo:
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=70)
+with col_titulo:
+    st.title("Histórico de Mensalidade — CIGAM")
 st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
 with st.form("busca_cliente_form"):
