@@ -81,6 +81,71 @@ def formatar_moeda(valor: float) -> str:
     return f"R$ {s}"
 
 
+# nomes de exibição — os nomes de campo crus (ex: "Descricao_Material",
+# "diaVencimento") vêm direto do CIGAM/BigQuery, não são pensados pra
+# quem só está lendo a tabela na tela
+RENOMEAR_COLUNAS_EXIBICAO = {
+    "Descricao_Material": "Material",
+    "Descricao": "Descrição",
+    "diaVencimento": "Dia Vencimento",
+    "observacao": "Observação",
+    "codigoContrato": "Código Contrato",
+    "Descricao_Cancelamento": "Motivo Cancelamento",
+    "contratoTerceiro": "Contrato Terceiro",
+    "bomba_nome": "Equipamento",
+    "serial_equipamento": "Serial",
+    "local_nome": "Local",
+}
+
+
+def renomear_para_exibicao(df):
+    """Troca os nomes de coluna crus por versões legíveis, só na hora de
+    mostrar na tela — as colunas internas continuam com o nome original
+    em todo o resto do código."""
+    return df.rename(columns=RENOMEAR_COLUNAS_EXIBICAO)
+
+
+def extrair_serial_de_texto(texto: str):
+    """Tenta achar um número de série mencionado no texto da descrição
+    do contrato (formato comum visto nos dados reais: 'SERIE 20802 #1 -
+    ID 1285143632') que possa bater com um serial_equipamento cadastrado.
+    Retorna o número como string, ou None se não achar nada parecido."""
+    if not texto or pd.isna(texto):
+        return None
+    m = re.search(r"SERIE\s*(\d+)", str(texto), re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def cruzar_contratos_com_equipamentos(df_contratos, df_equipamentos, coluna_origem="Descricao"):
+    """
+    Adiciona a coluna 'Equipamento (cruzado)' na tabela de contratos,
+    tentando achar qual equipamento físico corresponde a cada linha —
+    via o número de série mencionado na descrição do contrato, cruzado
+    com serial_equipamento da tabela de equipamentos. Fica em branco
+    quando não acha correspondência (não força um match errado).
+    """
+    df = df_contratos.copy()
+    if df_equipamentos is None or df_equipamentos.empty or coluna_origem not in df.columns:
+        df["Equipamento (cruzado)"] = ""
+        return df
+
+    mapa_serial_para_texto = {}
+    for serial, grupo in df_equipamentos.groupby(df_equipamentos["serial_equipamento"].astype(str)):
+        locais = grupo["local_nome"].dropna().unique()
+        bombas = grupo["bomba_nome"].dropna().unique()
+        if len(locais) == 1:
+            mapa_serial_para_texto[serial] = f"{locais[0]} — {', '.join(bombas)}"
+        else:
+            mapa_serial_para_texto[serial] = ", ".join(locais)
+
+    def _resolver(texto):
+        serial = extrair_serial_de_texto(texto)
+        return mapa_serial_para_texto.get(serial, "") if serial else ""
+
+    df["Equipamento (cruzado)"] = df[coluna_origem].apply(_resolver)
+    return df
+
+
 def parse_data_flexivel(serie: pd.Series) -> pd.Series:
     """
     Datas vindas do Google Sheets podem voltar tanto em ISO (quando o
@@ -1606,6 +1671,54 @@ def plotar_historico_multi(
     return fig, detalhes_md
 
 
+def mostrar_cards_contratos(historicos: list):
+    """
+    Um card por grupo de contrato — situação, valor atual, e avisos
+    (mês sem faturamento, cancelamento parcial), pensado pra ficar do
+    lado do gráfico principal (não dentro dele). Ideia: o gráfico fica
+    livre pra ser só a representação visual da tendência, e o detalhe
+    "tipo BI" (valor exato, status, avisos) mora nos cards, sem precisar
+    caber tudo no hover/legenda de um gráfico já cheio de linhas.
+    """
+    for h in historicos:
+        cor = classificar_cor_grupo(h) or PALETA_CONTRATOS[0]
+        df_h = h.get("df")
+
+        valor_atual = None
+        if df_h is not None and not df_h.empty:
+            valores_validos = pd.to_numeric(df_h.sort_values("mes")["valor"], errors="coerce").dropna()
+            valor_atual = valores_validos.iloc[-1] if len(valores_validos) else None
+
+        situacao_label = "🟢 Ativo" if h.get("situacao") == "A" else "⚪ Encerrado"
+
+        avisos = []
+        if df_h is not None and len(df_h) >= 2:
+            meses_existentes = set(df_h["mes"])
+            intervalo_completo = pd.period_range(df_h["mes"].min(), df_h["mes"].max(), freq="M")
+            qtd_faltando = len(set(intervalo_completo) - meses_existentes)
+            if qtd_faltando:
+                avisos.append(f"⚠️ {qtd_faltando} mês(es) sem faturamento")
+        if h.get("data_cancelamento"):
+            codigos_ativos = h.get("codigos_ativos") or []
+            codigos_grupo = h.get("codigos_grupo") or []
+            if codigos_ativos and len(codigos_ativos) < len(codigos_grupo):
+                avisos.append(f"🔶 Cancelamento parcial em {h['data_cancelamento']}")
+            else:
+                avisos.append(f"⬛ Cancelado em {h['data_cancelamento']}")
+
+        with st.container(border=True):
+            texto_avisos = "".join(f"<div style='font-size:0.85em; color:#F1F1F1cc;'>{a}</div>" for a in avisos)
+            st.markdown(
+                f"""<div style="border-left: 4px solid {cor}; padding-left: 10px;">
+                <b>{h['grupo']}</b><br>
+                <span style="font-size:0.9em;">{h.get('descricao', '')}</span><br>
+                {situacao_label} &nbsp;·&nbsp; <b>{formatar_moeda(valor_atual) if valor_atual is not None else 'N/D'}</b>
+                {texto_avisos}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+
 def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ativos: bool = True, cols: int = 3):
     """
     Mostra um "pequeno múltiplo" (mini-gráfico) por contrato, lado a lado
@@ -1781,24 +1894,38 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
     else:
         linhas.append("**Valor médio por equipamento:** N/D (sem equipamentos cadastrados como pagante)")
 
-    # "Principal motivo de cancelamento" (com contagem simples) foi
-    # removido — mesmo motivo da linha "Grupos de contrato no gráfico"
-    # que já tinha saído daqui: um número baixo (ex: "1 contrato(s)") não
-    # é um sinal útil por si só, e pode até enganar (parece indicar perda
-    # de cliente quando às vezes é só uma baixa administrativa, tipo um
-    # cancelamento parcial de um componente de um grupo que continua
-    # ativo). A informação individual continua na tabela de itens/
-    # contratos encerrados, lá embaixo. O que vale destacar aqui é só o
-    # PADRÃO (5+ contratos com o mesmo motivo administrativo) — isso sim
-    # é um sinal real de algo sistemático acontecendo.
-    motivos = contratos.loc[contratos["situacaoContrato"] == "E", "Descricao_Cancelamento"].value_counts()
-    if len(motivos):
-        principal = motivos.index[0]
-        if motivos.iloc[0] >= 5 and principal in ("CONTRATO ESTAVA COM ERRO", "CONTRATO DUPLICADO"):
-            linhas.append(
-                f"**Padrão de contratos recriados detectado:** {motivos.iloc[0]} contrato(s) cancelado(s) "
-                f"por '{principal}' — os valores desses contratos foram agrupados em 'Outros' no gráfico."
-            )
+    # "Principal motivo de cancelamento" (com contagem simples) e depois
+    # "Padrão de contratos recriados detectado" (por volume) foram
+    # removidos daqui — feedback direto: não agregavam valor prático pra
+    # quem está lendo o resumo. A informação individual de cada
+    # cancelamento continua na tabela de itens/contratos encerrados, lá
+    # embaixo, pra quem quiser investigar.
+
+    # detecta contratos com MESES SEM FATURAMENTO no meio do período
+    # ativo (não é o fim do contrato, é um "buraco" real no meio do
+    # histórico) — isso sim é um sinal útil: pode indicar uma cobrança
+    # que não saiu por engano, sem precisar caçar isso olhando marcador
+    # por marcador no gráfico (que já mostra o mesmo problema, mas fica
+    # fácil de passar despercebido em gráficos com muitas linhas)
+    grupos_com_lacuna = []
+    for h in historicos:
+        df_h = h.get("df")
+        if df_h is None or df_h.empty or len(df_h) < 2:
+            continue
+        meses_existentes = set(df_h["mes"])
+        intervalo_completo = pd.period_range(df_h["mes"].min(), df_h["mes"].max(), freq="M")
+        qtd_faltando = len(set(intervalo_completo) - meses_existentes)
+        if qtd_faltando > 0:
+            grupos_com_lacuna.append((h["grupo"], qtd_faltando))
+
+    if grupos_com_lacuna:
+        detalhe = ", ".join(f"{grupo} ({qtd} mês(es))" for grupo, qtd in grupos_com_lacuna[:5])
+        if len(grupos_com_lacuna) > 5:
+            detalhe += f" e mais {len(grupos_com_lacuna) - 5}"
+        linhas.append(
+            f"**⚠ Meses sem faturamento no meio do histórico:** {detalhe} — "
+            f"veja os marcadores âmbar no gráfico pra mais detalhe de qual mês exatamente."
+        )
 
     datas_validas = contratos["primeira_parcela"].dropna()
     ultima_parcela_valida = contratos["ultima_parcela"].dropna()
@@ -2217,8 +2344,9 @@ def relatorio_cliente(
         'múltiplo': duplo, triplo, quádruplo...) com a MESMA cor — dá pra
         ver de cara quais linhas são o mesmo equipamento físico, sem
         precisar comparar a coluna serial_equipamento manualmente."""
-        df_sel = df_equip[colunas_equip]
+        df_sel = df_equip[colunas_equip].copy()
         seriais_multiplos = df_sel.loc[df_sel["Múltiplo?"], "serial_equipamento"].unique()
+        df_sel = renomear_para_exibicao(df_sel)  # só troca o nome DEPOIS de calcular os múltiplos acima
         if len(seriais_multiplos) == 0:
             return df_sel
         paleta_multiplos = [
@@ -2227,7 +2355,7 @@ def relatorio_cliente(
         mapa_cor = {serial: paleta_multiplos[i % len(paleta_multiplos)] for i, serial in enumerate(seriais_multiplos)}
 
         def _estilo_linha(linha):
-            cor = mapa_cor.get(linha["serial_equipamento"])
+            cor = mapa_cor.get(linha["Serial"])
             return [f"background-color: {cor}33"] * len(linha) if cor else [""] * len(linha)
 
         return df_sel.style.apply(_estilo_linha, axis=1)
@@ -2306,8 +2434,11 @@ def relatorio_cliente(
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown(f"**Contratos ativos ({len(contratos_ativos)})**")
+                contratos_ativos_cruzado = cruzar_contratos_com_equipamentos(contratos_ativos, equipamentos)
                 st.dataframe(
-                    contratos_ativos[["Descricao_Material", "Descricao", "Mensalidade", "diaVencimento", "observacao"]],
+                    renomear_para_exibicao(contratos_ativos_cruzado[[
+                        "Descricao_Material", "Descricao", "Equipamento (cruzado)", "Mensalidade", "diaVencimento", "observacao",
+                    ]]),
                     use_container_width=True, hide_index=True,
                 )
             with col_b:
@@ -2342,8 +2473,17 @@ def relatorio_cliente(
         limiar_anotacao_pct=limiar_anotacao_pct,
         mostrar_eventos_cancelamento=mostrar_eventos_cancelamento,
     )
-    if fig_principal is not None:
-        st.plotly_chart(fig_principal, use_container_width=True)
+    # cards ao lado do gráfico (não dentro dele) — o detalhe "tipo BI"
+    # (valor exato, situação, avisos) fica nos cards; o gráfico fica
+    # livre pra ser só a representação visual da tendência, sem precisar
+    # caber tudo isso no hover/legenda quando tem muitos grupos
+    col_grafico, col_cards = st.columns([3, 1])
+    with col_grafico:
+        if fig_principal is not None:
+            st.plotly_chart(fig_principal, use_container_width=True)
+    with col_cards:
+        st.markdown("**Contratos**")
+        mostrar_cards_contratos(historicos)
 
     if detalhes_md:
         with st.expander("📋 Detalhamento completo das mudanças de equipamento por mês (sem resumir)"):
@@ -2376,11 +2516,11 @@ def relatorio_cliente(
     qtd_encerrados_grupos = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].nunique()
     st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))", anchor=False)
     st.dataframe(
-        contratos[contratos["situacaoContrato"] == "E"][[
+        renomear_para_exibicao(contratos[contratos["situacaoContrato"] == "E"][[
             "codigoContrato", "Descricao_Material", "Descricao",
             "Descricao_Cancelamento", "Data Cancelamento", "Data Criação",
             "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
-        ]].sort_values("codigoContrato"),
+        ]].sort_values("codigoContrato")),
         use_container_width=True, hide_index=True,
     )
 
