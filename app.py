@@ -1190,10 +1190,22 @@ def plotar_historico_multi(
                 resultado.append(filtro is None or s == filtro)
         return resultado
 
+    # título muda de texto junto com o filtro clicado (Todos/Só Ativos/Só
+    # Encerrados) — é o jeito mais seguro de indicar visualmente qual
+    # filtro está ativo: título já é comprovadamente estável (não corta
+    # nem empurra nada, diferente de anotação solta em y>1 ou do destaque
+    # nativo do Plotly nos botões, que causava o "pulo" que já corrigimos)
+    def _titulo_com_filtro(rotulo_filtro):
+        return f"{titulo}<br><sup>{subtitulo} — Filtro atual: <b>{rotulo_filtro}</b></sup>"
+
+    # method="update" (não "restyle") porque precisa mudar DUAS coisas ao
+    # mesmo tempo: a visibilidade das linhas E o texto do título — args[0]
+    # é a parte de "restyle" (traces), args[1] é a parte de "relayout"
+    # (layout, aqui só o título)
     botoes_filtro = [
-        dict(label="Todos", method="restyle", args=[{"visible": visibilidade(None)}]),
-        dict(label="Só Ativos", method="restyle", args=[{"visible": visibilidade("A")}]),
-        dict(label="Só Encerrados", method="restyle", args=[{"visible": visibilidade("E")}]),
+        dict(label="Todos", method="update", args=[{"visible": visibilidade(None)}, {"title.text": _titulo_com_filtro("Todos")}]),
+        dict(label="Só Ativos", method="update", args=[{"visible": visibilidade("A")}, {"title.text": _titulo_com_filtro("Só Ativos")}]),
+        dict(label="Só Encerrados", method="update", args=[{"visible": visibilidade("E")}, {"title.text": _titulo_com_filtro("Só Encerrados")}]),
     ]
 
     passo = max(1, len(todos_meses_str) // 24)
@@ -1232,7 +1244,7 @@ def plotar_historico_multi(
 
     fig.update_layout(
         title=dict(
-            text=f"{titulo}<br><sup>{subtitulo}</sup>", x=0.01, y=0.98, yanchor="top",
+            text=_titulo_com_filtro("Todos"), x=0.01, y=0.98, yanchor="top",
             font=dict(size=18),
         ),
         xaxis_title="Mês de referência", yaxis_title="Valor (R$)",
@@ -1509,10 +1521,13 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
             texto_periodo += " até o momento (contrato(s) ainda em aberto)"
         linhas.append(texto_periodo)
 
-    linhas.append(
-        f"**Grupos de contrato no gráfico:** {len(historicos)} "
-        f"(de {contratos['codigoContrato'].nunique()} grupo(s) reais)"
-    )
+    # "Grupos de contrato no gráfico" foi removido daqui — comparava
+    # len(historicos) com a quantidade de códigos "crus" da Base_Clientes,
+    # mas a diferença normal (ex: 1 de 2) é só a unificação aluguel+
+    # licenciamento acontecendo direito, não perda de informação; ficava
+    # confuso sem esse contexto. Quando ALGO realmente é agrupado por
+    # falta de espaço (o "Outros" no gráfico), já existe um aviso
+    # específico e claro pra isso (em agrupar_historicos_para_grafico).
 
     return "\n\n".join(linhas)
 
@@ -1866,6 +1881,12 @@ def relatorio_cliente(
     contratos["Situação"] = contratos["situacaoContrato"].map(SITUACAO_CONTRATO_LABELS).fillna(contratos["situacaoContrato"])
     contratos["Mensalidade"] = contratos["Preco_Unitario"].apply(lambda v: formatar_moeda(v) if pd.notna(v) else "")
     contratos["dataCriacao"] = parse_data_flexivel(contratos["dataCriacao"])
+    # coluna de EXIBIÇÃO separada (dd/mm/aaaa, sem hora) — a "dataCriacao"
+    # original continua como datetime de verdade, porque o pareamento de
+    # contratos (montar_grupos_contrato) precisa comparar essas datas
+    # entre si; só pra mostrar na tela que formatamos como texto
+    contratos["Data Criação"] = contratos["dataCriacao"].dt.strftime("%d/%m/%Y")
+    contratos["Data Criação"] = contratos["Data Criação"].fillna("")
 
     # busca a data de cancelamento no BigQuery só para os grupos encerrados
     # (evita consulta desnecessária para contratos ainda ativos)
@@ -2045,7 +2066,7 @@ def relatorio_cliente(
     st.subheader(f"Itens/contratos encerrados/cancelados ({qtd_encerrados_itens} item(ns) / {qtd_encerrados_grupos} grupo(s))", anchor=False)
     st.dataframe(contratos[contratos["situacaoContrato"] == "E"][[
         "codigoContrato", "Descricao_Material", "Descricao",
-        "Descricao_Cancelamento", "Data Cancelamento", "dataCriacao",
+        "Descricao_Cancelamento", "Data Cancelamento", "Data Criação",
         "observacao", "contratoTerceiro", "Mensalidade", "diaVencimento",
     ]].sort_values("codigoContrato"), use_container_width=True, hide_index=True)
 
