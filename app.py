@@ -1054,7 +1054,7 @@ def plotar_historico_multi(
                     )
                     if motivo:
                         hover_cancel += f" — Motivo: {motivo}"
-                    hover_cancel += "<br>O grupo continuou sendo cobrado com o(s) outro(s) contrato(s) — não acabou aqui."
+                    hover_cancel += "<br>Contrato segue de outra forma."
                     cor_marcador, simbolo, tamanho = "#f59e0b", "circle-open", 13
                 else:
                     hover_cancel = f"<b>Contrato {h['grupo']} cancelado em {data_cancel}</b>"
@@ -1394,33 +1394,38 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
         contratos.loc[contratos["situacaoContrato"] == "A", "Preco_Unitario"], errors="coerce"
     ).sum()
 
+    # ordem: Contratos, Equipamentos, depois o resto (valores derivados
+    # dos dois primeiros vêm logo em seguida a cada um)
     linhas.append(
         f"**Contratos:** {qtd_ativos} ativo(s), {qtd_encerrados} encerrado(s)"
         + (f", {qtd_outros} em outra situação" if qtd_outros else "")
     )
-    linhas.append(f"**Mensalidade atual** (soma dos contratos ativos): {formatar_moeda(mensalidade_atual)}")
 
     if len(equipamentos):
         # um serial pode aparecer em mais de uma linha (equipamento
-        # "duplo"/"triplo": mesmo chassi físico, vários bicos/produtos,
-        # ex: S10 + S500 no mesmo serial) — pra contar EQUIPAMENTOS de
-        # verdade, usamos serial único, não a quantidade de linhas
+        # "múltiplo": mesmo chassi físico, vários bicos/produtos — duplo,
+        # triplo, quádruplo, etc. — não vale a pena distinguir cada
+        # variação no texto) — pra contar EQUIPAMENTOS de verdade, usamos
+        # serial único, não a quantidade de linhas
         qtd_registros = len(equipamentos)
         qtd_equip_unicos = equipamentos["serial_equipamento"].nunique()
         qtd_outro_local = equipamentos["cliente_cigam_local"].ne(equipamentos["cliente_cigam_pagante"]).sum()
 
         texto_qtd = f"{qtd_equip_unicos} equipamento(s) (serial único)"
-        if qtd_registros != qtd_equip_unicos:
-            texto_qtd += f" — {qtd_registros} registro(s) na planilha (alguns são duplo/triplo, mesmo serial)"
         linhas.append(
             f"**Equipamentos sob responsabilidade:** {texto_qtd}"
             + (f" ({qtd_outro_local} registro(s) em local diferente do pagante)" if qtd_outro_local else "")
         )
+    else:
+        linhas.append("**Equipamentos sob responsabilidade:** 0")
 
+    linhas.append(f"**Mensalidade atual** (soma dos contratos ativos): {formatar_moeda(mensalidade_atual)}")
+
+    if len(equipamentos):
+        qtd_equip_unicos = equipamentos["serial_equipamento"].nunique()
         valor_medio_equip = mensalidade_atual / qtd_equip_unicos
         linhas.append(f"**Valor médio por equipamento** (mensalidade atual / qtd. equipamentos únicos): {formatar_moeda(valor_medio_equip)}")
     else:
-        linhas.append("**Equipamentos sob responsabilidade:** 0")
         linhas.append("**Valor médio por equipamento:** N/D (sem equipamentos cadastrados como pagante)")
 
     motivos = contratos.loc[contratos["situacaoContrato"] == "E", "Descricao_Cancelamento"].value_counts()
@@ -1826,17 +1831,15 @@ def relatorio_cliente(
     if len(equipamentos):
         equipamentos["Local ≠ Pagante?"] = equipamentos["cliente_cigam_local"] != equipamentos["cliente_cigam_pagante"]
         # marca quando o serial se repete em mais de uma linha (equipamento
-        # duplo/triplo: mesmo chassi físico, vários bicos/produtos) — pra
-        # não parecer que são equipamentos diferentes
-        equipamentos["Duplo/Triplo?"] = equipamentos.duplicated(subset="serial_equipamento", keep=False)
+        # "múltiplo": mesmo chassi físico, vários bicos/produtos — duplo,
+        # triplo, quádruplo, etc., não vale a pena nomear cada variação)
+        # — pra não parecer que são equipamentos diferentes
+        equipamentos["Múltiplo?"] = equipamentos.duplicated(subset="serial_equipamento", keep=False)
         equipamentos = equipamentos.sort_values(["local_nome", "serial_equipamento"])
 
     qtd_equip_unicos = equipamentos["serial_equipamento"].nunique() if len(equipamentos) else 0
-    label_qtd_equip = (
-        str(qtd_equip_unicos) if qtd_equip_unicos == len(equipamentos)
-        else f"{qtd_equip_unicos} únicos ({len(equipamentos)} registros — inclui duplo/triplo)"
-    )
-    colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Duplo/Triplo?"]
+    label_qtd_equip = str(qtd_equip_unicos)
+    colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Múltiplo?"]
 
     if mostrar_lado_a_lado:
         contratos_ativos = contratos[contratos["situacaoContrato"] == "A"].sort_values("codigoContrato")
@@ -1962,14 +1965,29 @@ def relatorio_cliente(
 # --- 8. Interface (Streamlit) ---
 # ============================================================================
 # logo: coloque um arquivo "logo.png" na raiz do repositório (mesma pasta
-# do app.py) que ele aparece automaticamente ao lado do título. Sem o
-# arquivo, o título aparece sozinho (sem quebrar nada).
-col_logo, col_titulo = st.columns([1, 8])
-with col_logo:
+# do app.py) que ele aparece automaticamente ao lado do título. Usa HTML
+# com a imagem embutida em base64 (em vez de st.columns) porque
+# st.columns empilha verticalmente em telas estreitas — o que fazia a
+# logo aparecer pequena e separada do título, numa linha própria. Assim
+# os dois ficam sempre lado a lado, do tamanho que a gente definir.
+def _renderizar_cabecalho():
     if os.path.exists("logo.png"):
-        st.image("logo.png", width=70)
-with col_titulo:
-    st.title("Histórico de Mensalidade — CIGAM")
+        import base64
+        logo_b64 = base64.b64encode(open("logo.png", "rb").read()).decode()
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
+                <img src="data:image/png;base64,{logo_b64}" style="height:64px; width:auto;">
+                <h1 style="margin:0; font-size:2.25rem;">Histórico de Mensalidade — CIGAM</h1>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.title("Histórico de Mensalidade — CIGAM")
+
+
+_renderizar_cabecalho()
 st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
 with st.form("busca_cliente_form"):
