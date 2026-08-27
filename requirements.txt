@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+google-cloud-bigquery
+db-dtypes
+google-auth
+gspread
+gspread-dataframe
