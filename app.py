@@ -910,9 +910,39 @@ def plotar_historico_multi(
         # do material + observação. "Item (situação atual)" foi removido —
         # agora que temos o item real de cada mês (via NF), a versão
         # "atual" genérica não agrega mais nada, só duplicava informação
-        cabecalho_hover = f"<b>Contrato {h['grupo']}</b> — {h['descricao']}"
-        if h.get("observacao"):
-            cabecalho_hover += f"<br>Obs (situação atual): {h['observacao']}"
+        #
+        # RÓTULO DINÂMICO: se o grupo teve um cancelamento PARCIAL (só um
+        # dos códigos foi cancelado, ex: aluguel 90011, mas o
+        # licenciamento 90012 continuou), o rótulo "90011/90012" some
+        # sendo enganoso pros meses DEPOIS do cancelamento — dá a entender
+        # que os dois ainda estão em vigor. A partir do mês do
+        # cancelamento, o cabeçalho passa a usar só o(s) código(s) que
+        # realmente continuam ativos.
+        codigos_grupo = h.get("codigos_grupo") or []
+        codigos_ativos = h.get("codigos_ativos") or []
+        teve_cancelamento_parcial = bool(codigos_ativos) and len(codigos_ativos) < len(codigos_grupo)
+        rotulo_pos_cancelamento = "/".join(codigos_ativos) if teve_cancelamento_parcial else None
+
+        mes_cancel = None
+        data_cancel = h.get("data_cancelamento")
+        if data_cancel and str(data_cancel).strip():
+            data_cancel_dt = pd.to_datetime(str(data_cancel), dayfirst=True, errors="coerce")
+            if pd.notna(data_cancel_dt):
+                mes_cancel = str(data_cancel_dt.to_period("M"))
+
+        def _cabecalho_para_mes(mes_str_ponto):
+            """Antes do cancelamento (ou se não houve cancelamento
+            parcial): usa o grupo completo, ex: '90011/90012'. A partir
+            do mês do cancelamento: usa só o(s) código(s) ainda ativo(s),
+            ex: '90012' — reflete o que está em vigor de verdade naquele
+            mês, não o que era em vigor lá no início do histórico."""
+            rotulo = h["grupo"]
+            if rotulo_pos_cancelamento and mes_cancel and mes_str_ponto >= mes_cancel:
+                rotulo = rotulo_pos_cancelamento
+            texto = f"<b>Contrato {rotulo}</b> — {h['descricao']}"
+            if h.get("observacao"):
+                texto += f"<br>Obs (situação atual): {h['observacao']}"
+            return texto
 
         faturas = df_m["fatura"].tolist() if "fatura" in df_m.columns else [""] * len(valores)
         composicoes_mes = df_m["composicao_mes"].fillna("").tolist() if "composicao_mes" in df_m.columns else [""] * len(valores)
@@ -920,6 +950,7 @@ def plotar_historico_multi(
 
         hover_texts = []
         for j, (mes_fmt, val) in enumerate(zip(eixo_labels, valores)):
+            cabecalho_hover = _cabecalho_para_mes(meses_str[j])
             if pd.isna(val):
                 texto = f"{cabecalho_hover}<br>{mes_fmt}: <i>sem parcela emitida neste mês</i>"
                 hover_texts.append(texto)
@@ -1054,10 +1085,9 @@ def plotar_historico_multi(
         # âmbar (não preto) com texto deixando claro que é só uma parte,
         # não o contrato inteiro. Só usa o losango preto "fim de verdade"
         # quando não há mais nada depois.
-        data_cancel = h.get("data_cancelamento")
+        # (data_cancel/mes_cancel já foram calculados mais acima, junto
+        # com o cabeçalho do hover — reaproveitados aqui)
         if data_cancel and str(data_cancel).strip():
-            data_cancel_dt = pd.to_datetime(str(data_cancel), dayfirst=True, errors="coerce")
-            mes_cancel = str(data_cancel_dt.to_period("M")) if pd.notna(data_cancel_dt) else None
             if mes_cancel in meses_str:
                 idx = meses_str.index(mes_cancel)
                 motivo = h.get("motivo_cancelamento") or ""
@@ -1191,22 +1221,60 @@ def plotar_historico_multi(
         return resultado
 
     # título muda de texto junto com o filtro clicado (Todos/Só Ativos/Só
-    # Encerrados) — é o jeito mais seguro de indicar visualmente qual
-    # filtro está ativo: título já é comprovadamente estável (não corta
-    # nem empurra nada, diferente de anotação solta em y>1 ou do destaque
-    # nativo do Plotly nos botões, que causava o "pulo" que já corrigimos)
+    # Encerrados) — continua ajudando mesmo com o destaque visual nos
+    # próprios botões, é um reforço redundante de propósito
     def _titulo_com_filtro(rotulo_filtro):
         return f"{titulo}<br><sup>{subtitulo} — Filtro atual: <b>{rotulo_filtro}</b></sup>"
 
-    # method="update" (não "restyle") porque precisa mudar DUAS coisas ao
-    # mesmo tempo: a visibilidade das linhas E o texto do título — args[0]
-    # é a parte de "restyle" (traces), args[1] é a parte de "relayout"
-    # (layout, aqui só o título)
-    botoes_filtro = [
-        dict(label="Todos", method="update", args=[{"visible": visibilidade(None)}, {"title.text": _titulo_com_filtro("Todos")}]),
-        dict(label="Só Ativos", method="update", args=[{"visible": visibilidade("A")}, {"title.text": _titulo_com_filtro("Só Ativos")}]),
-        dict(label="Só Encerrados", method="update", args=[{"visible": visibilidade("E")}, {"title.text": _titulo_com_filtro("Só Encerrados")}]),
+    # cores do botão selecionado vs. não selecionado — só muda
+    # bgcolor/bordercolor (preenchimento), NUNCA borderwidth. Mudar a
+    # ESPESSURA da borda é o que causava o "pulo" antes (o botão ficava
+    # fisicamente maior); mudar só a cor de preenchimento não altera o
+    # tamanho renderizado em nada, então é seguro.
+    COR_BOTAO_ATIVO_BG, COR_BOTAO_ATIVO_BORDA = COR_UNIAO_ALUGUEL_LICENCIAMENTO, "#F1F1F1"
+    COR_BOTAO_INATIVO_BG, COR_BOTAO_INATIVO_BORDA = "#26263A", COR_UNIAO_ALUGUEL_LICENCIAMENTO
+
+    def _estilo_dos_3_botoes(indice_selecionado):
+        """Cada botão é o SEU PRÓPRIO updatemenu (não um menu com 3
+        botões) — só assim dá pra colorir cada um independentemente.
+        Clicar em qualquer um deles recolore os 3 juntos: o clicado fica
+        'preenchido' (ativo), os outros dois voltam a ficar 'vazados'."""
+        estilo = {}
+        for i in range(3):
+            ativo = i == indice_selecionado
+            estilo[f"updatemenus[{i}].bgcolor"] = COR_BOTAO_ATIVO_BG if ativo else COR_BOTAO_INATIVO_BG
+            estilo[f"updatemenus[{i}].bordercolor"] = COR_BOTAO_ATIVO_BORDA if ativo else COR_BOTAO_INATIVO_BORDA
+        return estilo
+
+    def _relayout_do_filtro(indice_selecionado, rotulo_filtro):
+        return {**_estilo_dos_3_botoes(indice_selecionado), "title.text": _titulo_com_filtro(rotulo_filtro)}
+
+    # posições fixas lado a lado (âncora à esquerda, com folga generosa
+    # entre elas — cada rótulo tem um tamanho bem diferente: "Todos" é
+    # curto, "Só Encerrados" é bem mais longo)
+    _config_botoes = [
+        ("Todos", None, 0, 0.775),
+        ("Só Ativos", "A", 1, 0.828),
+        ("Só Encerrados", "E", 2, 0.901),
     ]
+
+    updatemenus_filtro = []
+    for rotulo, filtro, idx, x_pos in _config_botoes:
+        ativo_inicial = idx == 0  # "Todos" começa selecionado
+        updatemenus_filtro.append(dict(
+            type="buttons",
+            buttons=[dict(
+                label=rotulo, method="update",
+                args=[{"visible": visibilidade(filtro)}, _relayout_do_filtro(idx, rotulo)],
+            )],
+            x=x_pos, y=1.05, xanchor="left", yanchor="top",
+            showactive=False,
+            bgcolor=COR_BOTAO_ATIVO_BG if ativo_inicial else COR_BOTAO_INATIVO_BG,
+            bordercolor=COR_BOTAO_ATIVO_BORDA if ativo_inicial else COR_BOTAO_INATIVO_BORDA,
+            borderwidth=1,
+            font=dict(size=13, color="#F1F1F1"),
+            pad=dict(t=8, b=8, l=10, r=10),
+        ))
 
     passo = max(1, len(todos_meses_str) // 24)
 
@@ -1264,26 +1332,7 @@ def plotar_historico_multi(
             font=dict(size=13), groupclick="togglegroup",
         ),
         margin=dict(t=170, b=170, l=100, r=90),
-        updatemenus=[
-            dict(
-                type="buttons", direction="right", buttons=botoes_filtro,
-                # xanchor="left" com x FIXO (em vez de "right"): se a
-                # largura do grupo de botões variar por qualquer motivo
-                # (fonte, renderização), o ponto de partida (esquerda)
-                # continua fixo — só o espaço vazio à direita cresce ou
-                # encolhe, os botões em si nunca mudam de lugar visível.
-                x=0.72, y=1.05, xanchor="left", yanchor="top",
-                showactive=False,
-                # cores/bordas explícitas pros 3 estados possíveis do
-                # botão (normal, hover, clicado) — sem isso, o Plotly usa
-                # valores padrão que podem variar sutilmente o tamanho
-                # renderizado de um estado pro outro, dando a impressão
-                # de "pular"
-                bgcolor="#26263A", bordercolor="#382fd8", borderwidth=1,
-                font=dict(size=13, color="#F1F1F1"),
-                pad=dict(t=8, b=8, l=10, r=10),
-            ),
-        ],
+        updatemenus=updatemenus_filtro,
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
             categoryorder="array", categoryarray=todos_meses_str,
@@ -1977,6 +2026,13 @@ def relatorio_cliente(
                 # mini-gráficos (que só mostra os ativos) mesmo o
                 # licenciamento continuando cobrando
                 "situacao": "A" if (subset["situacaoContrato"] == "A").any() else subset["situacaoContrato"].iloc[0],
+                # códigos que compõem o grupo e quais deles CONTINUAM
+                # ativos hoje — usado pra, depois de um cancelamento
+                # parcial, o hover mostrar só o(s) código(s) de verdade
+                # em vigor naquele mês, em vez de manter "90011/90012"
+                # pra sempre mesmo com o 90011 já cancelado
+                "codigos_grupo": subset["codigoContrato"].unique().tolist(),
+                "codigos_ativos": subset.loc[subset["situacaoContrato"] == "A", "codigoContrato"].unique().tolist(),
                 "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum() if not df_hist.empty else 0,
             })
     if _contador_fallback_json["qtd"] > 0:
