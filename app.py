@@ -754,27 +754,17 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     if "previsao" in df.columns:
         df = df[~df["previsao"].apply(eh_previsao)]
 
-    # data_ref = mês de REFERÊNCIA da mensalidade (usado só pra agrupar no
-    # eixo do gráfico, ex: "PERÍODO: Novembro/2020") — continua vindo do
-    # vencimento, isso não muda
-    df["data_ref"] = pd.to_datetime(df["vencimentoOriginal"], dayfirst=True, errors="coerce")
-    df["data_ref"] = df["data_ref"].fillna(pd.to_datetime(df["vencimento"], dayfirst=True, errors="coerce"))
-
-    # já o CRITÉRIO DE CORTE (é provisão futura ou já foi lançado de
-    # verdade?) usa a data de EMISSÃO da NF. Vencimento é só "quando
-    # vence", não indica se a cobrança já foi de fato emitida — uma
-    # parcela pode vencer daqui a poucos dias mas já ter sido emitida há
-    # semanas (inclui), ou o contrário: vencimento já passado mas nunca
-    # emitida (é só provisão, exclui).
-    #
-    # IMPORTANTE: uso APENAS 'emissao', não caio pra 'data' (data do
-    # lançamento contábil) linha a linha — o CIGAM parece criar o
-    # lançamento de provisões futuras com antecedência (campo 'data'
-    # preenchido) mesmo sem ter emitido a NF ainda (campo 'emissao' só
-    # preenche quando a NF sai de verdade). Usar 'data' como fallback
-    # por linha incluía provisão por engano. Só recorro a 'data' (pro
-    # SUBCONTRATO INTEIRO, não linha a linha) se ele não tiver NENHUMA
-    # emissão registrada — sinal de que esse schema não usa esse campo.
+    # MÊS DE REFERÊNCIA (data_ref) agora usa a MESMA data do critério de
+    # corte (emissão), não mais vencimento. Descobrimos com dado real
+    # (cliente HOK, contrato 1146) que usar vencimento pra agrupar por
+    # mês criava colisões: esse contrato fatura ~3-4 semanas antes do
+    # vencimento, e às vezes isso empurra a emissão de DOIS meses
+    # consecutivos pro mesmo mês de vencimento — fazendo parecer que tem
+    # "cobrança duplicada" num mês só, quando na verdade são duas
+    # cobranças de meses DIFERENTES que só coincidem no vencimento.
+    # Confirmamos isso agrupando por emissão: os "meses suspeitos" se
+    # separaram corretamente em dois meses cada. Emissão é uma data mais
+    # fiel ao período de referência de verdade do que vencimento.
     if "emissao" in df.columns:
         df["data_emissao"] = pd.to_datetime(df["emissao"], dayfirst=True, errors="coerce")
     else:
@@ -783,17 +773,23 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     mes_atual = pd.Timestamp.now().to_period("M")
     if df["data_emissao"].notna().any():
         # tem pelo menos uma emissão real registrada nesse subcontrato ->
-        # usa 'emissao' como critério; linhas sem emissão ficam de fora
-        # (são provisão, mesmo que 'data'/vencimento já tenham passado)
+        # usa 'emissao' tanto pro corte (provisão futura fica de fora)
+        # quanto pro mês de referência (agrupamento no gráfico)
         df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") <= mes_atual)]
+        df["data_ref"] = df["data_emissao"]
     elif "data" in df.columns and pd.to_datetime(df["data"], dayfirst=True, errors="coerce").notna().any():
         # nenhuma linha tem 'emissao' preenchida -> esse schema
-        # provavelmente não usa esse campo; cai pra 'data' como um todo
+        # provavelmente não usa esse campo; cai pra 'data' como um todo,
+        # tanto pro corte quanto pro mês de referência
         df["data_lancamento"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
         df = df[df["data_lancamento"].notna() & (df["data_lancamento"].dt.to_period("M") <= mes_atual)]
+        df["data_ref"] = df["data_lancamento"]
     else:
         # fallback final: nem emissao nem data existem -> volta a usar
         # vencimento, mesma lógica de antes, pra não zerar o histórico
+        # (única situação em que data_ref ainda vem de vencimento)
+        df["data_ref"] = pd.to_datetime(df["vencimentoOriginal"], dayfirst=True, errors="coerce")
+        df["data_ref"] = df["data_ref"].fillna(pd.to_datetime(df["vencimento"], dayfirst=True, errors="coerce"))
         df = df[df["data_ref"].isna() | (df["data_ref"].dt.to_period("M") <= mes_atual)]
 
     df["mes"] = df["data_ref"].dt.to_period("M")
@@ -1485,62 +1481,38 @@ def plotar_historico_multi(
         return resultado
 
     # título muda de texto junto com o filtro clicado (Todos/Só Ativos/Só
-    # Encerrados) — continua ajudando mesmo com o destaque visual nos
-    # próprios botões, é um reforço redundante de propósito
+    # Encerrados) — é o indicador PRINCIPAL de qual filtro está ativo,
+    # porque é comprovadamente estável (não depende de medir largura de
+    # texto manualmente, ao contrário dos botões)
     def _titulo_com_filtro(rotulo_filtro):
         return f"{titulo}<br><sup>{subtitulo} — Filtro atual: <b>{rotulo_filtro}</b></sup>"
 
-    # cores do botão selecionado vs. não selecionado — só muda
-    # bgcolor/bordercolor (preenchimento), NUNCA borderwidth. Mudar a
-    # ESPESSURA da borda é o que causava o "pulo" antes (o botão ficava
-    # fisicamente maior); mudar só a cor de preenchimento não altera o
-    # tamanho renderizado em nada, então é seguro.
-    COR_BOTAO_ATIVO_BG, COR_BOTAO_ATIVO_BORDA = COR_UNIAO_ALUGUEL_LICENCIAMENTO, "#F1F1F1"
-    COR_BOTAO_INATIVO_BG, COR_BOTAO_INATIVO_BORDA = "#26263A", COR_UNIAO_ALUGUEL_LICENCIAMENTO
-
-    def _estilo_dos_3_botoes(indice_selecionado):
-        """Cada botão é o SEU PRÓPRIO updatemenu (não um menu com 3
-        botões) — só assim dá pra colorir cada um independentemente.
-        Clicar em qualquer um deles recolore os 3 juntos: o clicado fica
-        'preenchido' (ativo), os outros dois voltam a ficar 'vazados'."""
-        estilo = {}
-        for i in range(3):
-            ativo = i == indice_selecionado
-            estilo[f"updatemenus[{i}].bgcolor"] = COR_BOTAO_ATIVO_BG if ativo else COR_BOTAO_INATIVO_BG
-            estilo[f"updatemenus[{i}].bordercolor"] = COR_BOTAO_ATIVO_BORDA if ativo else COR_BOTAO_INATIVO_BORDA
-        return estilo
-
-    def _relayout_do_filtro(indice_selecionado, rotulo_filtro):
-        return {**_estilo_dos_3_botoes(indice_selecionado), "title.text": _titulo_com_filtro(rotulo_filtro)}
-
-    # posições fixas lado a lado (âncora à esquerda) — a tentativa
-    # anterior apertou demais (o texto real ocupa mais espaço do que eu
-    # tinha estimado, então "Todos" e "Só Ativos" ficaram quase colados).
-    # Volta a abrir um pouco, com uma estimativa de largura de caractere
-    # mais generosa dessa vez.
-    _config_botoes = [
-        ("Todos", None, 0, 0.780),
-        ("Só Ativos", "A", 1, 0.820),
-        ("Só Encerrados", "E", 2, 0.877),
+    botoes_filtro = [
+        dict(label="Todos", method="update", args=[{"visible": visibilidade(None)}, {"title.text": _titulo_com_filtro("Todos")}]),
+        dict(label="Só Ativos", method="update", args=[{"visible": visibilidade("A")}, {"title.text": _titulo_com_filtro("Só Ativos")}]),
+        dict(label="Só Encerrados", method="update", args=[{"visible": visibilidade("E")}, {"title.text": _titulo_com_filtro("Só Encerrados")}]),
     ]
 
-    updatemenus_filtro = []
-    for rotulo, filtro, idx, x_pos in _config_botoes:
-        ativo_inicial = idx == 0  # "Todos" começa selecionado
-        updatemenus_filtro.append(dict(
-            type="buttons",
-            buttons=[dict(
-                label=rotulo, method="update",
-                args=[{"visible": visibilidade(filtro)}, _relayout_do_filtro(idx, rotulo)],
-            )],
-            x=x_pos, y=1.05, xanchor="left", yanchor="top",
-            showactive=False,
-            bgcolor=COR_BOTAO_ATIVO_BG if ativo_inicial else COR_BOTAO_INATIVO_BG,
-            bordercolor=COR_BOTAO_ATIVO_BORDA if ativo_inicial else COR_BOTAO_INATIVO_BORDA,
-            borderwidth=1,
+    # 1 ÚNICO menu com os 3 botões juntos (não mais 3 menus separados com
+    # posição calculada na mão) — o gráfico usa width=1900 mas é exibido
+    # com use_container_width=True, que REDIMENSIONA pro tamanho real do
+    # navegador; qualquer posição em fração calculada assumindo 1900px
+    # fica errada sempre que o navegador renderiza mais estreito (quase
+    # sempre). Deixando o Plotly medir o texto de verdade na hora de
+    # desenhar (dentro de 1 menu só), o espaçamento fica certo não
+    # importa a largura final da tela. showactive=True dá o destaque
+    # nativo de "qual está selecionado" — o próprio Plotly cuida disso
+    # de forma consistente, sem a gente precisar recalcular nada.
+    updatemenus_filtro = [
+        dict(
+            type="buttons", direction="right", buttons=botoes_filtro,
+            x=1.0, y=1.05, xanchor="right", yanchor="top",
+            showactive=True,
+            bgcolor="#26263A", bordercolor=COR_UNIAO_ALUGUEL_LICENCIAMENTO, borderwidth=1,
             font=dict(size=13, color="#F1F1F1"),
-            pad=dict(t=8, b=8, l=8, r=8),
-        ))
+            pad=dict(t=8, b=8, l=10, r=10),
+        ),
+    ]
 
     passo = max(1, len(todos_meses_str) // 24)
 
