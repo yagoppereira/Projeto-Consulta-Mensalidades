@@ -1,7 +1,0 @@
-# Tema visual — CTA Comércio de Controles Eletrônicos S.A.
-# Cores do "Guia de Degradês e Identidade Visual" (jul/2026)
-[theme]
-primaryColor = "#382fd8"            # CTA Azul — botões, elementos interativos
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F1F1F1"  # CTA Cinza Claro — cards, inputs
-textColor = "#1E1E1E"                # CTA Preto
