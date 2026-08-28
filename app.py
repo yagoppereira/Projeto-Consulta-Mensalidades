@@ -1886,17 +1886,19 @@ def plotar_historico_multi(
     return fig, detalhes_md
 
 
-def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", max_visiveis: int = 6):
+def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
     """
     Um card por grupo de contrato — situação, valor atual, variação
     recente e avisos (mês sem faturamento, cancelamento parcial),
     pensado pra ficar do lado do gráfico principal (não dentro dele).
 
     Contratos ATIVOS aparecem primeiro (é o que interessa no dia a dia);
-    encerrados vão pro fim, ordenados por valor. Só os primeiros
-    `max_visiveis` aparecem como card completo — o resto vai pra uma
-    lista compacta dentro de um expander, senão um cliente com 16+
-    contratos gera uma coluna de rolagem interminável ao lado do gráfico.
+    encerrados vão pro fim, ordenados por valor. TODOS os contratos
+    aparecem como card completo — antes só os 6 primeiros vinham como
+    card e o resto ia pra uma lista compacta, mas isso criava dois
+    formatos diferentes pra mesma informação. Agora a lista inteira vive
+    dentro de um contêiner de altura fixa (mesma do gráfico) com rolagem
+    própria, então nada é cortado e a página não estica.
 
     Cada card tem um checkbox que controla se aquela linha aparece no
     gráfico. Retorna o conjunto de grupos marcados (ou None quando
@@ -1947,7 +1949,7 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", max_visiv
     houve_interacao = False
     total = len(historicos_ordenados)
 
-    for indice_card, h in enumerate(historicos_ordenados[:max_visiveis]):
+    for indice_card, h in enumerate(historicos_ordenados):
         cor, valor_atual, variacao_bruto, variacao_pct, avisos = _montar_dados_card(h, indice_card, total)
         situacao_label = "🟢 Ativo" if h.get("situacao") == "A" else "⚪ Encerrado"
         valor_texto = formatar_moeda(valor_atual) if valor_atual is not None else "N/D"
@@ -1986,24 +1988,6 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", max_visiv
             if marcado:
                 grupos_marcados.add(h["grupo"])
                 houve_interacao = True
-
-    # resto vai pra uma lista compacta (sem card, sem checkbox) — evita
-    # uma coluna lateral quilométrica em clientes com muitos contratos
-    restantes = historicos_ordenados[max_visiveis:]
-    if restantes:
-        with st.expander(f"+ {len(restantes)} outro(s) contrato(s)"):
-            for h in restantes:
-                situacao_icone = "🟢" if h.get("situacao") == "A" else "⚪"
-                df_h = h.get("df")
-                valor = None
-                if df_h is not None and not df_h.empty:
-                    vals = pd.to_numeric(df_h.sort_values("mes")["valor"], errors="coerce").dropna()
-                    valor = vals.iloc[-1] if len(vals) else None
-                texto_valor = formatar_moeda(valor) if valor is not None else "N/D"
-                st.markdown(
-                    f"{situacao_icone} **{h['grupo']}** · {texto_valor}".replace("$", "&#36;"),
-                    unsafe_allow_html=True,
-                )
 
     return grupos_marcados if houve_interacao else None
 
@@ -2671,26 +2655,33 @@ def relatorio_cliente(
     colunas_equip = [c for c in colunas_equip if c in equipamentos.columns or c in ("Local ≠ Pagante?", "Múltiplo?")]
 
     def _tabela_equipamentos_colorida(df_equip):
-        """Colore TODOS os equipamentos num gradiente Verde→Azul (segue a
-        ordem da tabela, que já vem alinhada com os contratos quando dá
-        pra cruzar) — cada equipamento diferente ganha um tom distinto,
-        em vez de tudo igual/sem cor. Equipamentos 'múltiplos' (mesmo
-        serial — duplo/triplo/quádruplo) continuam com a MESMA cor entre
-        si, já que são o mesmo equipamento físico."""
+        """
+        Colore por LOCAL: equipamentos no mesmo local recebem a mesma cor.
+
+        Antes era um gradiente puro por ordem de linha — ficava bonito
+        mas não dizia nada (a cor não representava informação nenhuma).
+        Agrupar por local dá uma leitura real: dá pra ver de relance
+        quantos equipamentos estão em cada obra/filial e quais linhas
+        pertencem ao mesmo sítio, sem precisar ler a coluna de local
+        linha a linha. Locais com um único equipamento ficam sem cor,
+        pra destacar os agrupamentos de verdade.
+        """
         df_sel = df_equip[colunas_equip].copy()
-        seriais_em_ordem_unicos = list(dict.fromkeys(df_sel["serial_equipamento"].astype(str)))
-        qtd = len(seriais_em_ordem_unicos)
+
+        contagem_por_local = df_sel["local_nome"].astype(str).value_counts()
+        locais_com_varios = [loc for loc, qtd in contagem_por_local.items() if qtd > 1]
         mapa_cor = {
-            serial: interpolar_cor_gradiente(i / (qtd - 1) if qtd > 1 else 0)
-            for i, serial in enumerate(seriais_em_ordem_unicos)
+            loc: interpolar_cor_gradiente(i / (len(locais_com_varios) - 1) if len(locais_com_varios) > 1 else 0)
+            for i, loc in enumerate(locais_com_varios)
         }
-        df_sel = renomear_para_exibicao(df_sel)  # só troca o nome DEPOIS de calcular o mapa de cor acima
+        locais_da_linha = df_sel["local_nome"].astype(str).tolist()
+        df_sel = renomear_para_exibicao(df_sel)  # renomeia só DEPOIS de usar os nomes crus acima
 
         def _estilo_linha(linha):
-            cor = mapa_cor.get(str(linha["Serial"]))
+            cor = mapa_cor.get(locais_da_linha[linha.name] if linha.name in range(len(locais_da_linha)) else None)
             return [f"background-color: {cor}40"] * len(linha) if cor else [""] * len(linha)
 
-        return df_sel.style.apply(_estilo_linha, axis=1)
+        return df_sel.reset_index(drop=True).style.apply(_estilo_linha, axis=1)
 
     # --- monta o histórico (consultas ao BigQuery) ANTES de exibir
     # qualquer coisa na tela — o Resumo (que sobe pra logo depois do
@@ -2970,9 +2961,18 @@ def relatorio_cliente(
                         limpo = re.split(r"LICENCIAMENTO DE SOFTWARE", str(texto_item or ""), flags=re.IGNORECASE)[0]
                         return (limpo.strip(" -") or str(texto_item or ""))[:40]
 
+                    def _id_aparelho(texto_item):
+                        """Extrai o ID do aparelho do texto da NF (formato
+                        'SERIE 20802 #1 - ID 1285143632') — é o mesmo ID
+                        que aparece na descrição do contrato, então serve
+                        de ponte entre a nota e o cadastro do equipamento."""
+                        m = re.search(r"\bID\s*(\d+)", str(texto_item or ""), re.IGNORECASE)
+                        return m.group(1) if m else ""
+
                     df_equip_ponto = pd.DataFrame([
                         {
                             "Equipamento": _rotulo_equipamento(e.get("texto")),
+                            "ID": _id_aparelho(e.get("texto")),
                             "Tipo": str(e.get("tipo", "")).capitalize(),
                             "Valor": formatar_moeda(e.get("valor", 0)),
                             "NF": e.get("nf", ""),
@@ -2985,7 +2985,14 @@ def relatorio_cliente(
         else:
             st.markdown("**Contratos**")
             st.caption("Marque um contrato pra ver a linha dele no gráfico, ou clique num ponto pra ver o detalhe do mês.")
-            mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
+            # contêiner de altura fixa com rolagem própria: a lista mostra
+            # TODOS os contratos (nenhum fica escondido atrás de um "+N
+            # outros"), mas ocupa exatamente a mesma altura do gráfico ao
+            # lado, então a página não estica com clientes grandes.
+            # Mesma fórmula de altura usada em plotar_historico_multi.
+            altura_painel = min(900, max(560, 60 * len(historicos_grafico)))
+            with st.container(height=altura_painel):
+                mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
 
     # Os dois expanders ("Detalhamento completo das mudanças de
     # equipamento" e "Descrição/observação por contrato") e a grade de
