@@ -1460,12 +1460,41 @@ def plotar_historico_multi(
             # fino, exibido como tabela (aguenta 16+ linhas sem virar um
             # muro de texto, ao contrário de cards empilhados)
             equipamentos_do_ponto = []
+
+            # compara com o mês ANTERIOR que teve itens, pra marcar por
+            # item: entrou agora / subiu de preço / caiu de preço. Sem
+            # isso, a tabela do painel mostrava só os valores do mês, sem
+            # dizer o que mudou desde a última cobrança.
+            itens_mes_anterior = {}
+            for j_ant in range(j - 1, -1, -1):
+                anteriores = itens_mes_lista_pontos[j_ant] or []
+                if anteriores:
+                    for _nf_a, _d_a, v_a, t_a in anteriores:
+                        chave_a = _extrair_id_equipamento(t_a) or t_a
+                        if chave_a and v_a is not None and not pd.isna(v_a):
+                            itens_mes_anterior[chave_a] = v_a
+                    break
+
             for nf_item, desc_item, val_item, texto_item in itens_do_ponto:
                 if val_item is None or pd.isna(val_item):
                     continue
                 composicao_por_tipo[desc_item] = composicao_por_tipo.get(desc_item, 0.0) + val_item
+
+                chave_item = _extrair_id_equipamento(texto_item) or texto_item
+                valor_anterior = itens_mes_anterior.get(chave_item)
+                if not itens_mes_anterior:
+                    situacao_item, pct_item = "", None  # sem base de comparação
+                elif valor_anterior is None:
+                    situacao_item, pct_item = "novo", None
+                elif valor_anterior and val_item != valor_anterior:
+                    pct_item = (val_item - valor_anterior) / valor_anterior * 100
+                    situacao_item = "subiu" if val_item > valor_anterior else "caiu"
+                else:
+                    situacao_item, pct_item = "igual", None
+
                 equipamentos_do_ponto.append({
                     "nf": nf_item, "tipo": desc_item, "valor": val_item, "texto": texto_item,
+                    "situacao_item": situacao_item, "pct_item": pct_item,
                 })
 
             dados_estruturados.append({
@@ -1528,7 +1557,11 @@ def plotar_historico_multi(
             trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
         # TODOS os pontos de mudança ganham um marcador colorido (sem texto)
-        idx_variacao = [j for j, p in enumerate(variacoes_pct) if p is not None]
+        # — o toggle "Marcadores de contrato cancelado" também controla
+        # estes: ele é, na prática, um interruptor de "marcações de evento
+        # no gráfico" (cancelamento E variação de valor), pra quem quer só
+        # a linha limpa
+        idx_variacao = [j for j, p in enumerate(variacoes_pct) if p is not None] if mostrar_eventos_cancelamento else []
         if idx_variacao:
             fig.add_trace(go.Scatter(
                 x=[meses_str[j] for j in idx_variacao],
@@ -1793,7 +1826,10 @@ def plotar_historico_multi(
     # rolagem enorme. Como as linhas individuais agora começam escondidas
     # (só a Total visível), não faz sentido reservar altura pra todas
     # elas de antemão.
-    altura_fig = min(900, max(560, 60 * len(historicos_validos)))
+    # altura mínima maior (era 560): com a margem inferior ampliada pra
+    # caber rótulos + legenda sem colidir, um gráfico baixo demais
+    # esmagava a área de plotagem em si.
+    altura_fig = min(950, max(700, 60 * len(historicos_validos)))
 
     # limite de zoom-out: sem isso, o Plotly deixa a pessoa afastar o
     # zoom indefinidamente, mostrando um espaço vazio gigante em volta de
@@ -1837,14 +1873,16 @@ def plotar_historico_multi(
         # colidir amanhã). Embaixo do eixo X ela nunca disputa espaço
         # com o eixo Y, independente do cliente/valores.
         legend=dict(
-            orientation="h", yanchor="top", y=-0.16, xanchor="center", x=0.5,
-            font=dict(size=13), groupclick="togglegroup",
+            # y mais afastado (era -0.16): a posição é uma FRAÇÃO da
+            # altura, então quando o gráfico ficou mais baixo essa fração
+            # virou poucos pixels e a legenda subiu em cima dos rótulos
+            # rotacionados do eixo X (que ocupam bastante altura).
+            orientation="h", yanchor="top", y=-0.30, xanchor="center", x=0.5,
+            font=dict(size=12), groupclick="togglegroup",
         ),
-        # margens reduzidas (eram t=170,b=170,l=100,r=90) — aquelas
-        # sobravam de quando o gráfico tinha width=1900 fixo e ocupava a
-        # tela inteira; numa coluna mais estreita elas comem uma fatia
-        # grande da área útil, deixando o gráfico em si espremido
-        margin=dict(t=120, b=120, l=70, r=40),
+        # margem inferior maior pra caber rótulos rotacionados + título do
+        # eixo + legenda sem sobreposição
+        margin=dict(t=110, b=190, l=70, r=40),
         updatemenus=updatemenus_filtro,
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
@@ -2824,10 +2862,10 @@ def relatorio_cliente(
     # que obrigava a refazer a busca inteira só pra ligar/desligar uns
     # marcadores.
     mostrar_eventos_cancelamento = st.toggle(
-        "Marcadores de contrato cancelado", value=mostrar_eventos_cancelamento,
+        "Marcadores de eventos no gráfico", value=mostrar_eventos_cancelamento,
         key=f"toggle_cancelamento_{nome_cliente}",
-        help="Desligue pra esconder os losangos/círculos e a linha vertical de cancelamento — "
-             "útil quando atrapalham a leitura de outras variações de valor na mesma época.",
+        help="Desligue pra ver só as linhas limpas — esconde os marcadores de cancelamento "
+             "(losangos/círculos + linha vertical) e os de aumento/redução de valor.",
     )
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
 
@@ -2993,12 +3031,31 @@ def relatorio_cliente(
                         m = re.search(r"\bID\s*(\d+)", str(texto_item or ""), re.IGNORECASE)
                         return m.group(1) if m else ""
 
+                    def _marca_variacao(item):
+                        """Sinaliza o que mudou nesse item desde a última
+                        cobrança: verde pra aumento, vermelho pra queda,
+                        azul pra 'entrou agora'. O percentual acompanha
+                        as duas primeiras (num item novo não há base de
+                        comparação pra calcular %)."""
+                        situacao = item.get("situacao_item")
+                        pct = item.get("pct_item")
+                        if situacao == "novo":
+                            return "🔵 Novo"
+                        if situacao == "subiu" and pct is not None:
+                            return f"🟢 +{pct:.1f}%"
+                        if situacao == "caiu" and pct is not None:
+                            return f"🔴 {pct:.1f}%"
+                        if situacao == "igual":
+                            return "—"
+                        return ""
+
                     df_equip_ponto = pd.DataFrame([
                         {
-                            "Equipamento": _rotulo_equipamento(e.get("texto")),
+                            "Descrição": _rotulo_equipamento(e.get("texto")),
                             "ID": _id_aparelho(e.get("texto")),
                             "Tipo": str(e.get("tipo", "")).capitalize(),
                             "Valor": formatar_moeda(e.get("valor", 0)),
+                            "Variação": _marca_variacao(e),
                             "NF": e.get("nf", ""),
                         }
                         for e in equipamentos
@@ -3014,7 +3071,7 @@ def relatorio_cliente(
             # outros"), mas ocupa exatamente a mesma altura do gráfico ao
             # lado, então a página não estica com clientes grandes.
             # Mesma fórmula de altura usada em plotar_historico_multi.
-            altura_painel = min(900, max(560, 60 * len(historicos_grafico)))
+            altura_painel = min(950, max(700, 60 * len(historicos_grafico)))
             with st.container(height=altura_painel):
                 mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
 
