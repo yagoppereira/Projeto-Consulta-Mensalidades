@@ -1291,7 +1291,18 @@ def plotar_historico_multi(
         # equipamento(s) que entraram/saíram entre o mês de origem da
         # variação e o mês atual — identificados pelo "ID xxxxx" que
         # aparece no texto de cada item, comparando as duas listas
-        itens_mes_lista = df_m["itens_mes_lista"].tolist() if "itens_mes_lista" in df_m.columns else [[]] * len(valores)
+        # mesma normalização defensiva do itens_mes_lista_pontos (ver
+        # comentário mais abaixo): NaN de reindex, coluna ausente no
+        # grupo "Outros", ou tuplas de tamanho inesperado
+        def _sanear_lista_itens(bruto):
+            if not isinstance(bruto, (list, tuple)):
+                return []
+            return [it for it in bruto if isinstance(it, (list, tuple)) and len(it) == 4]
+
+        itens_mes_lista = (
+            [_sanear_lista_itens(x) for x in df_m["itens_mes_lista"]]
+            if "itens_mes_lista" in df_m.columns else [[] for _ in valores]
+        )
 
         def _extrair_id_equipamento(texto):
             m = re.search(r"ID\s*(\d+)", str(texto))
@@ -1308,8 +1319,17 @@ def plotar_historico_multi(
             hover do gráfico)."""
             if idx_anterior is None:
                 return "", "", ""
-            itens_ant = itens_mes_lista[idx_anterior] or []
-            itens_atu = itens_mes_lista[idx_atual] or []
+            # mesma normalização defensiva usada mais abaixo: a coluna
+            # pode trazer NaN (meses preenchidos pelo reindex) ou tuplas
+            # de tamanho inesperado, e iterar/desempacotar isso quebrava
+            # a página inteira
+            def _itens_validos(bruto):
+                if not isinstance(bruto, (list, tuple)):
+                    return []
+                return [it for it in bruto if isinstance(it, (list, tuple)) and len(it) == 4]
+
+            itens_ant = _itens_validos(itens_mes_lista[idx_anterior])
+            itens_atu = _itens_validos(itens_mes_lista[idx_atual])
             mapa_ant = {_extrair_id_equipamento(t): (v, t) for _nf, _d, v, t in itens_ant if _extrair_id_equipamento(t)}
             mapa_atu = {_extrair_id_equipamento(t): (v, t) for _nf, _d, v, t in itens_atu if _extrair_id_equipamento(t)}
 
@@ -1383,7 +1403,21 @@ def plotar_historico_multi(
         faturas = df_m["fatura"].tolist() if "fatura" in df_m.columns else [""] * len(valores)
         composicoes_mes = df_m["composicao_mes"].fillna("").tolist() if "composicao_mes" in df_m.columns else [""] * len(valores)
         descricoes_mes = df_m["descricao_mes"].fillna("").tolist() if "descricao_mes" in df_m.columns else [""] * len(valores)
-        itens_mes_lista_pontos = df_m["itens_mes_lista"].tolist() if "itens_mes_lista" in df_m.columns else [[]] * len(valores)
+        # normaliza NA ORIGEM: a coluna pode trazer NaN (meses
+        # preenchidos pelo reindex, já que `NaN or []` devolve NaN — que
+        # é "verdadeiro" em Python) ou tuplas de tamanho inesperado, e o
+        # grupo agregado "Outros" nem tem essa coluna. Sanear aqui deixa
+        # todos os usos abaixo (len, iteração, desempacotamento) seguros
+        # sem precisar repetir a checagem em cada um.
+        def _sanear_itens(bruto):
+            if not isinstance(bruto, (list, tuple)):
+                return []
+            return [it for it in bruto if isinstance(it, (list, tuple)) and len(it) == 4]
+
+        itens_mes_lista_pontos = (
+            [_sanear_itens(x) for x in df_m["itens_mes_lista"]]
+            if "itens_mes_lista" in df_m.columns else [[] for _ in valores]
+        )
 
         hover_texts = []
         dados_estruturados = []  # customdata: cabeçalho + itens (nf, desc, valor) — pro detalhe do ponto clicado poder montar 1 card por item (ex: aluguel/licenciamento separados)
@@ -1462,12 +1496,25 @@ def plotar_historico_multi(
             equipamentos_do_ponto = []
 
             # compara com o mês ANTERIOR que teve itens, pra marcar por
-            # item: entrou agora / subiu de preço / caiu de preço. Sem
-            # isso, a tabela do painel mostrava só os valores do mês, sem
-            # dizer o que mudou desde a última cobrança.
+            # item: entrou agora / subiu de preço / caiu de preço.
+            #
+            # `_normalizar_itens` existe porque a coluna itens_mes_lista
+            # nem sempre traz uma lista de tuplas de 4: meses preenchidos
+            # pelo reindex viram NaN (e `NaN or []` devolve NaN, que é
+            # "verdadeiro" em Python — daí a tentativa de iterar sobre um
+            # float), e o grupo agregado "Outros" nem tem essa coluna.
+            # Normalizar aqui evita quebrar a página inteira por causa de
+            # um caso de borda desses.
+            def _normalizar_itens(bruto):
+                if not isinstance(bruto, (list, tuple)):
+                    return []
+                return [item for item in bruto if isinstance(item, (list, tuple)) and len(item) == 4]
+
+            itens_do_ponto = _normalizar_itens(itens_do_ponto)
+
             itens_mes_anterior = {}
             for j_ant in range(j - 1, -1, -1):
-                anteriores = itens_mes_lista_pontos[j_ant] or []
+                anteriores = _normalizar_itens(itens_mes_lista_pontos[j_ant])
                 if anteriores:
                     for _nf_a, _d_a, v_a, t_a in anteriores:
                         chave_a = _extrair_id_equipamento(t_a) or t_a
