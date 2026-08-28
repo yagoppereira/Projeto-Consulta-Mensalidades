@@ -1007,14 +1007,14 @@ PALETA_CONTRATOS = [
     "#b3f7e0",  # série verde, tom 1 (mais claro)
 ]
 
-# cores reservadas exclusivamente para os marcadores de aumento/redução —
-# a própria CTA já define essa convenção na "Série Divergente" do guia de
-# cores: Azul = negativo, Verde = positivo (não vermelho/verde genérico)
-COR_AUMENTO = "#19e098"  # CTA Verde
-COR_REDUCAO = "#1a1a2e"  # Azul Escuro (documentos formais) — bem mais
-# escuro/dessaturado que o Azul Institucional (#382fd8) e o tom escuro da
-# série azul (#2318a8) já usados nas linhas de contrato, pra não colidir
-# visualmente com elas quando o marcador cai em cima de uma linha azul
+# cores reservadas exclusivamente para os marcadores de aumento/redução.
+# Voltamos ao VERDE/VERMELHO convencional (a pedido): tínhamos testado
+# Verde/Azul seguindo a "Série Divergente" do guia de cores da CTA, mas
+# na prática o azul da redução se confundia com as linhas de contrato
+# (que também são azuis, pelo gradiente da marca) e o vermelho comunica
+# "caiu" de forma bem mais imediata pra quem lê o gráfico.
+COR_AUMENTO = "#19e098"  # CTA Verde (esse já era da marca, mantido)
+COR_REDUCAO = "#e5484d"  # vermelho — convenção universal de queda
 
 # cores por TIPO de contrato (identificado pelo texto — descrição,
 # composição, observação — não por ordem arbitrária). Se o tipo do grupo
@@ -1099,7 +1099,7 @@ def classificar_cor_grupo(h: dict) -> str:
 def plotar_historico_multi(
     historicos: list, titulo: str, subtitulo: str = "", incluir_total: bool = True,
     mostrar_texto_variacao: bool = False, limiar_anotacao_pct: float = 5.0,
-    mostrar_eventos_cancelamento: bool = True,
+    mostrar_eventos_cancelamento: bool = True, grupos_visiveis: set = None,
 ):
     """
     Plota UM gráfico com uma linha por grupo de contrato (cada `historicos[i]`
@@ -1142,6 +1142,10 @@ def plotar_historico_multi(
     # volta como "legendonly" (respeitando o "escondido por padrão") ou
     # como totalmente visível (linha Total sempre assim).
     trace_eh_grupo_individual = []
+    # paralelo também — a que GRUPO cada trace pertence (None pra linha
+    # Total). Usado pra respeitar a seleção feita nos checkboxes dos
+    # cards mesmo depois de clicar num botão de filtro.
+    trace_grupo_dono = []
     detalhes_mudancas_console = []  # (grupo, mes_fmt, direcao, valor_bruto, pct, novos, removidos, alterados) — sem resumir, pra imprimir no console
     # valores REAIS (não decorativos) de todas as linhas — usado só pra
     # calcular o limite de zoom-out do eixo Y. Populado à parte, na hora
@@ -1161,7 +1165,15 @@ def plotar_historico_multi(
         # nos vários fig.add_trace() abaixo, senão os marcadores (que têm
         # showlegend=False, não fazem parte do clique da legenda sozinhos)
         # ficariam "flutuando" visíveis mesmo com a linha escondida.
-        visivel_inicial_grupo = True if len(historicos_validos) <= 1 else "legendonly"
+        # visibilidade inicial: com 1 grupo só, sempre visível. Com
+        # vários, começa escondido (só na legenda) — a não ser que esse
+        # grupo tenha sido MARCADO num checkbox de card, aí aparece.
+        if len(historicos_validos) <= 1:
+            visivel_inicial_grupo = True
+        elif grupos_visiveis and h["grupo"] in grupos_visiveis:
+            visivel_inicial_grupo = True
+        else:
+            visivel_inicial_grupo = "legendonly"
 
         # preenche os meses que faltam no MEIO do período (do primeiro ao
         # último mês desse contrato) com um "buraco" (NaN) — sem isso, o
@@ -1436,7 +1448,7 @@ def plotar_historico_multi(
             # linhas quer inspecionar clicando na legenda.
             visible=visivel_inicial_grupo,
         ))
-        trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+        trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
         # marcador âmbar (nem verde nem vermelho) nos meses "incompletos"
         # — sinaliza visualmente que aquele ponto não é comparável (não é
@@ -1453,7 +1465,7 @@ def plotar_historico_multi(
                 hovertext=[hover_texts[j] for j in idx_incompletos], hoverinfo="text",
                 visible=visivel_inicial_grupo,
             ))
-            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
         # TODOS os pontos de mudança ganham um marcador colorido (sem texto)
         idx_variacao = [j for j, p in enumerate(variacoes_pct) if p is not None]
@@ -1470,7 +1482,7 @@ def plotar_historico_multi(
                 legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
                 visible=visivel_inicial_grupo,
             ))
-            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
         # só as mudanças RELEVANTES (>= limiar) ganham o texto escrito no
         # gráfico — e só quando mostrar_texto_variacao=True (desligado por
@@ -1494,7 +1506,7 @@ def plotar_historico_multi(
                     legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
                     visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
         # marcador de cancelamento + linha vertical, ambos como trace do
         # mesmo legendgroup (em vez de fig.add_vline, que é um "shape" do
@@ -1543,14 +1555,14 @@ def plotar_historico_multi(
                     hovertext=[hover_cancel], hoverinfo="text",
                     visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
                 fig.add_trace(go.Scatter(
                     x=[meses_str[idx], meses_str[idx]], y=[0, max(valores)],
                     mode="lines", line=dict(color=cor_marcador, width=1, dash="dash"),
                     opacity=0.35, legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
                     visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
 
     def adicionar_linha_total(subconjunto, variante, nome, visivel_inicialmente):
         """Adiciona uma linha 'Total' somando só os historicos do
@@ -1599,7 +1611,7 @@ def plotar_historico_multi(
             line=dict(color="black", width=3, dash="dot"),
             hovertext=hover_total, hoverinfo="text", customdata=dados_estruturados_total,
         ))
-        trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
+        trace_situacao.append(tag); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
 
         idx_var_t = [j for j, p in enumerate(var_pct_t) if p is not None]
         if idx_var_t:
@@ -1615,7 +1627,7 @@ def plotar_historico_multi(
                 legendgroup=legendgroup_total, showlegend=False, hoverinfo="skip",
                 visible=visivel_inicialmente,
             ))
-            trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
+            trace_situacao.append(tag); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
 
             if mostrar_texto_variacao:
                 idx_var_t_relevantes = [j for j in idx_var_t if abs(var_pct_t[j]) >= limiar_anotacao_pct]
@@ -1633,7 +1645,7 @@ def plotar_historico_multi(
                         legendgroup=legendgroup_total, showlegend=False, hoverinfo="skip",
                         visible=visivel_inicialmente,
                     ))
-                    trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
+                    trace_situacao.append(tag); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
 
     if incluir_total and len(historicos_validos) > 1:
         # 3 variantes pré-calculadas do Total, uma pra cada botão de
@@ -1652,21 +1664,21 @@ def plotar_historico_multi(
     # só com os contratos ativos, não o total geral escondido atrás do filtro
     def visibilidade(filtro):
         resultado = []
-        for s, eh_individual in zip(trace_situacao, trace_eh_grupo_individual):
+        for s, eh_individual, grupo_dono in zip(trace_situacao, trace_eh_grupo_individual, trace_grupo_dono):
             if s.startswith("total::"):
                 variante = s.split("::", 1)[1]
                 alvo = "todos" if filtro is None else filtro
                 resultado.append(variante == alvo)
             else:
                 corresponde = filtro is None or s == filtro
-                # se o trace é de um grupo individual (não a linha Total)
-                # e passou no filtro, volta como "legendonly" (escondido,
-                # só na legenda) em vez de True — preserva o "começa
-                # escondido por padrão" mesmo depois de clicar num botão
-                # de filtro; sem isso, qualquer clique nos botões forçava
-                # tudo de volta pra visível, perdendo esse comportamento
+                # grupo individual que passou no filtro: fica visível se
+                # estiver MARCADO num card, senão volta pra "legendonly"
+                # (escondido, só na legenda). Sem isso, clicar num botão
+                # de filtro forçava tudo de volta pra visível, perdendo
+                # tanto o "começa escondido" quanto a seleção dos cards.
                 if corresponde and eh_individual and len(historicos_validos) > 1:
-                    resultado.append("legendonly")
+                    esta_marcado = bool(grupos_visiveis) and grupo_dono in grupos_visiveis
+                    resultado.append(True if esta_marcado else "legendonly")
                 else:
                     resultado.append(corresponde)
         return resultado
@@ -1812,37 +1824,43 @@ def plotar_historico_multi(
     return fig, detalhes_md
 
 
-def mostrar_cards_contratos(historicos: list):
+def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", max_visiveis: int = 6):
     """
-    Um card por grupo de contrato — situação, valor atual, e avisos
-    (mês sem faturamento, cancelamento parcial), pensado pra ficar do
-    lado do gráfico principal (não dentro dele). Ideia: o gráfico fica
-    livre pra ser só a representação visual da tendência, e o detalhe
-    "tipo BI" (valor exato, status, avisos) mora nos cards, sem precisar
-    caber tudo no hover/legenda de um gráfico já cheio de linhas.
+    Um card por grupo de contrato — situação, valor atual, variação
+    recente e avisos (mês sem faturamento, cancelamento parcial),
+    pensado pra ficar do lado do gráfico principal (não dentro dele).
 
     Contratos ATIVOS aparecem primeiro (é o que interessa no dia a dia);
-    encerrados vão pro fim da lista, ordenados por valor.
+    encerrados vão pro fim, ordenados por valor. Só os primeiros
+    `max_visiveis` aparecem como card completo — o resto vai pra uma
+    lista compacta dentro de um expander, senão um cliente com 16+
+    contratos gera uma coluna de rolagem interminável ao lado do gráfico.
+
+    Cada card tem um checkbox que controla se aquela linha aparece no
+    gráfico. Retorna o conjunto de grupos marcados (ou None quando
+    ninguém mexeu em nada ainda, pra manter o comportamento padrão).
     """
     historicos_ordenados = sorted(
         historicos,
         key=lambda h: (h.get("situacao") != "A", -(h.get("valor_total") or 0)),
     )
-    for indice_card, h in enumerate(historicos_ordenados):
-        # mesma lógica de cor do gráfico (semântica quando dá, gradiente
-        # senão) — o card e a linha correspondente ficam com a mesma cor,
-        # o que ajuda a ligar visualmente um ao outro
+
+    def _montar_dados_card(h, indice_card, total_cards):
         cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
-            indice_card / (len(historicos_ordenados) - 1) if len(historicos_ordenados) > 1 else 0
+            indice_card / (total_cards - 1) if total_cards > 1 else 0
         )
         df_h = h.get("df")
 
-        valor_atual = None
+        valor_atual, variacao_bruto, variacao_pct = None, None, None
         if df_h is not None and not df_h.empty:
             valores_validos = pd.to_numeric(df_h.sort_values("mes")["valor"], errors="coerce").dropna()
-            valor_atual = valores_validos.iloc[-1] if len(valores_validos) else None
-
-        situacao_label = "🟢 Ativo" if h.get("situacao") == "A" else "⚪ Encerrado"
+            if len(valores_validos):
+                valor_atual = valores_validos.iloc[-1]
+            # variação entre os DOIS ÚLTIMOS meses com valor — é a
+            # informação de "pra onde está indo" que o card não tinha
+            if len(valores_validos) >= 2 and valores_validos.iloc[-2]:
+                variacao_bruto = valores_validos.iloc[-1] - valores_validos.iloc[-2]
+                variacao_pct = variacao_bruto / valores_validos.iloc[-2] * 100
 
         avisos = []
         if df_h is not None and len(df_h) >= 2:
@@ -1859,24 +1877,71 @@ def mostrar_cards_contratos(historicos: list):
             else:
                 avisos.append(f"⬛ Cancelado em {h['data_cancelamento']}")
 
+        return cor, valor_atual, variacao_bruto, variacao_pct, avisos
+
+    grupos_marcados = set()
+    houve_interacao = False
+    total = len(historicos_ordenados)
+
+    for indice_card, h in enumerate(historicos_ordenados[:max_visiveis]):
+        cor, valor_atual, variacao_bruto, variacao_pct, avisos = _montar_dados_card(h, indice_card, total)
+        situacao_label = "🟢 Ativo" if h.get("situacao") == "A" else "⚪ Encerrado"
+        valor_texto = formatar_moeda(valor_atual) if valor_atual is not None else "N/D"
+
+        texto_variacao = ""
+        if variacao_pct is not None and abs(variacao_pct) >= 0.05:
+            seta = "▲" if variacao_bruto > 0 else "▼"
+            cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
+            texto_variacao = (
+                f"<div style='font-size:0.85em; color:{cor_var};'>{seta} "
+                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%) vs. mês anterior</div>"
+            )
+
         with st.container(border=True):
             texto_avisos = "".join(f"<div style='font-size:0.85em; color:#F1F1F1cc;'>{a}</div>" for a in avisos)
-            valor_texto = formatar_moeda(valor_atual) if valor_atual is not None else "N/D"
             # HTML montado numa string ÚNICA, sem quebras de linha nem
             # indentação: markdown trata linha recuada com 4+ espaços como
-            # BLOCO DE CÓDIGO, então o HTML indentado (como estava antes)
-            # fazia o "</div>" final vazar como texto literal na tela em
-            # vez de fechar a tag. Escapa '$' pelo mesmo motivo de sempre
-            # (pares de '$' viram fórmula LaTeX no st.markdown).
+            # BLOCO DE CÓDIGO, o que fazia o "</div>" vazar como texto.
             html_card = (
                 f'<div style="border-left: 4px solid {cor}; padding-left: 10px;">'
                 f'<b>{h["grupo"]}</b><br>'
                 f'<span style="font-size:0.9em;">{h.get("descricao", "")}</span><br>'
                 f'{situacao_label} &nbsp;·&nbsp; <b>{valor_texto}</b>'
+                f'{texto_variacao}'
                 f'{texto_avisos}'
                 f'</div>'
             )
-            st.markdown(html_card.replace("$", "\\$"), unsafe_allow_html=True)
+            # '$' vira a entidade HTML &#36; — dentro de HTML o escape com
+            # barra invertida (\$) NÃO é interpretado, aparece literal na
+            # tela ("R\$ 11.475,00").
+            st.markdown(html_card.replace("$", "&#36;"), unsafe_allow_html=True)
+            marcado = st.checkbox(
+                "Mostrar no gráfico", value=False,
+                key=f"{chave_prefixo}mostrar_{h['grupo']}",
+            )
+            if marcado:
+                grupos_marcados.add(h["grupo"])
+                houve_interacao = True
+
+    # resto vai pra uma lista compacta (sem card, sem checkbox) — evita
+    # uma coluna lateral quilométrica em clientes com muitos contratos
+    restantes = historicos_ordenados[max_visiveis:]
+    if restantes:
+        with st.expander(f"+ {len(restantes)} outro(s) contrato(s)"):
+            for h in restantes:
+                situacao_icone = "🟢" if h.get("situacao") == "A" else "⚪"
+                df_h = h.get("df")
+                valor = None
+                if df_h is not None and not df_h.empty:
+                    vals = pd.to_numeric(df_h.sort_values("mes")["valor"], errors="coerce").dropna()
+                    valor = vals.iloc[-1] if len(vals) else None
+                texto_valor = formatar_moeda(valor) if valor is not None else "N/D"
+                st.markdown(
+                    f"{situacao_icone} **{h['grupo']}** · {texto_valor}".replace("$", "&#36;"),
+                    unsafe_allow_html=True,
+                )
+
+    return grupos_marcados if houve_interacao else None
 
 
 def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ativos: bool = True, cols: int = 3):
@@ -2678,6 +2743,19 @@ def relatorio_cliente(
     st.subheader("Histórico de mensalidade", anchor=False)
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
 
+    # grupos marcados nos checkboxes dos cards — lidos direto do
+    # session_state porque os cards são desenhados DEPOIS do gráfico
+    # (ficam na coluna ao lado), então nesta rodada só temos o que foi
+    # marcado na rodada anterior. Como marcar um checkbox já dispara um
+    # rerun sozinho, na prática a seleção aparece no gráfico
+    # imediatamente pra quem está usando.
+    prefixo_chave_cards = f"card_{nome_cliente}_"
+    grupos_marcados_nos_cards = {
+        chave[len(prefixo_chave_cards) + len("mostrar_"):]
+        for chave, valor in st.session_state.items()
+        if chave.startswith(prefixo_chave_cards + "mostrar_") and valor
+    }
+
     fig_principal, detalhes_md = plotar_historico_multi(
         historicos_grafico,
         titulo=f"Histórico de mensalidade — {nome_cliente}",
@@ -2686,6 +2764,7 @@ def relatorio_cliente(
         mostrar_texto_variacao=mostrar_texto_variacao,
         limiar_anotacao_pct=limiar_anotacao_pct,
         mostrar_eventos_cancelamento=mostrar_eventos_cancelamento,
+        grupos_visiveis=grupos_marcados_nos_cards or None,
     )
     # cards ao lado do gráfico (não dentro dele) — o detalhe "tipo BI"
     # (valor exato, situação, avisos) fica nos cards; o gráfico fica
@@ -2735,10 +2814,13 @@ def relatorio_cliente(
                     dado_ponto = dado_ponto[0] if dado_ponto else None
 
                 def _md_seguro(texto):
-                    """Escapa '$' antes de exibir via st.markdown — o
-                    Streamlit interpreta pares de '$' como fórmula
-                    matemática (LaTeX), e o texto tem vários "R$"."""
-                    st.markdown(str(texto).replace("$", "\\$"), unsafe_allow_html=True)
+                    """Troca '$' pela entidade HTML &#36; antes de exibir.
+                    Dentro de HTML (unsafe_allow_html=True) o escape com
+                    barra invertida NÃO funciona — aparece literal na tela
+                    ("R\\$ 11.475,00"). A entidade resolve os dois lados:
+                    o markdown não vê '$' pra abrir fórmula LaTeX, e o
+                    navegador renderiza como cifrão normal."""
+                    st.markdown(str(texto).replace("$", "&#36;"), unsafe_allow_html=True)
 
                 if not isinstance(dado_ponto, dict):
                     # fallback: formato inesperado, mostra o que der
@@ -2773,7 +2855,7 @@ def relatorio_cliente(
                     if variacao_pct is not None:
                         variacao_bruto = dado_ponto.get("variacao_bruto") or 0
                         seta = "▲" if variacao_bruto > 0 else "▼"
-                        cor_var = COR_AUMENTO if variacao_bruto > 0 else "#f87171"
+                        cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
                         linhas_cab.append(
                             f"<div style='font-size:0.9em; color:{cor_var};'>{seta} "
                             f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%)</div>"
@@ -2829,8 +2911,8 @@ def relatorio_cliente(
             st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
         else:
             st.markdown("**Contratos**")
-            st.caption("Clique num ponto do gráfico pra ver o detalhe daquele mês aqui.")
-            mostrar_cards_contratos(historicos)
+            st.caption("Marque um contrato pra ver a linha dele no gráfico, ou clique num ponto pra ver o detalhe do mês.")
+            mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
 
     if detalhes_md:
         with st.expander("📋 Detalhamento completo das mudanças de equipamento por mês (sem resumir)"):
