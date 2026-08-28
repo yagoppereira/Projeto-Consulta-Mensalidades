@@ -1184,7 +1184,16 @@ def plotar_historico_multi(
         # sem essa informação (linhas de grupo único, sem "/") contam
         # como completos por padrão.
         completos = df_m["completo"].fillna(False).tolist() if "completo" in df_m.columns else [True] * len(valores)
-        cor = classificar_cor_grupo(h) or PALETA_CONTRATOS[i % len(PALETA_CONTRATOS)]
+        # cor da linha: mantém as cores SEMÂNTICAS quando dá pra
+        # identificar o tipo do grupo (união aluguel+licenciamento,
+        # só licenciamento, só aluguel, sonda — cada uma tem significado
+        # e não deve mudar). Pro resto, usa o gradiente Verde→Azul da
+        # identidade CTA em vez da paleta de cores avulsas: com muitas
+        # linhas, tons progressivos ficam mais fáceis de distinguir e
+        # seguem a marca, em vez de parecer cores escolhidas ao acaso.
+        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
+            i / (len(historicos_validos) - 1) if len(historicos_validos) > 1 else 0
+        )
         grupo_legenda = f"grupo_{i}"
         situacao_grupo = h.get("situacao")
 
@@ -1308,7 +1317,12 @@ def plotar_historico_multi(
             if pd.isna(val):
                 texto = f"{cabecalho_hover}<br>{mes_fmt}: <i>sem parcela emitida neste mês</i>"
                 hover_texts.append(texto)
-                dados_estruturados.append({"cabecalho": texto, "itens": []})
+                dados_estruturados.append({
+                    "grupo": h["grupo"], "descricao": h.get("descricao", ""), "mes": mes_fmt,
+                    "valor_total": None, "nfs": "", "observacao": h.get("observacao", ""),
+                    "completo": True, "variacao_pct": None, "variacao_bruto": None,
+                    "composicao_por_tipo": {}, "equipamentos": [], "cabecalho": texto,
+                })
                 continue
             texto = f"{cabecalho_hover}<br>{mes_fmt}: {formatar_moeda(val)}"
             if faturas[j]:
@@ -1360,22 +1374,43 @@ def plotar_historico_multi(
                     ))
             hover_texts.append(texto)
 
-            # monta a lista de itens deste ponto (nf, descrição, valor) pro
-            # customdata — só interessa quando tem 2+ itens DIFERENTES
-            # (ex: aluguel + licenciamento); com 1 item só, não faz
-            # sentido quebrar em "cards", o cabeçalho já cobre
+            # customdata ESTRUTURADO (campos separados, não o texto do
+            # hover pronto) — o painel lateral precisa arranjar cada
+            # informação do seu jeito. Antes ele recebia só o texto
+            # gigante do hover e reexibia inteiro, virando um parágrafo
+            # ilegível em contratos com muitos equipamentos.
             itens_do_ponto = itens_mes_lista_pontos[j] or []
-            itens_agregados_por_nf = {}
+
+            # (a) composição por TIPO de material (licenciamento mobile,
+            # pedestal, aluguel...) — o "de que é feito" esse valor
+            composicao_por_tipo = {}
+            # (b) lista item a item (cada equipamento/serial) — o detalhe
+            # fino, exibido como tabela (aguenta 16+ linhas sem virar um
+            # muro de texto, ao contrário de cards empilhados)
+            equipamentos_do_ponto = []
             for nf_item, desc_item, val_item, texto_item in itens_do_ponto:
                 if val_item is None or pd.isna(val_item):
                     continue
-                chave = (nf_item, desc_item)
-                if chave not in itens_agregados_por_nf:
-                    itens_agregados_por_nf[chave] = {"nf": nf_item, "descricao": desc_item, "valor": 0.0, "texto": texto_item}
-                itens_agregados_por_nf[chave]["valor"] += val_item
+                composicao_por_tipo[desc_item] = composicao_por_tipo.get(desc_item, 0.0) + val_item
+                equipamentos_do_ponto.append({
+                    "nf": nf_item, "tipo": desc_item, "valor": val_item, "texto": texto_item,
+                })
+
             dados_estruturados.append({
+                "grupo": _cabecalho_para_mes(meses_str[j]).split("</b>")[0].replace("<b>Contrato ", "").strip(),
+                "descricao": h.get("descricao", ""),
+                "mes": mes_fmt,
+                "valor_total": float(val) if pd.notna(val) else None,
+                "nfs": faturas[j] or "",
+                "observacao": h.get("observacao", ""),
+                "completo": bool(completos[j]),
+                "variacao_pct": variacoes_pct[j],
+                "variacao_bruto": variacoes_bruto[j],
+                "composicao_por_tipo": composicao_por_tipo,
+                "equipamentos": equipamentos_do_ponto,
+                # texto do hover mantido como reserva, caso o painel não
+                # consiga interpretar a estrutura acima por algum motivo
                 "cabecalho": texto,
-                "itens": list(itens_agregados_por_nf.values()),
             })
 
         # linha principal — única com showlegend=True do grupo.
@@ -1548,7 +1583,12 @@ def plotar_historico_multi(
             # mesmo formato de customdata das linhas de grupo, só sem
             # itens (é uma soma agregada de vários grupos, não faz
             # sentido quebrar em cards de item aqui)
-            dados_estruturados_total.append({"cabecalho": texto, "itens": []})
+            dados_estruturados_total.append({
+                "grupo": nome, "descricao": "Soma de todos os contratos", "mes": m,
+                "valor_total": float(v) if pd.notna(v) else None, "nfs": "", "observacao": "",
+                "completo": True, "variacao_pct": var_pct_t[j], "variacao_bruto": var_bruto_t[j],
+                "composicao_por_tipo": {}, "equipamentos": [], "cabecalho": texto,
+            })
 
         tag = f"total::{variante}"
         legendgroup_total = f"total_{variante}"
@@ -1780,9 +1820,21 @@ def mostrar_cards_contratos(historicos: list):
     livre pra ser só a representação visual da tendência, e o detalhe
     "tipo BI" (valor exato, status, avisos) mora nos cards, sem precisar
     caber tudo no hover/legenda de um gráfico já cheio de linhas.
+
+    Contratos ATIVOS aparecem primeiro (é o que interessa no dia a dia);
+    encerrados vão pro fim da lista, ordenados por valor.
     """
-    for h in historicos:
-        cor = classificar_cor_grupo(h) or PALETA_CONTRATOS[0]
+    historicos_ordenados = sorted(
+        historicos,
+        key=lambda h: (h.get("situacao") != "A", -(h.get("valor_total") or 0)),
+    )
+    for indice_card, h in enumerate(historicos_ordenados):
+        # mesma lógica de cor do gráfico (semântica quando dá, gradiente
+        # senão) — o card e a linha correspondente ficam com a mesma cor,
+        # o que ajuda a ligar visualmente um ao outro
+        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
+            indice_card / (len(historicos_ordenados) - 1) if len(historicos_ordenados) > 1 else 0
+        )
         df_h = h.get("df")
 
         valor_atual = None
@@ -1809,15 +1861,22 @@ def mostrar_cards_contratos(historicos: list):
 
         with st.container(border=True):
             texto_avisos = "".join(f"<div style='font-size:0.85em; color:#F1F1F1cc;'>{a}</div>" for a in avisos)
-            st.markdown(
-                f"""<div style="border-left: 4px solid {cor}; padding-left: 10px;">
-                <b>{h['grupo']}</b><br>
-                <span style="font-size:0.9em;">{h.get('descricao', '')}</span><br>
-                {situacao_label} &nbsp;·&nbsp; <b>{formatar_moeda(valor_atual) if valor_atual is not None else 'N/D'}</b>
-                {texto_avisos}
-                </div>""",
-                unsafe_allow_html=True,
+            valor_texto = formatar_moeda(valor_atual) if valor_atual is not None else "N/D"
+            # HTML montado numa string ÚNICA, sem quebras de linha nem
+            # indentação: markdown trata linha recuada com 4+ espaços como
+            # BLOCO DE CÓDIGO, então o HTML indentado (como estava antes)
+            # fazia o "</div>" final vazar como texto literal na tela em
+            # vez de fechar a tag. Escapa '$' pelo mesmo motivo de sempre
+            # (pares de '$' viram fórmula LaTeX no st.markdown).
+            html_card = (
+                f'<div style="border-left: 4px solid {cor}; padding-left: 10px;">'
+                f'<b>{h["grupo"]}</b><br>'
+                f'<span style="font-size:0.9em;">{h.get("descricao", "")}</span><br>'
+                f'{situacao_label} &nbsp;·&nbsp; <b>{valor_texto}</b>'
+                f'{texto_avisos}'
+                f'</div>'
             )
+            st.markdown(html_card.replace("$", "\\$"), unsafe_allow_html=True)
 
 
 def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ativos: bool = True, cols: int = 3):
@@ -1843,7 +1902,9 @@ def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ati
         df_m = h["df"].sort_values("mes")
         eixo_labels = [formatar_mes_ano(p) for p in df_m["mes"]]
         valores = pd.to_numeric(df_m["valor"], errors="coerce").tolist()
-        cor = classificar_cor_grupo(h) or PALETA_CONTRATOS[idx % len(PALETA_CONTRATOS)]
+        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
+            idx / (len(grupos_plot) - 1) if len(grupos_plot) > 1 else 0
+        )
         hover = [f"{m}: {formatar_moeda(v)}" for m, v in zip(eixo_labels, valores)]
         fig.add_trace(go.Scatter(
             x=eixo_labels, y=valores, mode="lines+markers",
@@ -2665,59 +2726,106 @@ def relatorio_cliente(
                 pontos_selecionados = []
 
         if pontos_selecionados:
-            st.markdown("**Detalhe do ponto clicado**")
             for ponto in pontos_selecionados:
                 try:
                     dado_ponto = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
                 except Exception:
                     dado_ponto = None
-                # customdata pode vir embrulhado numa lista/tupla (o
-                # Plotly permite múltiplos valores por ponto) — desembrulha
-                # antes de processar
                 if isinstance(dado_ponto, (list, tuple)):
                     dado_ponto = dado_ponto[0] if dado_ponto else None
-
-                # formato esperado: {"cabecalho": str, "itens": [{"nf":...,
-                # "descricao":...,"valor":...}, ...]}. Qualquer coisa fora
-                # desse formato (ex: versão antiga, ou algo inesperado no
-                # round-trip do navegador) cai no fallback de mostrar só
-                # o texto cru, sem quebrar a página.
-                cabecalho, itens = None, []
-                if isinstance(dado_ponto, dict):
-                    cabecalho = dado_ponto.get("cabecalho")
-                    itens = dado_ponto.get("itens") or []
-                elif dado_ponto:
-                    cabecalho = str(dado_ponto)
 
                 def _md_seguro(texto):
                     """Escapa '$' antes de exibir via st.markdown — o
                     Streamlit interpreta pares de '$' como fórmula
-                    matemática (LaTeX), e como o texto tem vários "R$"
-                    espalhados, isso "comia" pedaços do texto inteiro
-                    (inclusive as tags <br>). Só afeta esse ponto de
-                    exibição — o hover nativo do Plotly não passa por
-                    esse processamento, não precisa escapar lá."""
+                    matemática (LaTeX), e o texto tem vários "R$"."""
                     st.markdown(str(texto).replace("$", "\\$"), unsafe_allow_html=True)
 
-                # descrições distintas (não NFs distintas) é o critério —
-                # a mesma NF pode ter 2 itens (ex: pedestal + sonda numa
-                # nota só), mas o que importa pro usuário é separar por
-                # TIPO de cobrança (aluguel vs licenciamento), não por NF
-                descricoes_distintas = {item.get("descricao") for item in itens if item.get("descricao")}
-                if cabecalho:
-                    with st.container(border=True):
-                        _md_seguro(cabecalho)
-                if len(descricoes_distintas) >= 2:
-                    for item in itens:
+                if not isinstance(dado_ponto, dict):
+                    # fallback: formato inesperado, mostra o que der
+                    if dado_ponto:
                         with st.container(border=True):
-                            texto_item = (
-                                f"<b>{str(item.get('descricao', '')).capitalize()}</b><br>"
-                                f"Valor: {formatar_moeda(item.get('valor', 0))}<br>"
-                                f"NF: {item.get('nf', 'N/D')}"
-                            )
-                            if item.get("texto"):
-                                texto_item += f"<br>{item['texto']}"
-                            _md_seguro(texto_item)
+                            _md_seguro(dado_ponto)
+                    continue
+
+                mes = dado_ponto.get("mes", "")
+                valor_total = dado_ponto.get("valor_total")
+                composicao = dado_ponto.get("composicao_por_tipo") or {}
+                equipamentos = dado_ponto.get("equipamentos") or []
+
+                # 1) CABEÇALHO enxuto: mês + valor em destaque, contrato e
+                # NFs como linha secundária. Antes o cabeçalho era o texto
+                # inteiro do hover (com composição, itens, variação, tudo
+                # concatenado), virando um parágrafo ilegível.
+                st.markdown(f"**{mes}**" if mes else "**Detalhe do mês**")
+                with st.container(border=True):
+                    linhas_cab = [
+                        f"<div style='font-size:1.4em;'><b>{formatar_moeda(valor_total) if valor_total is not None else 'N/D'}</b></div>",
+                        f"<div style='font-size:0.85em; opacity:0.75;'>Contrato {dado_ponto.get('grupo','')} · {dado_ponto.get('descricao','')}</div>",
+                    ]
+                    if dado_ponto.get("nfs"):
+                        linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
+                    if not dado_ponto.get("completo", True):
+                        linhas_cab.append(
+                            "<div style='font-size:0.85em; color:#f59e0b;'>⚠ Mês incompleto — "
+                            "nem todos os itens emitiram NF (não é redução de preço)</div>"
+                        )
+                    variacao_pct = dado_ponto.get("variacao_pct")
+                    if variacao_pct is not None:
+                        variacao_bruto = dado_ponto.get("variacao_bruto") or 0
+                        seta = "▲" if variacao_bruto > 0 else "▼"
+                        cor_var = COR_AUMENTO if variacao_bruto > 0 else "#f87171"
+                        linhas_cab.append(
+                            f"<div style='font-size:0.9em; color:{cor_var};'>{seta} "
+                            f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%)</div>"
+                        )
+                    _md_seguro("".join(linhas_cab))
+
+                # 2) COMPOSIÇÃO por tipo — barrinha proporcional, não texto
+                # corrido: com 2+ tipos dá pra ver o peso de cada um de
+                # relance, em vez de ler "58.8% | 41.2%" no meio de um
+                # parágrafo
+                if len(composicao) >= 2:
+                    st.markdown("**Composição**")
+                    total_comp = sum(composicao.values()) or 1
+                    for tipo, valor_tipo in sorted(composicao.items(), key=lambda x: -x[1]):
+                        pct = valor_tipo / total_comp * 100
+                        _md_seguro(
+                            f"<div style='font-size:0.85em; margin-bottom:2px;'>{str(tipo).capitalize()} — "
+                            f"<b>{formatar_moeda(valor_tipo)}</b> ({pct:.1f}%)</div>"
+                            f"<div style='background:#ffffff1a; border-radius:3px; height:6px; margin-bottom:8px;'>"
+                            f"<div style='background:{COR_UNIAO_ALUGUEL_LICENCIAMENTO}; width:{pct:.1f}%; height:6px; border-radius:3px;'></div></div>"
+                        )
+
+                # 3) EQUIPAMENTOS como TABELA (não cards empilhados) —
+                # escala pra 16+ itens sem virar um muro de texto, e dá
+                # pra ordenar/rolar
+                if equipamentos:
+                    st.markdown(f"**Equipamentos ({len(equipamentos)})**")
+
+                    def _rotulo_equipamento(texto_item):
+                        """Prefere o número de série (SERIE ####) quando
+                        existe — é o identificador curto e útil. Sem
+                        série, usa o texto da NF sem o sufixo genérico
+                        de período ('LICENCIAMENTO DE SOFTWARE PERIODO:
+                        ...'), que é igual em todas as linhas e não
+                        ajuda a distinguir um equipamento do outro."""
+                        serial = extrair_serial_de_texto(texto_item)
+                        if serial:
+                            return f"SERIE {serial}"
+                        limpo = re.split(r"LICENCIAMENTO DE SOFTWARE", str(texto_item or ""), flags=re.IGNORECASE)[0]
+                        return (limpo.strip(" -") or str(texto_item or ""))[:40]
+
+                    df_equip_ponto = pd.DataFrame([
+                        {
+                            "Equipamento": _rotulo_equipamento(e.get("texto")),
+                            "Tipo": str(e.get("tipo", "")).capitalize(),
+                            "Valor": formatar_moeda(e.get("valor", 0)),
+                            "NF": e.get("nf", ""),
+                        }
+                        for e in equipamentos
+                    ])
+                    st.dataframe(df_equip_ponto, use_container_width=True, hide_index=True, height=min(400, 40 + 35 * len(df_equip_ponto)))
+
             st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
         else:
             st.markdown("**Contratos**")
