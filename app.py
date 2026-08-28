@@ -11,6 +11,7 @@
 
 import json
 import re
+import concurrent.futures
 import os
 import pandas as pd
 import plotly.graph_objects as go
@@ -715,6 +716,7 @@ def obter_dados_demo_bq():
     return parcelas_df, itens_nf
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_parcelas_bq(codigo_contrato: str) -> pd.DataFrame:
     """
     Busca as parcelas de um contrato. Primeiro tenta o array nativo
@@ -724,6 +726,12 @@ def buscar_parcelas_bq(codigo_contrato: str) -> pd.DataFrame:
     (string JSON), que tem a MESMA estrutura de campos (fatura, situacao
     L/J, tipo E/c, valor, vencimento, emissao, previsao) e está populado
     mesmo quando o array nativo não está.
+
+    Cacheada: é a consulta MAIS chamada do app (uma por subcontrato, e um
+    cliente grande tem dezenas), então sem cache cada busca repetia todas
+    elas do zero. Medimos 32 chamadas dessa função num cliente com 16
+    contratos — cacheando, uma segunda busca no mesmo cliente (ou em
+    outro que compartilhe contratos) não paga esse custo de novo.
     """
     if MODO_DEMO:
         parcelas_demo, _ = obter_dados_demo_bq()
@@ -1019,6 +1027,32 @@ COR_SO_ALUGUEL = "#66efc1"  # série verde, tom 2
 COR_SONDA = "#F1F1F1"  # CTA Cinza Claro
 
 
+def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#19e098", cor_fim: str = "#382fd8") -> str:
+    """
+    Interpola linearmente entre duas cores hex, dado fracao em [0, 1].
+    Padrão: Verde → Azul — o mesmo degradê PRIMÁRIO da identidade visual
+    da CTA (Guia de Degradês, jul/2026), reaproveitado aqui pra dar um
+    tom distinto a cada equipamento na tabela, em vez de deixar tudo
+    com a mesma cor (ou sem cor nenhuma) e pouca identificação visual.
+    """
+    fracao = max(0.0, min(1.0, fracao))
+
+    def _hex_para_rgb(cor):
+        cor = cor.lstrip("#")
+        return tuple(int(cor[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _rgb_para_hex(rgb):
+        return "#" + "".join(f"{max(0, min(255, round(c))):02x}" for c in rgb)
+
+    r1, g1, b1 = _hex_para_rgb(cor_inicio)
+    r2, g2, b2 = _hex_para_rgb(cor_fim)
+    return _rgb_para_hex((
+        r1 + (r2 - r1) * fracao,
+        g1 + (g2 - g1) * fracao,
+        b1 + (b2 - b1) * fracao,
+    ))
+
+
 def classificar_cor_grupo(h: dict) -> str:
     """
     Decide a cor da linha pelo TEXTO (descrição, composição, observação,
@@ -1102,6 +1136,12 @@ def plotar_historico_multi(
 
     fig = go.Figure()
     trace_situacao = []  # paralelo a fig.data, para os botões de filtro
+    # paralelo também — marca quais traces são de GRUPO INDIVIDUAL (linha
+    # de contrato + seus marcadores) vs. da linha Total. Usado só pra
+    # decidir se um clique nos botões de filtro deve trazer o trace de
+    # volta como "legendonly" (respeitando o "escondido por padrão") ou
+    # como totalmente visível (linha Total sempre assim).
+    trace_eh_grupo_individual = []
     detalhes_mudancas_console = []  # (grupo, mes_fmt, direcao, valor_bruto, pct, novos, removidos, alterados) — sem resumir, pra imprimir no console
     # valores REAIS (não decorativos) de todas as linhas — usado só pra
     # calcular o limite de zoom-out do eixo Y. Populado à parte, na hora
@@ -1114,6 +1154,14 @@ def plotar_historico_multi(
 
     for i, h in enumerate(historicos_validos):
         df_m = h["df"].sort_values("mes").reset_index(drop=True)
+
+        # com mais de 1 grupo, TODOS os traces desse grupo (linha
+        # principal + marcadores de incompleto/variação/cancelamento)
+        # começam escondidos, só na legenda — usado de forma consistente
+        # nos vários fig.add_trace() abaixo, senão os marcadores (que têm
+        # showlegend=False, não fazem parte do clique da legenda sozinhos)
+        # ficariam "flutuando" visíveis mesmo com a linha escondida.
+        visivel_inicial_grupo = True if len(historicos_validos) <= 1 else "legendonly"
 
         # preenche os meses que faltam no MEIO do período (do primeiro ao
         # último mês desse contrato) com um "buraco" (NaN) — sem isso, o
@@ -1345,8 +1393,15 @@ def plotar_historico_multi(
             legendgroup=grupo_legenda, showlegend=True,
             line=dict(color=cor, width=2), marker=dict(size=6, color=cor),
             hovertext=hover_texts, hoverinfo="text", customdata=dados_estruturados,
+            # com mais de 1 grupo, começa ESCONDIDA (só aparece na
+            # legenda, clicável pra reativar) — a Total (ou a única linha,
+            # se só tiver 1 grupo) fica visível de cara. Evita o gráfico
+            # já abrir poluído com N linhas coloridas sobrepostas quando
+            # o cliente tem muitos contratos; a pessoa escolhe quais
+            # linhas quer inspecionar clicando na legenda.
+            visible=visivel_inicial_grupo,
         ))
-        trace_situacao.append(situacao_grupo)
+        trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
 
         # marcador âmbar (nem verde nem vermelho) nos meses "incompletos"
         # — sinaliza visualmente que aquele ponto não é comparável (não é
@@ -1361,8 +1416,9 @@ def plotar_historico_multi(
                 marker=dict(size=10, color="#f59e0b", symbol="triangle-up", line=dict(color="white", width=1)),
                 legendgroup=grupo_legenda, showlegend=False,
                 hovertext=[hover_texts[j] for j in idx_incompletos], hoverinfo="text",
+                visible=visivel_inicial_grupo,
             ))
-            trace_situacao.append(situacao_grupo)
+            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
 
         # TODOS os pontos de mudança ganham um marcador colorido (sem texto)
         idx_variacao = [j for j, p in enumerate(variacoes_pct) if p is not None]
@@ -1377,8 +1433,9 @@ def plotar_historico_multi(
                     line=dict(color="white", width=1),
                 ),
                 legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
+                visible=visivel_inicial_grupo,
             ))
-            trace_situacao.append(situacao_grupo)
+            trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
 
         # só as mudanças RELEVANTES (>= limiar) ganham o texto escrito no
         # gráfico — e só quando mostrar_texto_variacao=True (desligado por
@@ -1400,8 +1457,9 @@ def plotar_historico_multi(
                         color=[COR_AUMENTO if variacoes_bruto[j] > 0 else COR_REDUCAO for j in idx_relevantes],
                     ),
                     legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
+                    visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
 
         # marcador de cancelamento + linha vertical, ambos como trace do
         # mesmo legendgroup (em vez de fig.add_vline, que é um "shape" do
@@ -1448,14 +1506,16 @@ def plotar_historico_multi(
                     marker=dict(size=tamanho, color=cor_marcador, symbol=simbolo, line=dict(color="white", width=1.5)),
                     legendgroup=grupo_legenda, showlegend=False,
                     hovertext=[hover_cancel], hoverinfo="text",
+                    visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
                 fig.add_trace(go.Scatter(
                     x=[meses_str[idx], meses_str[idx]], y=[0, max(valores)],
                     mode="lines", line=dict(color=cor_marcador, width=1, dash="dash"),
                     opacity=0.35, legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
+                    visible=visivel_inicial_grupo,
                 ))
-                trace_situacao.append(situacao_grupo)
+                trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True)
 
     def adicionar_linha_total(subconjunto, variante, nome, visivel_inicialmente):
         """Adiciona uma linha 'Total' somando só os historicos do
@@ -1499,7 +1559,7 @@ def plotar_historico_multi(
             line=dict(color="black", width=3, dash="dot"),
             hovertext=hover_total, hoverinfo="text", customdata=dados_estruturados_total,
         ))
-        trace_situacao.append(tag)
+        trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
 
         idx_var_t = [j for j, p in enumerate(var_pct_t) if p is not None]
         if idx_var_t:
@@ -1515,7 +1575,7 @@ def plotar_historico_multi(
                 legendgroup=legendgroup_total, showlegend=False, hoverinfo="skip",
                 visible=visivel_inicialmente,
             ))
-            trace_situacao.append(tag)
+            trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
 
             if mostrar_texto_variacao:
                 idx_var_t_relevantes = [j for j in idx_var_t if abs(var_pct_t[j]) >= limiar_anotacao_pct]
@@ -1533,7 +1593,7 @@ def plotar_historico_multi(
                         legendgroup=legendgroup_total, showlegend=False, hoverinfo="skip",
                         visible=visivel_inicialmente,
                     ))
-                    trace_situacao.append(tag)
+                    trace_situacao.append(tag); trace_eh_grupo_individual.append(False)
 
     if incluir_total and len(historicos_validos) > 1:
         # 3 variantes pré-calculadas do Total, uma pra cada botão de
@@ -1552,13 +1612,23 @@ def plotar_historico_multi(
     # só com os contratos ativos, não o total geral escondido atrás do filtro
     def visibilidade(filtro):
         resultado = []
-        for s in trace_situacao:
+        for s, eh_individual in zip(trace_situacao, trace_eh_grupo_individual):
             if s.startswith("total::"):
                 variante = s.split("::", 1)[1]
                 alvo = "todos" if filtro is None else filtro
                 resultado.append(variante == alvo)
             else:
-                resultado.append(filtro is None or s == filtro)
+                corresponde = filtro is None or s == filtro
+                # se o trace é de um grupo individual (não a linha Total)
+                # e passou no filtro, volta como "legendonly" (escondido,
+                # só na legenda) em vez de True — preserva o "começa
+                # escondido por padrão" mesmo depois de clicar num botão
+                # de filtro; sem isso, qualquer clique nos botões forçava
+                # tudo de volta pra visível, perdendo esse comportamento
+                if corresponde and eh_individual and len(historicos_validos) > 1:
+                    resultado.append("legendonly")
+                else:
+                    resultado.append(corresponde)
         return resultado
 
     # título muda de texto junto com o filtro clicado (Todos/Só Ativos/Só
@@ -1575,13 +1645,12 @@ def plotar_historico_multi(
     ]
 
     # 1 ÚNICO menu com os 3 botões juntos (não mais 3 menus separados com
-    # posição calculada na mão) — o gráfico usa width=1900 mas é exibido
-    # com use_container_width=True, que REDIMENSIONA pro tamanho real do
-    # navegador; qualquer posição em fração calculada assumindo 1900px
-    # fica errada sempre que o navegador renderiza mais estreito (quase
-    # sempre). Deixando o Plotly medir o texto de verdade na hora de
-    # desenhar (dentro de 1 menu só), o espaçamento fica certo não
-    # importa a largura final da tela. showactive=True dá o destaque
+    # posição calculada na mão) — o gráfico é exibido com
+    # use_container_width=True, então a largura real depende do navegador
+    # e do layout; qualquer posição em fração calculada assumindo uma
+    # largura fixa fica errada. Deixando o Plotly medir o texto de
+    # verdade na hora de desenhar (dentro de 1 menu só), o espaçamento
+    # fica certo não importa a largura final da tela. showactive=True dá o destaque
     # nativo de "qual está selecionado" — o próprio Plotly cuida disso
     # de forma consistente, sem a gente precisar recalcular nada.
     updatemenus_filtro = [
@@ -1606,7 +1675,13 @@ def plotar_historico_multi(
     else:
         range_inicial = [todos_meses_str[0], todos_meses_str[-1]] if todos_meses_str else None
 
-    altura_fig = max(950, 65 * len(historicos_validos))
+    # altura proporcional à quantidade de linhas, mas com TETO — antes
+    # era só `max(950, 65 * N)`, sem limite superior: um cliente com 16+
+    # grupos gerava um gráfico de milhares de pixels de altura, forçando
+    # rolagem enorme. Como as linhas individuais agora começam escondidas
+    # (só a Total visível), não faz sentido reservar altura pra todas
+    # elas de antemão.
+    altura_fig = min(900, max(560, 60 * len(historicos_validos)))
 
     # limite de zoom-out: sem isso, o Plotly deixa a pessoa afastar o
     # zoom indefinidamente, mostrando um espaço vazio gigante em volta de
@@ -1636,7 +1711,13 @@ def plotar_historico_multi(
         yaxis=dict(minallowed=y_min_permitido, maxallowed=y_max_permitido) if y_min_permitido is not None else {},
         template="plotly_white", hovermode="closest",
         height=altura_fig,
-        width=1900,  # bem mais largo — usa mais espaço da tela
+        # width REMOVIDO de propósito: o gráfico é exibido com
+        # use_container_width=True, dentro de uma coluna estreita (3:1,
+        # por causa do painel de cards ao lado). Com width=1900 fixo, o
+        # navegador precisava ESPREMER um gráfico de 1900px nesse espaço
+        # menor, deformando as proporções (fontes e espaçamentos ficavam
+        # apertados em relação ao resto). Sem width, o Plotly se adapta à
+        # largura real disponível e as proporções ficam corretas.
         # legenda HORIZONTAL, embaixo do gráfico (não mais à esquerda) —
         # tentar alinhar a legenda com precisão ao lado do eixo Y é frágil
         # (a largura dos rótulos do eixo varia com os valores de cada
@@ -1647,7 +1728,11 @@ def plotar_historico_multi(
             orientation="h", yanchor="top", y=-0.16, xanchor="center", x=0.5,
             font=dict(size=13), groupclick="togglegroup",
         ),
-        margin=dict(t=170, b=170, l=100, r=90),
+        # margens reduzidas (eram t=170,b=170,l=100,r=90) — aquelas
+        # sobravam de quando o gráfico tinha width=1900 fixo e ocupava a
+        # tela inteira; numa coluna mais estreita elas comem uma fatia
+        # grande da área útil, deixando o gráfico em si espremido
+        margin=dict(t=120, b=120, l=70, r=40),
         updatemenus=updatemenus_filtro,
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
@@ -1771,18 +1856,26 @@ def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ati
     fig.update_layout(
         title=f"Histórico individual por contrato — {nome_cliente}"
               + (" (só ativos)" if apenas_ativos else " (todos)"),
-        height=max(320, 260 * linhas), width=max(1000, 380 * cols),
+        # sem width fixo (mesmo motivo do gráfico principal): é exibido
+        # com use_container_width=True, então largura fixa só fazia o
+        # navegador espremer/esticar e deformar as proporções
+        height=max(320, 260 * linhas),
         template="plotly_white", showlegend=False,
     )
     return fig
 
 
 # --- 7. Relatório completo do cliente ---
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_data_cancelamento_bq(codigo_contrato_grupo: str):
     """
     A Base_Clientes não tem a data exata de cancelamento (só motivo e
     dataCriacao). Busca no BigQuery (cigam__contratos) para cada subcódigo
     do grupo e retorna a primeira data não vazia encontrada.
+
+    Cacheada: roda uma vez por grupo ENCERRADO — clientes com histórico
+    longo têm muitos, e a data de cancelamento de um contrato já
+    encerrado não muda mais.
     """
     subcodigos = [normalizar_codigo_contrato(c) for c in str(codigo_contrato_grupo).split("/")]
     if MODO_DEMO:
@@ -1817,13 +1910,20 @@ def resumir_lista(itens: list, max_itens: int = 3, max_chars_item: int = 60) -> 
     return " | ".join(itens[:max_itens]) + f"  (+{len(itens) - max_itens} itens)"
 
 
-def agrupar_historicos_para_grafico(historicos: list, max_linhas: int = 8) -> list:
+def agrupar_historicos_para_grafico(historicos: list, max_linhas: int = 20) -> list:
     """
     Evita gráfico ilegível quando o cliente tem muitos grupos de contrato
     (comum quando há um histórico de contratos recriados por erro
     cadastral). Contratos ATIVOS sempre ficam como linha própria. Entre os
     demais (encerrados/outros), mantém os de maior valor total como linha
     própria e agrupa o restante numa única linha "Outros (N contratos)".
+
+    max_linhas subiu de 8 pra 20: o motivo original do limite baixo era
+    não poluir o gráfico com linhas demais desenhadas ao mesmo tempo —
+    mas agora as linhas individuais COMEÇAM ESCONDIDAS (só na legenda,
+    ver `visivel_inicial_grupo`), então elas não poluem nada por padrão.
+    Com o limite baixo, contratos iam pro bucket "Outros" à toa,
+    perdendo a possibilidade de inspecionar cada um pela legenda.
     """
     ativos = [h for h in historicos if h.get("situacao") == "A"]
     resto = [h for h in historicos if h.get("situacao") != "A"]
@@ -2078,11 +2178,13 @@ def montar_texto_composicao(subset: pd.DataFrame) -> str:
     return " | ".join(partes)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_descricao_contrato_bq(codigo_contrato: str):
     """Busca a descrição do contrato (ex: 'ALUGUEL DE EQUIPAMENTO',
     'LICENCIAMENTO DE SOFTWARE') direto no cigam__contratos — usado
     quando a Base_Clientes já uniu o par e não guarda mais o tipo de
-    cada parte separadamente."""
+    cada parte separadamente. Cacheada: descrição de contrato é um dado
+    praticamente estático."""
     if MODO_DEMO:
         cod_norm = normalizar_codigo_contrato(codigo_contrato)
         return {
@@ -2105,6 +2207,7 @@ def buscar_descricao_contrato_bq(codigo_contrato: str):
     return str(valor).strip() if pd.notna(valor) and str(valor).strip() else None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_itens_nota_fiscal(numero_nf: str) -> pd.DataFrame:
     """
     Busca os itens REAIS de uma nota fiscal específica — direto de
@@ -2174,11 +2277,24 @@ def buscar_itens_notas_fiscais_lote(numeros_nf: list) -> dict:
     (`documento` em branco, valores pequenos tipo taxa/ajuste). Por isso
     só considera itens com `documento='NF'`, e não sobrescreve uma
     entrada já encontrada com uma NF duplicada.
+
+    Esta é a "casca": normaliza a lista de entrada (ordena + tira
+    duplicatas) e delega pro miolo cacheado. A separação existe porque o
+    cache do Streamlit precisa de argumentos hasheáveis — lista não é,
+    tupla é. Normalizar ANTES também melhora o aproveitamento do cache:
+    as mesmas NFs em ordem diferente viram a mesma chave.
     """
-    numeros_validos = sorted(set(str(n).strip() for n in numeros_nf if n and str(n).strip()))
+    numeros_validos = tuple(sorted(set(str(n).strip() for n in numeros_nf if n and str(n).strip())))
     if not numeros_validos:
         return {}
+    return _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos)
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos: tuple) -> dict:
+    """Miolo cacheado de buscar_itens_notas_fiscais_lote — recebe tupla
+    já normalizada (ver docstring da casca acima)."""
+    numeros_validos = list(numeros_validos)
     if MODO_DEMO:
         _, itens_demo = obter_dados_demo_bq()
         return {n: itens_demo[n] for n in numeros_validos if n in itens_demo}
@@ -2290,7 +2406,7 @@ def calcular_composicao_real(codigo_contrato_grupo: str) -> str:
 def relatorio_cliente(
     identificador: str,
     incluir_total: bool = True,
-    max_linhas_grafico: int = 8,
+    max_linhas_grafico: int = 20,
     mostrar_lado_a_lado: bool = True,
     mostrar_grade_individual: bool = True,
     mostrar_texto_variacao: bool = False,
@@ -2356,23 +2472,24 @@ def relatorio_cliente(
     colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Múltiplo?"]
 
     def _tabela_equipamentos_colorida(df_equip):
-        """Colore as linhas que compartilham o mesmo serial (equipamento
-        'múltiplo': duplo, triplo, quádruplo...) com a MESMA cor — dá pra
-        ver de cara quais linhas são o mesmo equipamento físico, sem
-        precisar comparar a coluna serial_equipamento manualmente."""
+        """Colore TODOS os equipamentos num gradiente Verde→Azul (segue a
+        ordem da tabela, que já vem alinhada com os contratos quando dá
+        pra cruzar) — cada equipamento diferente ganha um tom distinto,
+        em vez de tudo igual/sem cor. Equipamentos 'múltiplos' (mesmo
+        serial — duplo/triplo/quádruplo) continuam com a MESMA cor entre
+        si, já que são o mesmo equipamento físico."""
         df_sel = df_equip[colunas_equip].copy()
-        seriais_multiplos = df_sel.loc[df_sel["Múltiplo?"], "serial_equipamento"].unique()
-        df_sel = renomear_para_exibicao(df_sel)  # só troca o nome DEPOIS de calcular os múltiplos acima
-        if len(seriais_multiplos) == 0:
-            return df_sel
-        paleta_multiplos = [
-            COR_UNIAO_ALUGUEL_LICENCIAMENTO, COR_SO_LICENCIAMENTO, COR_SO_ALUGUEL,
-        ] + PALETA_CONTRATOS
-        mapa_cor = {serial: paleta_multiplos[i % len(paleta_multiplos)] for i, serial in enumerate(seriais_multiplos)}
+        seriais_em_ordem_unicos = list(dict.fromkeys(df_sel["serial_equipamento"].astype(str)))
+        qtd = len(seriais_em_ordem_unicos)
+        mapa_cor = {
+            serial: interpolar_cor_gradiente(i / (qtd - 1) if qtd > 1 else 0)
+            for i, serial in enumerate(seriais_em_ordem_unicos)
+        }
+        df_sel = renomear_para_exibicao(df_sel)  # só troca o nome DEPOIS de calcular o mapa de cor acima
 
         def _estilo_linha(linha):
-            cor = mapa_cor.get(linha["Serial"])
-            return [f"background-color: {cor}33"] * len(linha) if cor else [""] * len(linha)
+            cor = mapa_cor.get(str(linha["Serial"]))
+            return [f"background-color: {cor}40"] * len(linha) if cor else [""] * len(linha)
 
         return df_sel.style.apply(_estilo_linha, axis=1)
 
@@ -2383,55 +2500,75 @@ def relatorio_cliente(
     # gráfico, como era antes
     grupos = montar_grupos_contrato(contratos)
     _contador_fallback_json["qtd"] = 0
+
+    def _processar_grupo(cod_grupo, subset):
+        """Todo o trabalho de UM grupo (consultas ao BigQuery + montagem
+        do dict) — extraído em função separada pra dar pra rodar vários
+        grupos em paralelo (são consultas de rede independentes entre
+        si, não tem razão pra esperar uma terminar pra começar a outra)."""
+        materiais = subset["Descricao_Material"].dropna().unique()
+        descricao = "Mensalidade Unificada" if len(materiais) > 1 else (materiais[0] if len(materiais) else "")
+        df_hist = obter_historico_unificado(cod_grupo)
+
+        # junta Descricao/observacao de TODAS as linhas desse grupo (um
+        # codigoContrato pode ter várias linhas: um item por equipamento/serial,
+        # por isso resumimos em vez de concatenar tudo)
+        descricoes_item = [d for d in subset["Descricao"].dropna().unique() if str(d).strip()]
+        observacoes = [o for o in subset["observacao"].dropna().unique() if str(o).strip()]
+
+        # composição aluguel/licenciamento: primeiro tenta pelas linhas da
+        # Base_Clientes (funciona pros pares que NÓS montamos, a partir de
+        # encerrados); se vier vazio e o grupo já é um par ("/"), é porque
+        # a Base_Clientes já uniu na origem e descartou o valor de cada
+        # parte — nesse caso busca no BigQuery pra reconstruir
+        composicao = montar_texto_composicao(subset)
+        if not composicao and "/" in str(cod_grupo):
+            composicao = calcular_composicao_real(cod_grupo)
+
+        return {
+            "grupo": cod_grupo,
+            "descricao": descricao,
+            "df": df_hist,
+            "data_cancelamento": subset["Data Cancelamento"].dropna().iloc[0] if subset["Data Cancelamento"].notna().any() else None,
+            "motivo_cancelamento": subset["Descricao_Cancelamento"].dropna().iloc[0] if subset["Descricao_Cancelamento"].notna().any() else None,
+            "descricao_item": resumir_lista(descricoes_item),
+            "observacao": resumir_lista(observacoes),
+            "composicao": composicao,
+            "qtd_itens": len(subset),
+            # se QUALQUER linha do grupo ainda está ativa, o grupo
+            # inteiro conta como ativo — antes pegava só a primeira
+            # linha da lista, então um par aluguel(encerrado)/
+            # licenciamento(ativo) virava "encerrado" por inteiro só
+            # porque o aluguel aparecia primeiro, sumindo da grade de
+            # mini-gráficos (que só mostra os ativos) mesmo o
+            # licenciamento continuando cobrando
+            "situacao": "A" if (subset["situacaoContrato"] == "A").any() else subset["situacaoContrato"].iloc[0],
+            # códigos que compõem o grupo e quais deles CONTINUAM
+            # ativos hoje — usado pra, depois de um cancelamento
+            # parcial, o hover mostrar só o(s) código(s) de verdade
+            # em vigor naquele mês, em vez de manter "90011/90012"
+            # pra sempre mesmo com o 90011 já cancelado
+            "codigos_grupo": subset["codigoContrato"].unique().tolist(),
+            "codigos_ativos": subset.loc[subset["situacaoContrato"] == "A", "codigoContrato"].unique().tolist(),
+            "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum() if not df_hist.empty else 0,
+        }
+
     with st.spinner(f"Buscando histórico de {len(grupos)} grupo(s) de contrato no BigQuery..."):
-        historicos = []
-        for cod_grupo, subset in grupos:
-            materiais = subset["Descricao_Material"].dropna().unique()
-            descricao = "Mensalidade Unificada" if len(materiais) > 1 else (materiais[0] if len(materiais) else "")
-            df_hist = obter_historico_unificado(cod_grupo)
-
-            # junta Descricao/observacao de TODAS as linhas desse grupo (um
-            # codigoContrato pode ter várias linhas: um item por equipamento/serial,
-            # por isso resumimos em vez de concatenar tudo)
-            descricoes_item = [d for d in subset["Descricao"].dropna().unique() if str(d).strip()]
-            observacoes = [o for o in subset["observacao"].dropna().unique() if str(o).strip()]
-
-            # composição aluguel/licenciamento: primeiro tenta pelas linhas da
-            # Base_Clientes (funciona pros pares que NÓS montamos, a partir de
-            # encerrados); se vier vazio e o grupo já é um par ("/"), é porque
-            # a Base_Clientes já uniu na origem e descartou o valor de cada
-            # parte — nesse caso busca no BigQuery pra reconstruir
-            composicao = montar_texto_composicao(subset)
-            if not composicao and "/" in str(cod_grupo):
-                composicao = calcular_composicao_real(cod_grupo)
-
-            historicos.append({
-                "grupo": cod_grupo,
-                "descricao": descricao,
-                "df": df_hist,
-                "data_cancelamento": subset["Data Cancelamento"].dropna().iloc[0] if subset["Data Cancelamento"].notna().any() else None,
-                "motivo_cancelamento": subset["Descricao_Cancelamento"].dropna().iloc[0] if subset["Descricao_Cancelamento"].notna().any() else None,
-                "descricao_item": resumir_lista(descricoes_item),
-                "observacao": resumir_lista(observacoes),
-                "composicao": composicao,
-                "qtd_itens": len(subset),
-                # se QUALQUER linha do grupo ainda está ativa, o grupo
-                # inteiro conta como ativo — antes pegava só a primeira
-                # linha da lista, então um par aluguel(encerrado)/
-                # licenciamento(ativo) virava "encerrado" por inteiro só
-                # porque o aluguel aparecia primeiro, sumindo da grade de
-                # mini-gráficos (que só mostra os ativos) mesmo o
-                # licenciamento continuando cobrando
-                "situacao": "A" if (subset["situacaoContrato"] == "A").any() else subset["situacaoContrato"].iloc[0],
-                # códigos que compõem o grupo e quais deles CONTINUAM
-                # ativos hoje — usado pra, depois de um cancelamento
-                # parcial, o hover mostrar só o(s) código(s) de verdade
-                # em vigor naquele mês, em vez de manter "90011/90012"
-                # pra sempre mesmo com o 90011 já cancelado
-                "codigos_grupo": subset["codigoContrato"].unique().tolist(),
-                "codigos_ativos": subset.loc[subset["situacaoContrato"] == "A", "codigoContrato"].unique().tolist(),
-                "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum() if not df_hist.empty else 0,
-            })
+        # cada grupo faz consultas de REDE independentes (BigQuery) — não
+        # tem motivo pra esperar uma terminar pra começar a próxima.
+        # ThreadPoolExecutor (não multiprocessing) porque o gargalo aqui
+        # é ESPERAR resposta da rede, não processamento pesado de CPU —
+        # threads bastam e evitam a complicação de compartilhar memória
+        # entre processos. max_workers limitado a 8 pra não abrir
+        # consultas demais de uma vez só no BigQuery.
+        historicos = [None] * len(grupos)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(grupos)) or 1) as executor:
+            futuros = {
+                executor.submit(_processar_grupo, cod_grupo, subset): indice
+                for indice, (cod_grupo, subset) in enumerate(grupos)
+            }
+            for futuro in concurrent.futures.as_completed(futuros):
+                historicos[futuros[futuro]] = futuro.result()
     if _contador_fallback_json["qtd"] > 0:
         st.caption(
             f"({_contador_fallback_json['qtd']} subcontrato(s) usaram o fallback parcelasContrato_json "
