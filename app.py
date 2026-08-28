@@ -1374,10 +1374,11 @@ def plotar_historico_multi(
             rotulo = h["grupo"]
             if rotulo_pos_cancelamento and mes_cancel and mes_str_ponto >= mes_cancel:
                 rotulo = rotulo_pos_cancelamento
-            texto = f"<b>Contrato {rotulo}</b> — {h['descricao']}"
-            if h.get("observacao"):
-                texto += f"<br>Obs (situação atual): {h['observacao']}"
-            return texto
+            # a observação do contrato saiu do hover — é a MESMA em todos
+            # os pontos da linha (é uma propriedade do contrato, não do
+            # mês), então repeti-la em cada balão só ocupava espaço. Ela
+            # continua no card lateral e no detalhe do ponto clicado.
+            return f"<b>Contrato {rotulo}</b> — {h['descricao']}"
 
         faturas = df_m["fatura"].tolist() if "fatura" in df_m.columns else [""] * len(valores)
         composicoes_mes = df_m["composicao_mes"].fillna("").tolist() if "composicao_mes" in df_m.columns else [""] * len(valores)
@@ -1399,22 +1400,15 @@ def plotar_historico_multi(
                 })
                 continue
             texto = f"{cabecalho_hover}<br>{mes_fmt}: {formatar_moeda(val)}"
-            if faturas[j]:
-                texto += f"<br>NF: {faturas[j]}"
-            # composição REAL desse mês específico (buscada na NF de
-            # verdade daquele mês). SEM fallback pra "composição atual" —
-            # já que buscamos nota por nota, misturar uma aproximação de
-            # outra época só confundiria; se não achar a composição real
-            # dessa NF, simplesmente não mostra nada em vez de arriscar
-            # mostrar algo que pode não bater com o período
-            if composicoes_mes[j]:
-                texto += f"<br>Composição (deste mês): {composicoes_mes[j]}"
-            # texto livre da NF (local + período de referência real) —
-            # aparece mesmo quando a NF só tem 1 item (sem % de composição),
-            # ex: "PEDESTAL SIMPLES - Feira de Santana, BA LICENCIAMENTO
-            # DE SOFTWARE PERIODO: Setembro/2025"
-            if descricoes_mes[j]:
-                texto += f"<br>Item (deste mês): {descricoes_mes[j]}"
+            # HOVER SIMPLIFICADO: composição detalhada e lista de itens
+            # saíram daqui — com muitos equipamentos isso virava um balão
+            # gigante que cobria o gráfico inteiro (e ainda ficava
+            # cortado). Esse detalhe agora vive no painel lateral, ao
+            # CLICAR no ponto: lá tem espaço, tabela e rolagem. O hover
+            # fica só com o essencial pra identificar o ponto de relance.
+            qtd_itens_mes = len(itens_mes_lista_pontos[j] or [])
+            if qtd_itens_mes:
+                texto += f"<br>{qtd_itens_mes} item(ns) nesta NF"
             if not completos[j]:
                 texto += (
                     "<br><b>⚠ Dado incompleto:</b> nem todos os itens deste grupo "
@@ -1424,17 +1418,21 @@ def plotar_historico_multi(
             elif variacoes_pct[j] is not None:
                 direcao = "Aumento" if variacoes_bruto[j] > 0 else "Redução"
                 texto += f"<br>{direcao}: {formatar_moeda(abs(variacoes_bruto[j]))} ({variacoes_pct[j]:+.1f}%)"
-                # aponta qual equipamento específico entrou/saiu/mudou de
-                # valor entre o mês de comparação e este, quando dá pra
-                # identificar — "valor alterado" é o mais direto pra
-                # responder "onde exatamente aumentou"
+                # a LISTA de equipamentos que entraram/saíram/mudaram de
+                # valor saiu do hover (era outra fonte de balão gigante) —
+                # aqui fica só a contagem; o detalhe item a item está no
+                # painel lateral ao clicar no ponto. A versão completa
+                # continua sendo guardada pro console/detalhamento.
                 txt_novos, txt_removidos, txt_alterados = _mudancas_equipamento(origem_variacao_idx[j], j)
+                resumo_mudancas = []
                 if txt_alterados:
-                    texto += f"<br>↕ Valor alterado: {txt_alterados}"
+                    resumo_mudancas.append("valor alterado")
                 if txt_novos:
-                    texto += f"<br>+ Equipamento(s) novo(s): {txt_novos}"
+                    resumo_mudancas.append("equipamento novo")
                 if txt_removidos:
-                    texto += f"<br>− Equipamento(s) removido(s): {txt_removidos}"
+                    resumo_mudancas.append("equipamento removido")
+                if resumo_mudancas:
+                    texto += f"<br><i>({', '.join(resumo_mudancas)} — clique pra ver)</i>"
                 # versão COMPLETA (sem resumir) guardada à parte pra
                 # imprimir no console depois do gráfico — o hover tem
                 # espaço limitado, o console não
@@ -1522,7 +1520,7 @@ def plotar_historico_multi(
                 x=[meses_str[j] for j in idx_incompletos],
                 y=[valores[j] for j in idx_incompletos],
                 mode="markers",
-                marker=dict(size=10, color="#f59e0b", symbol="triangle-up", line=dict(color="white", width=1)),
+                marker=dict(size=14, color="#f59e0b", symbol="triangle-up", line=dict(color="white", width=1)),
                 legendgroup=grupo_legenda, showlegend=False,
                 hovertext=[hover_texts[j] for j in idx_incompletos], hoverinfo="text",
                 visible=visivel_inicial_grupo,
@@ -1537,7 +1535,7 @@ def plotar_historico_multi(
                 y=[valores[j] for j in idx_variacao],
                 mode="markers",
                 marker=dict(
-                    size=8,
+                    size=12,
                     color=[COR_AUMENTO if variacoes_bruto[j] > 0 else COR_REDUCAO for j in idx_variacao],
                     line=dict(color="white", width=1),
                 ),
@@ -1603,12 +1601,12 @@ def plotar_historico_multi(
                     if motivo:
                         hover_cancel += f" — Motivo: {motivo}"
                     hover_cancel += "<br>Contrato segue de outra forma."
-                    cor_marcador, simbolo, tamanho = "#f59e0b", "circle-open", 13
+                    cor_marcador, simbolo, tamanho = "#f59e0b", "circle-open", 17
                 else:
                     hover_cancel = f"<b>Contrato {h['grupo']} cancelado em {data_cancel}</b>"
                     if motivo:
                         hover_cancel += f"<br>Motivo: {motivo}"
-                    cor_marcador, simbolo, tamanho = "black", "diamond", 14
+                    cor_marcador, simbolo, tamanho = "black", "diamond", 18
 
                 fig.add_trace(go.Scatter(
                     x=[meses_str[idx]], y=[valores[idx]], mode="markers",
@@ -1682,7 +1680,7 @@ def plotar_historico_multi(
                 y=[valores_t[j] for j in idx_var_t],
                 mode="markers",
                 marker=dict(
-                    size=8,
+                    size=12,
                     color=[COR_AUMENTO if var_bruto_t[j] > 0 else COR_REDUCAO for j in idx_var_t],
                     line=dict(color="white", width=1),
                 ),
@@ -2656,29 +2654,45 @@ def relatorio_cliente(
 
     def _tabela_equipamentos_colorida(df_equip):
         """
-        Colore por LOCAL: equipamentos no mesmo local recebem a mesma cor.
+        Colore cada equipamento com a cor do CONTRATO correspondente — a
+        mesma cor da linha dele no gráfico e do card lateral. Assim a cor
+        vira uma chave de leitura que atravessa a tela inteira: bateu o
+        olho num equipamento, sabe qual linha do gráfico e qual card
+        falam dele.
 
-        Antes era um gradiente puro por ordem de linha — ficava bonito
-        mas não dizia nada (a cor não representava informação nenhuma).
-        Agrupar por local dá uma leitura real: dá pra ver de relance
-        quantos equipamentos estão em cada obra/filial e quais linhas
-        pertencem ao mesmo sítio, sem precisar ler a coluna de local
-        linha a linha. Locais com um único equipamento ficam sem cor,
-        pra destacar os agrupamentos de verdade.
+        O cruzamento é pelo número de série mencionado na descrição do
+        contrato (ex: 'SERIE 19927 #1 - ID ...') batendo com o
+        serial_equipamento. Equipamento sem contrato correspondente fica
+        sem cor — melhor honesto que forçar um match errado.
         """
         df_sel = df_equip[colunas_equip].copy()
 
-        contagem_por_local = df_sel["local_nome"].astype(str).value_counts()
-        locais_com_varios = [loc for loc, qtd in contagem_por_local.items() if qtd > 1]
-        mapa_cor = {
-            loc: interpolar_cor_gradiente(i / (len(locais_com_varios) - 1) if len(locais_com_varios) > 1 else 0)
-            for i, loc in enumerate(locais_com_varios)
-        }
-        locais_da_linha = df_sel["local_nome"].astype(str).tolist()
+        # serial -> código do contrato (via descrição do contrato)
+        serial_para_codigo = {}
+        for _, linha_contrato in contratos.iterrows():
+            serial = extrair_serial_de_texto(linha_contrato.get("Descricao"))
+            if serial:
+                serial_para_codigo[serial] = normalizar_codigo_contrato(linha_contrato.get("codigoContrato"))
+
+        # código do contrato -> grupo (um grupo pode ter vários códigos,
+        # ex: "6484/6483" cobre o 6484 e o 6483)
+        codigo_para_grupo = {}
+        for h in historicos:
+            for cod in str(h["grupo"]).split("/"):
+                codigo_para_grupo[normalizar_codigo_contrato(cod)] = h["grupo"]
+
+        cores_por_grupo = resolver_cores_dos_grupos(historicos)
+
+        cores_das_linhas = []
+        for serial in df_sel["serial_equipamento"].astype(str):
+            codigo = serial_para_codigo.get(serial)
+            grupo = codigo_para_grupo.get(codigo) if codigo else None
+            cores_das_linhas.append(cores_por_grupo.get(grupo) if grupo else None)
+
         df_sel = renomear_para_exibicao(df_sel)  # renomeia só DEPOIS de usar os nomes crus acima
 
         def _estilo_linha(linha):
-            cor = mapa_cor.get(locais_da_linha[linha.name] if linha.name in range(len(locais_da_linha)) else None)
+            cor = cores_das_linhas[linha.name] if linha.name < len(cores_das_linhas) else None
             return [f"background-color: {cor}40"] * len(linha) if cor else [""] * len(linha)
 
         return df_sel.reset_index(drop=True).style.apply(_estilo_linha, axis=1)
@@ -2805,6 +2819,16 @@ def relatorio_cliente(
 
     # --- 3) Histórico de mensalidade (gráfico principal) ---
     st.subheader("Histórico de mensalidade", anchor=False)
+    # opção do GRÁFICO (não da busca): muda como o gráfico se apresenta,
+    # então mora junto dele — antes ficava no formulário de pesquisa, o
+    # que obrigava a refazer a busca inteira só pra ligar/desligar uns
+    # marcadores.
+    mostrar_eventos_cancelamento = st.toggle(
+        "Marcadores de contrato cancelado", value=mostrar_eventos_cancelamento,
+        key=f"toggle_cancelamento_{nome_cliente}",
+        help="Desligue pra esconder os losangos/círculos e a linha vertical de cancelamento — "
+             "útil quando atrapalham a leitura de outras variações de valor na mesma época.",
+    )
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
 
     # grupos marcados nos checkboxes dos cards — lidos direto do
@@ -3050,33 +3074,25 @@ st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Busc
 
 with st.form("busca_cliente_form"):
     identificador_input = st.text_input("Cliente:", placeholder="Ex: DNP TERRAPLANAGEM, 308, ou 57623761000117")
-    mostrar_eventos_cancelamento_input = st.checkbox(
-        "Mostrar marcadores de contrato cancelado no gráfico", value=True,
-        help="Desmarque pra esconder os losangos/círculos e a linha vertical de cancelamento — "
-             "útil quando eles atrapalham a leitura de outras variações de valor na mesma época.",
-    )
     col1, col2 = st.columns([1, 3])
     with col1:
         buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
 
-# guarda o cliente buscado (e as opções escolhidas) em session_state — o
-# Streamlit reroda o script INTEIRO a cada interação, inclusive quando
-# se clica num ponto do gráfico (recurso de detalhe do ponto clicado).
-# Sem guardar isso aqui, a variável `buscar_clicado` volta a ser False
-# em qualquer rerun que não seja o exato clique no botão "Buscar", e a
-# tela inteira do cliente sumia — parecia que "resetava a pesquisa",
-# porque, tecnicamente, resetava mesmo: o relatório só era desenhado
-# dentro do `if buscar_clicado`.
+# guarda o cliente buscado em session_state — o Streamlit reroda o script
+# INTEIRO a cada interação, inclusive ao clicar num ponto do gráfico. Sem
+# isso, `buscar_clicado` volta a ser False em qualquer rerun que não seja
+# o clique no botão e a tela do cliente sumia (parecia "resetar a
+# pesquisa" — tecnicamente resetava mesmo).
 if buscar_clicado:
     if not identificador_input.strip():
         st.warning("Digite um cliente pra buscar.")
         st.session_state["identificador_buscado"] = None
     else:
         st.session_state["identificador_buscado"] = identificador_input.strip()
-        st.session_state["mostrar_eventos_cancelamento"] = mostrar_eventos_cancelamento_input
 
 if st.session_state.get("identificador_buscado"):
-    relatorio_cliente(
-        st.session_state["identificador_buscado"],
-        mostrar_eventos_cancelamento=st.session_state.get("mostrar_eventos_cancelamento", True),
-    )
+    # a opção de marcadores de cancelamento é uma propriedade do GRÁFICO
+    # (ver o toggle logo acima dele, dentro de relatorio_cliente), não da
+    # busca — mudar como o gráfico se apresenta não deveria exigir
+    # refazer a pesquisa
+    relatorio_cliente(st.session_state["identificador_buscado"])
