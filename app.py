@@ -79,6 +79,7 @@ RENOMEAR_COLUNAS_EXIBICAO = {
     "contratoTerceiro": "Contrato Terceiro",
     "bomba_nome": "Equipamento",
     "serial_equipamento": "Serial",
+    "id_op_operacional": "ID Operacional",
     "local_nome": "Local",
 }
 
@@ -292,6 +293,7 @@ def carregar_bombas_do_dw():
     SELECT
       b.bomba_nome,
       b.serial_equipamento,
+      CAST(b.id_op_operacional AS STRING) AS id_op_operacional,
       CAST(b.cliente_cigam_local AS STRING) AS cliente_cigam_local,
       CAST(b.cliente_cigam_pagante AS STRING) AS cliente_cigam_pagante,
       local.nomeCompleto AS local_nome,
@@ -1027,6 +1029,64 @@ COR_SO_ALUGUEL = "#66efc1"  # série verde, tom 2
 COR_SONDA = "#F1F1F1"  # CTA Cinza Claro
 
 
+def variar_tom(cor_base: str, fracao: float, intensidade: float = 0.55) -> str:
+    """
+    Gera uma variação de TOM da mesma cor base (mais clara ou mais
+    escura), controlada por `fracao` em [0, 1].
+
+    Motivo: a cor da linha carrega SIGNIFICADO (união aluguel+
+    licenciamento, só aluguel, sonda...), então não dá pra simplesmente
+    dar uma cor diferente pra cada contrato. Mas quando vários grupos
+    caem na MESMA categoria — e isso é comum, ex: um cliente com 16
+    contratos todos "Mensalidade Unificada" — todos ficavam exatamente
+    da mesma cor e as linhas viravam um emaranhado indistinguível.
+    Variando o tom, a categoria continua reconhecível (todo mundo azul)
+    mas cada linha fica distinguível da vizinha.
+    """
+    cor = cor_base.lstrip("#")
+    r, g, b = (int(cor[i:i + 2], 16) for i in (0, 2, 4))
+    # fracao 0 -> mais escuro; 0.5 -> cor original; 1 -> mais claro
+    desvio = (fracao - 0.5) * 2 * intensidade
+    if desvio >= 0:
+        r, g, b = (c + (255 - c) * desvio for c in (r, g, b))
+    else:
+        r, g, b = (c * (1 + desvio) for c in (r, g, b))
+    return "#" + "".join(f"{max(0, min(255, round(c))):02x}" for c in (r, g, b))
+
+
+def resolver_cores_dos_grupos(historicos: list) -> dict:
+    """
+    Decide a cor de CADA grupo de uma vez, retornando {grupo: cor}.
+
+    Faz isso em duas camadas:
+      1. categoria semântica (união aluguel+licenciamento, só aluguel,
+         só licenciamento, sonda) — a cor carrega significado;
+      2. variação de TOM dentro da categoria — quando vários grupos
+         caem na mesma (muito comum: cliente com 16 contratos todos
+         "Mensalidade Unificada"), cada um recebe um tom distinto da
+         mesma cor base, senão viram linhas idênticas e indistinguíveis.
+
+    Grupos sem categoria identificável caem no gradiente Verde→Azul da
+    marca, como antes.
+    """
+    por_categoria = {}
+    for h in historicos:
+        por_categoria.setdefault(classificar_cor_grupo(h), []).append(h["grupo"])
+
+    cores = {}
+    for categoria, grupos_da_categoria in por_categoria.items():
+        qtd = len(grupos_da_categoria)
+        for i, nome_grupo in enumerate(grupos_da_categoria):
+            fracao = i / (qtd - 1) if qtd > 1 else 0.5
+            if categoria is None:
+                cores[nome_grupo] = interpolar_cor_gradiente(fracao if qtd > 1 else 0)
+            elif qtd == 1:
+                cores[nome_grupo] = categoria  # único da categoria: cor pura, sem variar
+            else:
+                cores[nome_grupo] = variar_tom(categoria, fracao)
+    return cores
+
+
 def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#19e098", cor_fim: str = "#382fd8") -> str:
     """
     Interpola linearmente entre duas cores hex, dado fracao em [0, 1].
@@ -1125,6 +1185,7 @@ def plotar_historico_multi(
     Botões no topo permitem filtrar Todos / Só Ativos / Só Encerrados.
     """
     historicos_validos = [h for h in historicos if not h["df"].empty]
+    mapa_cores_grupos = resolver_cores_dos_grupos(historicos_validos)
     if not historicos_validos:
         st.info(f"Sem histórico de parcelas cobradas para: {titulo}")
         return None, ""
@@ -1203,9 +1264,10 @@ def plotar_historico_multi(
         # identidade CTA em vez da paleta de cores avulsas: com muitas
         # linhas, tons progressivos ficam mais fáceis de distinguir e
         # seguem a marca, em vez de parecer cores escolhidas ao acaso.
-        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
-            i / (len(historicos_validos) - 1) if len(historicos_validos) > 1 else 0
-        )
+        # cor resolvida em bloco (ver resolver_cores_dos_grupos): a
+        # categoria semântica define a cor base, e o TOM varia entre
+        # grupos da mesma categoria pra não virarem linhas idênticas
+        cor = mapa_cores_grupos.get(h["grupo"]) or interpolar_cor_gradiente(0.5)
         grupo_legenda = f"grupo_{i}"
         situacao_grupo = h.get("situacao")
 
@@ -1845,10 +1907,12 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", max_visiv
         key=lambda h: (h.get("situacao") != "A", -(h.get("valor_total") or 0)),
     )
 
+    mapa_cores_cards = resolver_cores_dos_grupos(historicos_ordenados)
+
     def _montar_dados_card(h, indice_card, total_cards):
-        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
-            indice_card / (total_cards - 1) if total_cards > 1 else 0
-        )
+        # mesma cor da linha no gráfico (resolver_cores_dos_grupos é
+        # determinística), ligando visualmente o card à linha
+        cor = mapa_cores_cards.get(h["grupo"]) or interpolar_cor_gradiente(0.5)
         df_h = h.get("df")
 
         valor_atual, variacao_bruto, variacao_pct = None, None, None
@@ -1962,14 +2026,13 @@ def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ati
 
     fig = make_subplots(rows=linhas, cols=cols, subplot_titles=titulos, vertical_spacing=0.12, horizontal_spacing=0.06)
 
+    mapa_cores_mini = resolver_cores_dos_grupos(grupos_plot)
     for idx, h in enumerate(grupos_plot):
         r, c = idx // cols + 1, idx % cols + 1
         df_m = h["df"].sort_values("mes")
         eixo_labels = [formatar_mes_ano(p) for p in df_m["mes"]]
         valores = pd.to_numeric(df_m["valor"], errors="coerce").tolist()
-        cor = classificar_cor_grupo(h) or interpolar_cor_gradiente(
-            idx / (len(grupos_plot) - 1) if len(grupos_plot) > 1 else 0
-        )
+        cor = mapa_cores_mini.get(h["grupo"]) or interpolar_cor_gradiente(0.5)
         hover = [f"{m}: {formatar_moeda(v)}" for m, v in zip(eixo_labels, valores)]
         fig.add_trace(go.Scatter(
             x=eixo_labels, y=valores, mode="lines+markers",
@@ -2156,18 +2219,26 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
             continue
         meses_existentes = set(df_h["mes"])
         intervalo_completo = pd.period_range(df_h["mes"].min(), df_h["mes"].max(), freq="M")
-        qtd_faltando = len(set(intervalo_completo) - meses_existentes)
-        if qtd_faltando > 0:
-            grupos_com_lacuna.append((h["grupo"], qtd_faltando))
+        meses_faltando = sorted(set(intervalo_completo) - meses_existentes)
+        if meses_faltando:
+            grupos_com_lacuna.append((h["grupo"], meses_faltando))
 
     if grupos_com_lacuna:
-        detalhe = ", ".join(f"{grupo} ({qtd} mês(es))" for grupo, qtd in grupos_com_lacuna[:5])
+        # nomeia QUAIS meses faltaram, não só quantos — antes dizia só
+        # "(1 mês(es))" e mandava procurar o marcador âmbar no gráfico,
+        # mas esses meses costumam estar FORA da janela visível (são
+        # anteriores ao início do gráfico), então não havia marcador
+        # nenhum pra achar e a mensagem virava um beco sem saída.
+        partes = []
+        for grupo, meses_faltando in grupos_com_lacuna[:5]:
+            nomes_meses = ", ".join(formatar_mes_ano(m) for m in meses_faltando[:3])
+            if len(meses_faltando) > 3:
+                nomes_meses += f" e mais {len(meses_faltando) - 3}"
+            partes.append(f"{grupo} ({nomes_meses})")
+        detalhe = " · ".join(partes)
         if len(grupos_com_lacuna) > 5:
-            detalhe += f" e mais {len(grupos_com_lacuna) - 5}"
-        linhas.append(
-            f"**⚠ Meses sem faturamento no meio do histórico:** {detalhe} — "
-            f"veja os marcadores âmbar no gráfico pra mais detalhe de qual mês exatamente."
-        )
+            detalhe += f" · e mais {len(grupos_com_lacuna) - 5} contrato(s)"
+        linhas.append(f"**⚠ Meses sem faturamento no meio do histórico:** {detalhe}")
 
     datas_validas = contratos["primeira_parcela"].dropna()
     ultima_parcela_valida = contratos["ultima_parcela"].dropna()
@@ -2595,7 +2666,9 @@ def relatorio_cliente(
 
     qtd_equip_unicos = equipamentos["serial_equipamento"].nunique() if len(equipamentos) else 0
     label_qtd_equip = str(qtd_equip_unicos)
-    colunas_equip = ["bomba_nome", "serial_equipamento", "local_nome", "Local ≠ Pagante?", "Múltiplo?"]
+    colunas_equip = ["bomba_nome", "serial_equipamento", "id_op_operacional", "local_nome", "Local ≠ Pagante?", "Múltiplo?"]
+    # id_op_operacional só entra se a coluna existir (o modo demo não tem)
+    colunas_equip = [c for c in colunas_equip if c in equipamentos.columns or c in ("Local ≠ Pagante?", "Múltiplo?")]
 
     def _tabela_equipamentos_colorida(df_equip):
         """Colore TODOS os equipamentos num gradiente Verde→Azul (segue a
@@ -2914,31 +2987,16 @@ def relatorio_cliente(
             st.caption("Marque um contrato pra ver a linha dele no gráfico, ou clique num ponto pra ver o detalhe do mês.")
             mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
 
-    if detalhes_md:
-        with st.expander("📋 Detalhamento completo das mudanças de equipamento por mês (sem resumir)"):
-            st.markdown(detalhes_md)
+    # Os dois expanders ("Detalhamento completo das mudanças de
+    # equipamento" e "Descrição/observação por contrato") e a grade de
+    # mini-gráficos foram REMOVIDOS daqui: os cards laterais + o detalhe
+    # do ponto clicado (com tabela de equipamentos por mês) já cobrem
+    # essa informação de forma mais direta, e mantê-los duplicava
+    # conteúdo no fim de uma página já longa. `mostrar_grade_individual`
+    # e `plotar_contratos_lado_a_lado` continuam no código, caso valha
+    # a pena retomar a grade num painel próprio depois.
 
-    with st.expander("Descrição/observação por contrato (texto completo)"):
-        if len(historicos) <= 15:
-            for h in historicos:
-                st.markdown(f"**Contrato {h['grupo']} ({h['descricao']}):**")
-                st.write(f"Item: {h['descricao_item'] or '(sem descrição de item)'}")
-                st.write(f"Obs.: {h['observacao'] or '(sem observação)'}")
-                st.divider()
-        else:
-            st.caption(
-                f"{len(historicos)} grupos é muita coisa pra listar em texto aqui — "
-                f"veja na tabela de itens/contratos acima ou no hover do gráfico."
-            )
-
-    # --- 4) Histórico individual por contrato (mini-gráficos) ---
-    if mostrar_grade_individual:
-        st.subheader("Histórico individual por contrato (mini-gráficos)", anchor=False)
-        fig_grade = plotar_contratos_lado_a_lado(historicos, nome_cliente, apenas_ativos=True)
-        if fig_grade is not None:
-            st.plotly_chart(fig_grade, use_container_width=True)
-
-    # --- 5) Itens/contratos encerrados/cancelados — movido pro final,
+    # --- 4) Itens/contratos encerrados/cancelados — movido pro final,
     # como pedido; é informação de arquivo/histórico, não o primeiro que
     # a pessoa precisa ver
     qtd_encerrados_itens = (contratos["situacaoContrato"] == "E").sum()
