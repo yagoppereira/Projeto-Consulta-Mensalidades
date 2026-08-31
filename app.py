@@ -2064,10 +2064,23 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
             # barra invertida (\$) NÃO é interpretado, aparece literal na
             # tela ("R\$ 11.475,00").
             st.markdown(html_card.replace("$", "&#36;"), unsafe_allow_html=True)
+
+            # A seleção é guardada numa chave PRÓPRIA (chave_selecao),
+            # separada da chave do widget. Motivo: o Streamlit APAGA do
+            # session_state as chaves de widgets que não são renderizados
+            # numa rodada — e o painel de cards deixa de existir quando a
+            # pessoa clica num ponto do gráfico (troca pra visão de
+            # detalhe do mês). Sem essa cópia, ao voltar do detalhe a
+            # seleção era descartada e o gráfico voltava a mostrar só o
+            # Total, perdendo o contrato que estava sendo inspecionado.
+            chave_widget = f"{chave_prefixo}mostrar_{h['grupo']}"
+            chave_selecao = f"selecao_persistente_{chave_prefixo}{h['grupo']}"
             marcado = st.checkbox(
-                "Mostrar no gráfico", value=False,
-                key=f"{chave_prefixo}mostrar_{h['grupo']}",
+                "Mostrar no gráfico",
+                value=bool(st.session_state.get(chave_selecao, False)),
+                key=chave_widget,
             )
+            st.session_state[chave_selecao] = marcado
             if marcado:
                 grupos_marcados.add(h["grupo"])
                 houve_interacao = True
@@ -2922,11 +2935,17 @@ def relatorio_cliente(
     # marcado na rodada anterior. Como marcar um checkbox já dispara um
     # rerun sozinho, na prática a seleção aparece no gráfico
     # imediatamente pra quem está usando.
+    #
+    # Lê as chaves PERSISTENTES (selecao_persistente_*), não as dos
+    # widgets: o Streamlit apaga as chaves de widgets não renderizados, e
+    # os cards saem da tela quando a pessoa abre o detalhe de um mês —
+    # ler do widget fazia a seleção se perder ao voltar do detalhe.
     prefixo_chave_cards = f"card_{nome_cliente}_"
+    prefixo_persistente = f"selecao_persistente_{prefixo_chave_cards}"
     grupos_marcados_nos_cards = {
-        chave[len(prefixo_chave_cards) + len("mostrar_"):]
+        chave[len(prefixo_persistente):]
         for chave, valor in st.session_state.items()
-        if chave.startswith(prefixo_chave_cards + "mostrar_") and valor
+        if chave.startswith(prefixo_persistente) and valor
     }
 
     fig_principal, detalhes_md = plotar_historico_multi(
