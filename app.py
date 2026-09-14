@@ -1001,12 +1001,12 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
 # depois de reservar as cores semânticas abaixo (união/licenciamento/
 # aluguel/sonda/aumento/redução), pra nunca colidir com elas
 PALETA_CONTRATOS = [
-    "#574ae2",  # CTA Violeta
-    "#0fad72",  # série verde, tom 4
-    "#8f87ec",  # série azul, tom 2
-    "#087a50",  # série verde, tom 5 (mais escuro)
-    "#c4bff6",  # série azul, tom 1 (mais claro)
-    "#b3f7e0",  # série verde, tom 1 (mais claro)
+    "#4070E0",  # Cobalt Light
+    "#2ACFA1",  # Fuel Light
+    "#0035A8",  # Cobalt Dark
+    "#009A6D",  # Fuel Dark
+    "#86A8F7",  # Cobalt 40%
+    "#9FEDD8",  # Fuel 40%
 ]
 
 # cores reservadas exclusivamente para os marcadores de aumento/redução.
@@ -1015,18 +1015,21 @@ PALETA_CONTRATOS = [
 # na prática o azul da redução se confundia com as linhas de contrato
 # (que também são azuis, pelo gradiente da marca) e o vermelho comunica
 # "caiu" de forma bem mais imediata pra quem lê o gráfico.
-COR_AUMENTO = "#19e098"  # CTA Verde (esse já era da marca, mantido)
-COR_REDUCAO = "#e5484d"  # vermelho — convenção universal de queda
+COR_AUMENTO = "#00C389"  # Fuel Green — o brandbook define essa cor
+# literalmente como "status ativo"; é a metáfora do negócio (painel
+# industrial: verde = operando). Serve tanto pra aumento quanto pra
+# sinalizar contrato ativo.
+COR_REDUCAO = "#E74C3C"  # vermelho da paleta de apoio do brandbook
 
 # cores por TIPO de contrato (identificado pelo texto — descrição,
 # composição, observação — não por ordem arbitrária). Se o tipo do grupo
 # mudar (ex: passou a ser "Mensalidade Unificada" recentemente, antes
 # era só licenciamento), a cor acompanha automaticamente, porque a
 # classificação é refeita a cada vez com o dado mais recente disponível.
-COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#382fd8"  # CTA Azul
-COR_SO_LICENCIAMENTO = "#2318a8"  # série azul, tom mais escuro
-COR_SO_ALUGUEL = "#66efc1"  # série verde, tom 2
-COR_SONDA = "#F1F1F1"  # CTA Cinza Claro
+COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#0040D0"  # Cobalt Blue · Principal
+COR_SO_LICENCIAMENTO = "#0035A8"  # Cobalt Dark 70%
+COR_SO_ALUGUEL = "#2ACFA1"  # Fuel Green claro
+COR_SONDA = "#8A95A8"  # Steel — textos secundários/bordas
 
 
 def variar_tom(cor_base: str, fracao: float, intensidade: float = 0.55) -> str:
@@ -1087,7 +1090,7 @@ def resolver_cores_dos_grupos(historicos: list) -> dict:
     return cores
 
 
-def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#19e098", cor_fim: str = "#382fd8") -> str:
+def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#00C389", cor_fim: str = "#0040D0") -> str:
     """
     Interpola linearmente entre duas cores hex, dado fracao em [0, 1].
     Padrão: Verde → Azul — o mesmo degradê PRIMÁRIO da identidade visual
@@ -1572,9 +1575,22 @@ def plotar_historico_multi(
         # mouse parado em cima do ponto pra ler
         fig.add_trace(go.Scatter(
             x=meses_str, y=valores, mode="lines+markers", connectgaps=False,
-            name=f"{h['grupo']} — {h['descricao']}"[:40],
+            # ● = ativo, ○ = encerrado — a legenda é o único lugar em que
+            # a pessoa lê o nome do contrato, então carregar a situação
+            # aqui evita ter que cruzar com os cards pra saber
+            name=("● " if situacao_grupo == "A" else "○ ") + f"{h['grupo']} — {h['descricao']}"[:38],
             legendgroup=grupo_legenda, showlegend=True,
-            line=dict(color=cor, width=2), marker=dict(size=6, color=cor),
+            # ENCERRADO vira linha tracejada e mais fina; ativo fica
+            # sólida e cheia. Antes só a cor diferenciava, e como a cor
+            # já carrega o TIPO de contrato (união/aluguel/licenciamento)
+            # não sobrava nada pra indicar a situação — ativo e encerrado
+            # ficavam visualmente idênticos.
+            line=dict(
+                color=cor,
+                width=2 if situacao_grupo == "A" else 1.5,
+                dash="solid" if situacao_grupo == "A" else "dash",
+            ),
+            marker=dict(size=6 if situacao_grupo == "A" else 4, color=cor),
             hovertext=hover_texts, hoverinfo="text", customdata=dados_estruturados,
             # com mais de 1 grupo, começa ESCONDIDA (só aparece na
             # legenda, clicável pra reativar) — a Total (ou a única linha,
@@ -1876,7 +1892,16 @@ def plotar_historico_multi(
     # altura mínima maior (era 560): com a margem inferior ampliada pra
     # caber rótulos + legenda sem colidir, um gráfico baixo demais
     # esmagava a área de plotagem em si.
-    altura_fig = min(950, max(700, 60 * len(historicos_validos)))
+    # A legenda é horizontal e quebra em várias linhas quando há muitos
+    # contratos (7 contratos = ~3 linhas). Com `y` e margem FIXOS, ela
+    # invadia os rótulos do eixo X exatamente nesses casos — que são os
+    # que mais precisam de legenda. Aqui o espaço reservado cresce junto
+    # com a quantidade de itens.
+    qtd_itens_legenda = len(historicos_validos) + (1 if incluir_total else 0)
+    linhas_legenda = max(1, (qtd_itens_legenda + 2) // 3)  # ~3 itens por linha
+    margem_inferior = 150 + 26 * linhas_legenda
+    y_legenda = -(0.20 + 0.055 * linhas_legenda)
+    altura_fig = min(1000, max(680, 60 * len(historicos_validos)) + 24 * linhas_legenda)
 
     # limite de zoom-out: sem isso, o Plotly deixa a pessoa afastar o
     # zoom indefinidamente, mostrando um espaço vazio gigante em volta de
@@ -1924,12 +1949,12 @@ def plotar_historico_multi(
             # altura, então quando o gráfico ficou mais baixo essa fração
             # virou poucos pixels e a legenda subiu em cima dos rótulos
             # rotacionados do eixo X (que ocupam bastante altura).
-            orientation="h", yanchor="top", y=-0.30, xanchor="center", x=0.5,
+            orientation="h", yanchor="top", y=y_legenda, xanchor="center", x=0.5,
             font=dict(size=12), groupclick="togglegroup",
         ),
         # margem inferior maior pra caber rótulos rotacionados + título do
         # eixo + legenda sem sobreposição
-        margin=dict(t=110, b=190, l=70, r=40),
+        margin=dict(t=110, b=margem_inferior, l=70, r=40),
         updatemenus=updatemenus_filtro,
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
@@ -2034,7 +2059,14 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
 
     for indice_card, h in enumerate(historicos_ordenados):
         cor, valor_atual, variacao_bruto, variacao_pct, avisos = _montar_dados_card(h, indice_card, total)
-        situacao_label = "🟢 Ativo" if h.get("situacao") == "A" else "⚪ Encerrado"
+        # mesmos símbolos da legenda do gráfico (● ativo / ○ encerrado),
+        # pra card e linha se lerem como a mesma coisa. Cor do status
+        # também vem da marca: Fuel Green = "status ativo" no brandbook.
+        eh_ativo = h.get("situacao") == "A"
+        situacao_label = (
+            f"<span style='color:{COR_AUMENTO};'>● Ativo</span>" if eh_ativo
+            else f"<span style='color:{COR_SONDA};'>○ Encerrado</span>"
+        )
         valor_texto = formatar_moeda(valor_atual) if valor_atual is not None else "N/D"
 
         texto_variacao = ""
@@ -2075,9 +2107,13 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
             # Total, perdendo o contrato que estava sendo inspecionado.
             chave_widget = f"{chave_prefixo}mostrar_{h['grupo']}"
             chave_selecao = f"selecao_persistente_{chave_prefixo}{h['grupo']}"
+            marcado_antes = bool(st.session_state.get(chave_selecao, False))
             marcado = st.checkbox(
-                "Mostrar no gráfico",
-                value=bool(st.session_state.get(chave_selecao, False)),
+                # o rótulo reflete o ESTADO atual, não uma ação genérica:
+                # fica claro de relance quais contratos estão desenhados
+                # no gráfico sem precisar conferir a legenda
+                "✓ Visível no gráfico" if marcado_antes else "Mostrar no gráfico",
+                value=marcado_antes,
                 key=chave_widget,
             )
             st.session_state[chave_selecao] = marcado
@@ -3137,7 +3173,8 @@ def relatorio_cliente(
             # outros"), mas ocupa exatamente a mesma altura do gráfico ao
             # lado, então a página não estica com clientes grandes.
             # Mesma fórmula de altura usada em plotar_historico_multi.
-            altura_painel = min(950, max(700, 60 * len(historicos_grafico)))
+            _linhas_leg = max(1, (len(historicos_grafico) + 1 + 2) // 3)
+            altura_painel = min(1000, max(680, 60 * len(historicos_grafico)) + 24 * _linhas_leg)
             with st.container(height=altura_painel):
                 mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
 
@@ -3324,6 +3361,20 @@ def detectar_operador_do_equipamento(bomba_nome: str, nomes_cliente) -> str:
     return "" if (palavras_bomba & palavras_cliente) else prefixo
 
 
+def _sufixo_cnpj(cnpj: str) -> str:
+    """Formata só a parte que DIFERENCIA as empresas de um grupo: o
+    sufixo de filial + dígito verificador. A raiz (8 primeiros dígitos)
+    é igual em todas, então mostrá-la na legenda só gasta espaço.
+
+    CNPJ tem 14 dígitos: 8 (raiz) + 4 (filial) + 2 (DV). O corte é
+    sempre [8:12] pra filial e [12:] pro DV — ex: 20705907/0018-01.
+    """
+    digitos = "".join(ch for ch in str(cnpj or "") if ch.isdigit())
+    if len(digitos) != 14:
+        return str(cnpj or "?")[:14]
+    return f"{digitos[8:12]}-{digitos[12:14]}"
+
+
 def relatorio_grupo(termo: str):
     """Visão consolidada de um grupo econômico: quem são as empresas,
     quanto cada uma paga, e o total do grupo."""
@@ -3408,7 +3459,11 @@ def relatorio_grupo(termo: str):
             if df_hist.empty:
                 continue
             historicos_grupo.append({
-                "grupo": f"{emp['Empresa'][:18]} · {cod_grupo}",
+                # rótulo usa o SUFIXO do CNPJ (ex: 0018-01), não o nome:
+                # num grupo econômico todas as empresas têm praticamente
+                # o mesmo nome ("HOK TRANSPORTES LTDA"), então o nome não
+                # distingue nada na legenda — o que diferencia é a filial
+                "grupo": f"{_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}",
                 "descricao": subset["Descricao_Material"].dropna().iloc[0] if subset["Descricao_Material"].notna().any() else "",
                 "df": df_hist, "composicao": "", "data_cancelamento": None,
                 "motivo_cancelamento": None, "descricao_item": "", "observacao": "",
