@@ -1242,12 +1242,15 @@ def plotar_historico_multi(
         # visibilidade inicial: com 1 grupo só, sempre visível. Com
         # vários, começa escondido (só na legenda) — a não ser que esse
         # grupo tenha sido MARCADO num checkbox de card, aí aparece.
-        if len(historicos_validos) <= 1:
-            visivel_inicial_grupo = True
-        elif grupos_visiveis and h["grupo"] in grupos_visiveis:
+        # O multiselect é a fonte de verdade da visibilidade:
+        #  - vazio  -> mostra TODAS as linhas (estado inicial útil; antes
+        #              escondia tudo e o gráfico parecia quebrado)
+        #  - com itens -> mostra só os escolhidos
+        # Um grupo só sempre aparece, não há o que filtrar.
+        if len(historicos_validos) <= 1 or not grupos_visiveis:
             visivel_inicial_grupo = True
         else:
-            visivel_inicial_grupo = "legendonly"
+            visivel_inicial_grupo = True if h["grupo"] in grupos_visiveis else "legendonly"
 
         # preenche os meses que faltam no MEIO do período (do primeiro ao
         # último mês desse contrato) com um "buraco" (NaN) — sem isso, o
@@ -1876,6 +1879,13 @@ def plotar_historico_multi(
         yaxis_tickprefix="R$ ", yaxis_tickformat=",.2f",
         yaxis=dict(minallowed=y_min_permitido, maxallowed=y_max_permitido) if y_min_permitido is not None else {},
         template="plotly_white", hovermode="closest",
+        # fundo claro FIXO no gráfico: por padrão o Plotly no Streamlit
+        # herda o tema do app, e no modo escuro as linhas em Cobalt Dark
+        # (#0035A8) sumiam contra o fundo preto — o gráfico parecia vazio
+        # mesmo com os dados lá. Fixando aqui, o gráfico fica legível
+        # independente do tema que o navegador/usuário estiver usando.
+        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        font=dict(color="#060D1F"),
         height=altura_fig,
         # width REMOVIDO de propósito: o gráfico é exibido com
         # use_container_width=True, dentro de uma coluna estreita (3:1,
@@ -1896,6 +1906,14 @@ def plotar_historico_multi(
             # virou poucos pixels e a legenda subiu em cima dos rótulos
             # rotacionados do eixo X (que ocupam bastante altura).
             orientation="h", yanchor="top", y=y_legenda, xanchor="center", x=0.5,
+            # clique na legenda DESABILITADO: ela era um terceiro
+            # controle de visibilidade competindo com o multiselect e
+            # com os cards. Como o clique acontece dentro do Plotly, o
+            # app não ficava sabendo — então marcar no multiselect e
+            # clicar na legenda davam resultados diferentes, e os cards
+            # refletiam só um dos dois. Agora o multiselect é a ÚNICA
+            # fonte de verdade: gráfico e cards seguem ele.
+            itemclick=False, itemdoubleclick=False,
             font=dict(size=12), groupclick="togglegroup",
         ),
         # margem inferior maior pra caber rótulos rotacionados + título do
@@ -2031,7 +2049,9 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", grupos_ex
             # a seleção passou pro multiselect único no topo da lista,
             # e o card só REFLETE o estado, não o controla. Menos ruído
             # visual, e a relação card<->linha fica imediata.
-            no_grafico = h["grupo"] in (grupos_exibidos or set())
+            # mesma regra do gráfico: seleção vazia = todos no gráfico,
+            # senão só os escolhidos. Card e linha contam a mesma história.
+            no_grafico = (not grupos_exibidos) or (h["grupo"] in grupos_exibidos)
             opacidade = "1" if no_grafico else "0.45"
             marca_exibicao = (
                 f'<div style="font-size:0.8em; color:{cor};">▬ no gráfico</div>'
@@ -2914,7 +2934,7 @@ def relatorio_cliente(
     opcoes_contratos = [h["grupo"] for h in historicos_grafico]
     with col_f2:
         grupos_marcados_nos_cards = set(st.multiselect(
-            "Contratos no gráfico (vazio = só o total)",
+            "Contratos no gráfico (vazio = todos)",
             options=opcoes_contratos, default=[],
             key=f"sel_contratos_{nome_cliente}",
             help="Escolha quais contratos desenhar. Os cards ao lado acendem conforme a seleção.",
@@ -3156,7 +3176,7 @@ def _renderizar_cabecalho():
         st.markdown(
             f"""
             <div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
-                <img src="data:image/png;base64,{logo_b64}" style="height:64px; width:auto;">
+                <img src="data:image/png;base64,{logo_b64}" style="height:104px; width:auto;">
                 <h1 style="margin:0; font-size:2.25rem;">Histórico de Mensalidade — CIGAM</h1>
             </div>
             """,
@@ -3469,16 +3489,18 @@ def relatorio_grupo(termo: str):
 
 _renderizar_cabecalho()
 
-aba_cliente, aba_grupo = st.tabs(["🔍 Cliente", "🏢 Grupo econômico"])
+aba_cliente, aba_grupo = st.tabs(["Cliente", "Grupo econômico"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
     with st.form("busca_cliente_form"):
-        identificador_input = st.text_input("Cliente:", placeholder="Ex: DNP TERRAPLANAGEM, 308, ou 57623761000117")
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
+        col_busca, col_btn = st.columns([5, 1], vertical_alignment="bottom")
+        with col_busca:
+            identificador_input = st.text_input(
+                "Cliente", placeholder="Nome, código CIGAM ou CNPJ/CPF")
+        with col_btn:
+            buscar_clicado = st.form_submit_button("Buscar", use_container_width=True, type="primary")
 
     # guarda o cliente buscado em session_state — o Streamlit reroda o script
     # INTEIRO a cada interação, inclusive ao clicar num ponto do gráfico. Sem
@@ -3505,10 +3527,11 @@ with aba_grupo:
         "(matriz e filiais) e por nome. Ex: 'HOK' traz todos os HOK."
     )
     with st.form("busca_grupo_form"):
-        termo_grupo = st.text_input("Grupo:", placeholder="Ex: HOK, EDECONSIL, ou um CNPJ do grupo")
-        col_g1, col_g2 = st.columns([1, 3])
-        with col_g1:
-            buscar_grupo_clicado = st.form_submit_button("🏢 Buscar grupo", use_container_width=True)
+        col_bg, col_btg = st.columns([5, 1], vertical_alignment="bottom")
+        with col_bg:
+            termo_grupo = st.text_input("Grupo", placeholder="Ex: HOK, EDECONSIL, ou um CNPJ do grupo")
+        with col_btg:
+            buscar_grupo_clicado = st.form_submit_button("Buscar grupo", use_container_width=True, type="primary")
 
     if buscar_grupo_clicado:
         st.session_state["grupo_buscado"] = termo_grupo.strip() or None
