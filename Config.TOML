@@ -1,0 +1,10 @@
+# Tema visual — ctasmart | link2pump (BRANDBOOK 2026)
+# Modo CLARO: o modo escuro estava dificultando a leitura dos gráficos
+# (linhas finas e texto de eixo somem no fundo escuro). O brandbook usa
+# Night (#060D1F) como "fundo premium", mas pra ferramenta de trabalho
+# — muitas tabelas, muita linha fina — o fundo claro lê melhor.
+[theme]
+primaryColor = "#0040D0"             # Cobalt Blue · Principal
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F4F8" # cinza claro da paleta
+textColor = "#060D1F"                # Night — texto principal
