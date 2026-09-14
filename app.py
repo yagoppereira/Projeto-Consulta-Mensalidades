@@ -3270,6 +3270,60 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
 
 
+def detectar_operador_do_equipamento(bomba_nome: str, nomes_cliente) -> str:
+    """
+    O nome do equipamento costuma trazer o OPERADOR real no início
+    (ex: "MG LOG Transportes - Brasília/DF"), que nem sempre é o cliente
+    cadastrado como local/pagante no CIGAM (nesse caso, HOK 2522).
+
+    Isso importa porque é a única pista de que o equipamento está
+    operando por conta de um terceiro — nenhum campo de cliente mostra
+    isso. Retorna o nome do operador quando ele DIVERGE do cliente, ou
+    string vazia quando bate (caso normal).
+
+    A comparação é por palavra-chave (primeira palavra significativa),
+    pra tolerar as diferenças naturais de grafia entre o cadastro da
+    bomba e a razão social ("MG LOG Transportes" vs "MG LOG LTDA").
+    """
+    if not bomba_nome or pd.isna(bomba_nome):
+        return ""
+    # o operador é o trecho antes do primeiro " - " (o resto é local)
+    prefixo = str(bomba_nome).split(" - ")[0].strip()
+    if not prefixo:
+        return ""
+
+    # palavras genéricas que NÃO identificam uma empresa — precisam ser
+    # ignoradas nos dois lados, senão "MG LOG Transportes" bateria com
+    # "HOK Transportes" só por compartilharem o ramo, escondendo um
+    # operador terceiro de verdade
+    ignorar = {
+        "LTDA", "S.A.", "SA", "ME", "EPP", "EIRELI", "DE", "DA", "DO", "E", "POSTO", "CO",
+        "TRANSPORTES", "TRANSPORTE", "LOGISTICA", "LOGÍSTICA", "COMERCIO", "COMÉRCIO",
+        "SERVICOS", "SERVIÇOS", "EMPRESA", "INDUSTRIA", "INDÚSTRIA", "DISTRIBUIDORA",
+        "CONSTRUCOES", "CONSTRUÇÕES", "LOCACOES", "LOCAÇÕES", "COMBOIO", "PEDESTAL",
+    }
+
+    def _palavras(texto):
+        """Todas as palavras significativas, não só a primeira: nomes de
+        bomba como 'Oesa Hok Transportes' têm o cliente no MEIO, e
+        comparar só a primeira palavra dava falso positivo (acusava
+        terceiro quando era o próprio cliente)."""
+        return {
+            p for p in re.split(r"[\s\-/.]+", str(texto).upper())
+            if len(p) >= 3 and p not in ignorar
+        }
+
+    palavras_bomba = _palavras(prefixo)
+    if not palavras_bomba:
+        return ""
+    palavras_cliente = set()
+    for n in nomes_cliente:
+        if n and not pd.isna(n):
+            palavras_cliente |= _palavras(n)
+    # se QUALQUER palavra significativa coincide, é o próprio cliente
+    return "" if (palavras_bomba & palavras_cliente) else prefixo
+
+
 def relatorio_grupo(termo: str):
     """Visão consolidada de um grupo econômico: quem são as empresas,
     quanto cada uma paga, e o total do grupo."""
@@ -3283,6 +3337,10 @@ def relatorio_grupo(termo: str):
 
     linhas_resumo = []
     total_grupo = 0.0
+    # guarda os contratos de cada empresa pra reaproveitar depois (linha
+    # do tempo + detalhe por empresa) — sem isso a busca seria refeita,
+    # e são consultas ao BigQuery
+    contratos_por_empresa = {}
     with st.spinner(f"Buscando contratos de {len(grupo)} empresa(s)..."):
         for _, emp in grupo.iterrows():
             codigo = emp["codigo_cliente"]
@@ -3292,6 +3350,16 @@ def relatorio_grupo(termo: str):
                 contratos_emp = buscar_itens_contrato_do_dw((int(codigo),))
             except Exception:
                 continue
+            contratos_por_empresa[int(codigo)] = contratos_emp
+            # "Mensalidade" (texto formatado) é criada em relatorio_cliente,
+            # não vem de buscar_itens_contrato_do_dw — cria aqui também,
+            # senão a tabela de detalhe por empresa quebra procurando ela
+            if not contratos_emp.empty and "Mensalidade" not in contratos_emp.columns:
+                contratos_emp = contratos_emp.copy()
+                contratos_emp["Mensalidade"] = contratos_emp["Preco_Unitario"].apply(
+                    lambda v: formatar_moeda(v) if pd.notna(v) else ""
+                )
+                contratos_por_empresa[int(codigo)] = contratos_emp
             ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else contratos_emp
             mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
             total_grupo += mensalidade
@@ -3324,6 +3392,87 @@ def relatorio_grupo(termo: str):
         "'raiz CNPJ' é match forte (matriz/filial do mesmo CNPJ base); "
         "'nome' é complementar e pode trazer homônimos — vale conferir."
     )
+
+    # ------------------------------------------------------------------
+    # LINHA DO TEMPO CONSOLIDADA do grupo
+    # ------------------------------------------------------------------
+    st.subheader("Histórico de mensalidade do grupo", anchor=False)
+    historicos_grupo = []
+    for _, emp in df_resumo.iterrows():
+        cod = int(emp["Código"])
+        contratos_emp = contratos_por_empresa.get(cod)
+        if contratos_emp is None or contratos_emp.empty:
+            continue
+        for cod_grupo, subset in montar_grupos_contrato(contratos_emp):
+            df_hist = obter_historico_unificado(cod_grupo)
+            if df_hist.empty:
+                continue
+            historicos_grupo.append({
+                "grupo": f"{emp['Empresa'][:18]} · {cod_grupo}",
+                "descricao": subset["Descricao_Material"].dropna().iloc[0] if subset["Descricao_Material"].notna().any() else "",
+                "df": df_hist, "composicao": "", "data_cancelamento": None,
+                "motivo_cancelamento": None, "descricao_item": "", "observacao": "",
+                "codigos_grupo": [cod_grupo], "codigos_ativos": [cod_grupo],
+                "situacao": "A" if (subset["situacaoContrato"] == "A").any() else "E",
+                "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum(),
+            })
+
+    if historicos_grupo:
+        fig_grupo, _ = plotar_historico_multi(
+            agrupar_historicos_para_grafico(historicos_grupo, max_linhas=20),
+            titulo=f"Mensalidade consolidada — grupo {termo}",
+            subtitulo=f"{len(historicos_grupo)} contrato(s) em {len(df_resumo)} empresa(s)",
+            incluir_total=True, mostrar_eventos_cancelamento=False,
+        )
+        if fig_grupo is not None:
+            st.plotly_chart(fig_grupo, use_container_width=True)
+    else:
+        st.info("Nenhum histórico de faturamento encontrado para as empresas deste grupo.")
+
+    # ------------------------------------------------------------------
+    # DETALHE POR EMPRESA — contratos + equipamentos
+    # ------------------------------------------------------------------
+    st.subheader("Detalhe por empresa", anchor=False)
+    for _, emp in df_resumo.iterrows():
+        cod = int(emp["Código"])
+        contratos_emp = contratos_por_empresa.get(cod, pd.DataFrame())
+        ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else pd.DataFrame()
+        equip_emp = df_bombas[df_bombas["cliente_cigam_pagante"] == cod].copy() if df_bombas is not None else pd.DataFrame()
+
+        rotulo = f"{emp['Empresa']} · {emp['CNPJ']} — {formatar_moeda(emp['Mensalidade'])}"
+        with st.expander(rotulo, expanded=False):
+            if len(ativos):
+                st.markdown("**Contratos ativos**")
+                st.dataframe(
+                    renomear_para_exibicao(ativos[["codigoContrato", "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento"]]),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.caption("Sem contratos ativos.")
+
+            if len(equip_emp):
+                # sinaliza equipamentos cujo NOME aponta pra outra empresa
+                # (operador terceiro) — ex: bomba "MG LOG Transportes -
+                # Brasília/DF" cadastrada em HOK. É a única pista de que
+                # o equipamento opera por conta de um terceiro.
+                nomes_do_grupo = set(df_resumo["Empresa"].astype(str)) | {str(emp["Empresa"])}
+                equip_emp["Operador (se terceiro)"] = equip_emp["bomba_nome"].apply(
+                    lambda b: detectar_operador_do_equipamento(b, nomes_do_grupo)
+                )
+                qtd_terceiro = int((equip_emp["Operador (se terceiro)"] != "").sum())
+                st.markdown(f"**Equipamentos ({len(equip_emp)})**")
+                if qtd_terceiro:
+                    st.warning(
+                        f"⚠️ {qtd_terceiro} equipamento(s) com nome de OUTRA empresa — "
+                        f"provável operação por terceiro, veja a coluna 'Operador'.",
+                        icon="🔀",
+                    )
+                colunas_eq = [c for c in ["bomba_nome", "serial_equipamento", "id_op_operacional",
+                                          "local_nome", "Operador (se terceiro)"] if c in equip_emp.columns]
+                st.dataframe(renomear_para_exibicao(equip_emp[colunas_eq]),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("Sem equipamentos como pagante.")
 
 
 _renderizar_cabecalho()
