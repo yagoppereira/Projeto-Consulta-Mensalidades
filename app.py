@@ -1163,6 +1163,7 @@ def plotar_historico_multi(
     historicos: list, titulo: str, subtitulo: str = "", incluir_total: bool = True,
     mostrar_texto_variacao: bool = False, limiar_anotacao_pct: float = 5.0,
     mostrar_eventos_cancelamento: bool = True, grupos_visiveis: set = None,
+    filtro_situacao: str = None,
 ):
     """
     Plota UM gráfico com uma linha por grupo de contrato (cada `historicos[i]`
@@ -1188,6 +1189,15 @@ def plotar_historico_multi(
     Botões no topo permitem filtrar Todos / Só Ativos / Só Encerrados.
     """
     historicos_validos = [h for h in historicos if not h["df"].empty]
+    # filtro de situação agora vem de FORA (controle do Streamlit acima do
+    # gráfico), não mais dos botões flutuantes do Plotly. Os botões
+    # ficavam por cima da área de plotagem e a posição deles nunca
+    # estabilizou de verdade — um controle nativo resolve isso e ainda
+    # herda o tema/cores do app.
+    if filtro_situacao in ("A", "E"):
+        historicos_validos = [h for h in historicos_validos if h.get("situacao") == filtro_situacao]
+    if not historicos_validos:
+        return None, ""
     mapa_cores_grupos = resolver_cores_dos_grupos(historicos_validos)
     if not historicos_validos:
         st.info(f"Sem histórico de parcelas cobradas para: {titulo}")
@@ -1818,85 +1828,21 @@ def plotar_historico_multi(
     # cada botão também escolhe qual variante do Total aparece (ver
     # adicionar_linha_total acima) — "Só Ativos" mostra o Total recalculado
     # só com os contratos ativos, não o total geral escondido atrás do filtro
-    def visibilidade(filtro):
-        resultado = []
-        for s, eh_individual, grupo_dono in zip(trace_situacao, trace_eh_grupo_individual, trace_grupo_dono):
-            if s.startswith("total::"):
-                variante = s.split("::", 1)[1]
-                alvo = "todos" if filtro is None else filtro
-                resultado.append(variante == alvo)
-            else:
-                corresponde = filtro is None or s == filtro
-                # grupo individual que passou no filtro: fica visível se
-                # estiver MARCADO num card, senão volta pra "legendonly"
-                # (escondido, só na legenda). Sem isso, clicar num botão
-                # de filtro forçava tudo de volta pra visível, perdendo
-                # tanto o "começa escondido" quanto a seleção dos cards.
-                if corresponde and eh_individual and len(historicos_validos) > 1:
-                    esta_marcado = bool(grupos_visiveis) and grupo_dono in grupos_visiveis
-                    resultado.append(True if esta_marcado else "legendonly")
-                else:
-                    resultado.append(corresponde)
-        return resultado
+    # o filtro de situação virou um controle do Streamlit acima do
+    # gráfico (ver relatorio_cliente), então não há mais botões nem
+    # rótulo de filtro dentro do título
+    def _titulo_com_filtro(_=None):
+        return f"{titulo}<br><sup>{subtitulo}</sup>"
 
-    # título muda de texto junto com o filtro clicado (Todos/Só Ativos/Só
-    # Encerrados) — é o indicador PRINCIPAL de qual filtro está ativo,
-    # porque é comprovadamente estável (não depende de medir largura de
-    # texto manualmente, ao contrário dos botões)
-    def _titulo_com_filtro(rotulo_filtro):
-        return f"{titulo}<br><sup>{subtitulo} — Filtro atual: <b>{rotulo_filtro}</b></sup>"
-
-    botoes_filtro = [
-        dict(label="Todos", method="update", args=[{"visible": visibilidade(None)}, {"title.text": _titulo_com_filtro("Todos")}]),
-        dict(label="Só Ativos", method="update", args=[{"visible": visibilidade("A")}, {"title.text": _titulo_com_filtro("Só Ativos")}]),
-        dict(label="Só Encerrados", method="update", args=[{"visible": visibilidade("E")}, {"title.text": _titulo_com_filtro("Só Encerrados")}]),
-    ]
-
-    # 1 ÚNICO menu com os 3 botões juntos (não mais 3 menus separados com
-    # posição calculada na mão) — o gráfico é exibido com
-    # use_container_width=True, então a largura real depende do navegador
-    # e do layout; qualquer posição em fração calculada assumindo uma
-    # largura fixa fica errada. Deixando o Plotly medir o texto de
-    # verdade na hora de desenhar (dentro de 1 menu só), o espaçamento
-    # fica certo não importa a largura final da tela. showactive=True dá o destaque
-    # nativo de "qual está selecionado" — o próprio Plotly cuida disso
-    # de forma consistente, sem a gente precisar recalcular nada.
-    updatemenus_filtro = [
-        dict(
-            type="buttons", direction="right", buttons=botoes_filtro,
-            x=1.0, y=1.05, xanchor="right", yanchor="top",
-            showactive=True,
-            bgcolor="#26263A", bordercolor=COR_UNIAO_ALUGUEL_LICENCIAMENTO, borderwidth=1,
-            font=dict(size=13, color="#F1F1F1"),
-            pad=dict(t=8, b=8, l=10, r=10),
-        ),
-    ]
-
+    # espaçamento dos rótulos do eixo X: com muitos meses, mostrar todos
+    # vira um borrão — mostra 1 a cada `passo` pra manter legível
     passo = max(1, len(todos_meses_str) // 24)
+    range_inicial = None  # deixa o Plotly ajustar ao conteúdo
 
-    # janela inicial visível menor (últimos N meses) pra não precisar dar
-    # zoom manual toda vez — use o zoom/pan do próprio Plotly (ícones da
-    # barra de ferramentas) pra ver o histórico completo além dela
-    janela_padrao = 20
-    if len(todos_meses_str) > janela_padrao:
-        range_inicial = [todos_meses_str[-janela_padrao], todos_meses_str[-1]]
-    else:
-        range_inicial = [todos_meses_str[0], todos_meses_str[-1]] if todos_meses_str else None
-
-    # altura proporcional à quantidade de linhas, mas com TETO — antes
-    # era só `max(950, 65 * N)`, sem limite superior: um cliente com 16+
-    # grupos gerava um gráfico de milhares de pixels de altura, forçando
-    # rolagem enorme. Como as linhas individuais agora começam escondidas
-    # (só a Total visível), não faz sentido reservar altura pra todas
-    # elas de antemão.
-    # altura mínima maior (era 560): com a margem inferior ampliada pra
-    # caber rótulos + legenda sem colidir, um gráfico baixo demais
-    # esmagava a área de plotagem em si.
     # A legenda é horizontal e quebra em várias linhas quando há muitos
-    # contratos (7 contratos = ~3 linhas). Com `y` e margem FIXOS, ela
-    # invadia os rótulos do eixo X exatamente nesses casos — que são os
-    # que mais precisam de legenda. Aqui o espaço reservado cresce junto
-    # com a quantidade de itens.
+    # contratos. Com `y` e margem FIXOS ela invadia os rótulos do eixo X
+    # justamente nesses casos — o espaço reservado cresce junto com a
+    # quantidade de itens.
     qtd_itens_legenda = len(historicos_validos) + (1 if incluir_total else 0)
     linhas_legenda = max(1, (qtd_itens_legenda + 2) // 3)  # ~3 itens por linha
     margem_inferior = 150 + 26 * linhas_legenda
@@ -1955,7 +1901,6 @@ def plotar_historico_multi(
         # margem inferior maior pra caber rótulos rotacionados + título do
         # eixo + legenda sem sobreposição
         margin=dict(t=110, b=margem_inferior, l=70, r=40),
-        updatemenus=updatemenus_filtro,
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
             categoryorder="array", categoryarray=todos_meses_str,
@@ -1994,7 +1939,7 @@ def plotar_historico_multi(
     return fig, detalhes_md
 
 
-def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
+def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", grupos_exibidos: set = None):
     """
     Um card por grupo de contrato — situação, valor atual, variação
     recente e avisos (mês sem faturamento, cancelamento parcial),
@@ -2053,8 +1998,6 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
 
         return cor, valor_atual, variacao_bruto, variacao_pct, avisos
 
-    grupos_marcados = set()
-    houve_interacao = False
     total = len(historicos_ordenados)
 
     for indice_card, h in enumerate(historicos_ordenados):
@@ -2083,13 +2026,25 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
             # HTML montado numa string ÚNICA, sem quebras de linha nem
             # indentação: markdown trata linha recuada com 4+ espaços como
             # BLOCO DE CÓDIGO, o que fazia o "</div>" vazar como texto.
+            # FADE: card de contrato que não está desenhado no gráfico
+            # fica esmaecido. Substitui o checkbox que existia aqui —
+            # a seleção passou pro multiselect único no topo da lista,
+            # e o card só REFLETE o estado, não o controla. Menos ruído
+            # visual, e a relação card<->linha fica imediata.
+            no_grafico = h["grupo"] in (grupos_exibidos or set())
+            opacidade = "1" if no_grafico else "0.45"
+            marca_exibicao = (
+                f'<div style="font-size:0.8em; color:{cor};">▬ no gráfico</div>'
+                if no_grafico else ""
+            )
             html_card = (
-                f'<div style="border-left: 4px solid {cor}; padding-left: 10px;">'
+                f'<div style="border-left: 4px solid {cor}; padding-left: 10px; opacity:{opacidade};">'
                 f'<b>{h["grupo"]}</b><br>'
                 f'<span style="font-size:0.9em;">{h.get("descricao", "")}</span><br>'
                 f'{situacao_label} &nbsp;·&nbsp; <b>{valor_texto}</b>'
                 f'{texto_variacao}'
                 f'{texto_avisos}'
+                f'{marca_exibicao}'
                 f'</div>'
             )
             # '$' vira a entidade HTML &#36; — dentro de HTML o escape com
@@ -2097,31 +2052,7 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = ""):
             # tela ("R\$ 11.475,00").
             st.markdown(html_card.replace("$", "&#36;"), unsafe_allow_html=True)
 
-            # A seleção é guardada numa chave PRÓPRIA (chave_selecao),
-            # separada da chave do widget. Motivo: o Streamlit APAGA do
-            # session_state as chaves de widgets que não são renderizados
-            # numa rodada — e o painel de cards deixa de existir quando a
-            # pessoa clica num ponto do gráfico (troca pra visão de
-            # detalhe do mês). Sem essa cópia, ao voltar do detalhe a
-            # seleção era descartada e o gráfico voltava a mostrar só o
-            # Total, perdendo o contrato que estava sendo inspecionado.
-            chave_widget = f"{chave_prefixo}mostrar_{h['grupo']}"
-            chave_selecao = f"selecao_persistente_{chave_prefixo}{h['grupo']}"
-            marcado_antes = bool(st.session_state.get(chave_selecao, False))
-            marcado = st.checkbox(
-                # o rótulo reflete o ESTADO atual, não uma ação genérica:
-                # fica claro de relance quais contratos estão desenhados
-                # no gráfico sem precisar conferir a legenda
-                "✓ Visível no gráfico" if marcado_antes else "Mostrar no gráfico",
-                value=marcado_antes,
-                key=chave_widget,
-            )
-            st.session_state[chave_selecao] = marcado
-            if marcado:
-                grupos_marcados.add(h["grupo"])
-                houve_interacao = True
-
-    return grupos_marcados if houve_interacao else None
+    return None
 
 
 def plotar_contratos_lado_a_lado(historicos: list, nome_cliente: str, apenas_ativos: bool = True, cols: int = 3):
@@ -2964,25 +2895,30 @@ def relatorio_cliente(
              "(losangos/círculos + linha vertical) e os de aumento/redução de valor.",
     )
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
-
-    # grupos marcados nos checkboxes dos cards — lidos direto do
-    # session_state porque os cards são desenhados DEPOIS do gráfico
-    # (ficam na coluna ao lado), então nesta rodada só temos o que foi
-    # marcado na rodada anterior. Como marcar um checkbox já dispara um
-    # rerun sozinho, na prática a seleção aparece no gráfico
-    # imediatamente pra quem está usando.
-    #
-    # Lê as chaves PERSISTENTES (selecao_persistente_*), não as dos
-    # widgets: o Streamlit apaga as chaves de widgets não renderizados, e
-    # os cards saem da tela quando a pessoa abre o detalhe de um mês —
-    # ler do widget fazia a seleção se perder ao voltar do detalhe.
     prefixo_chave_cards = f"card_{nome_cliente}_"
-    prefixo_persistente = f"selecao_persistente_{prefixo_chave_cards}"
-    grupos_marcados_nos_cards = {
-        chave[len(prefixo_persistente):]
-        for chave, valor in st.session_state.items()
-        if chave.startswith(prefixo_persistente) and valor
-    }
+
+    # CONTROLES do gráfico, fora dele. Antes o filtro de situação era um
+    # grupo de botões flutuantes DENTRO da área de plotagem (updatemenus
+    # do Plotly): ficava por cima do gráfico, com cores que não seguiam o
+    # tema, e a posição nunca estabilizou. Controles nativos do Streamlit
+    # herdam o tema, não disputam espaço com os dados, e ainda deixam a
+    # seleção de contratos num lugar só (em vez de um checkbox por card).
+    col_f1, col_f2 = st.columns([1, 2])
+    with col_f1:
+        filtro_rotulo = st.radio(
+            "Mostrar", ["Todos", "Só ativos", "Só encerrados"],
+            horizontal=True, key=f"filtro_sit_{nome_cliente}",
+        )
+    filtro_situacao = {"Só ativos": "A", "Só encerrados": "E"}.get(filtro_rotulo)
+
+    opcoes_contratos = [h["grupo"] for h in historicos_grafico]
+    with col_f2:
+        grupos_marcados_nos_cards = set(st.multiselect(
+            "Contratos no gráfico (vazio = só o total)",
+            options=opcoes_contratos, default=[],
+            key=f"sel_contratos_{nome_cliente}",
+            help="Escolha quais contratos desenhar. Os cards ao lado acendem conforme a seleção.",
+        ))
 
     fig_principal, detalhes_md = plotar_historico_multi(
         historicos_grafico,
@@ -2993,6 +2929,7 @@ def relatorio_cliente(
         limiar_anotacao_pct=limiar_anotacao_pct,
         mostrar_eventos_cancelamento=mostrar_eventos_cancelamento,
         grupos_visiveis=grupos_marcados_nos_cards or None,
+        filtro_situacao=filtro_situacao,
     )
     # cards ao lado do gráfico (não dentro dele) — o detalhe "tipo BI"
     # (valor exato, situação, avisos) fica nos cards; o gráfico fica
@@ -3176,7 +3113,7 @@ def relatorio_cliente(
             _linhas_leg = max(1, (len(historicos_grafico) + 1 + 2) // 3)
             altura_painel = min(1000, max(680, 60 * len(historicos_grafico)) + 24 * _linhas_leg)
             with st.container(height=altura_painel):
-                mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards)
+                mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards, grupos_exibidos=grupos_marcados_nos_cards)
 
     # Os dois expanders ("Detalhamento completo das mudanças de
     # equipamento" e "Descrição/observação por contrato") e a grade de
