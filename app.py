@@ -3192,30 +3192,185 @@ def _renderizar_cabecalho():
         st.title("Histórico de Mensalidade — CIGAM", anchor=False)
 
 
+def buscar_grupo_economico(termo: str) -> pd.DataFrame:
+    """
+    Acha todas as empresas de um mesmo grupo econômico.
+
+    Combina dois critérios (como pedido):
+      1. RAIZ DO CNPJ (8 primeiros dígitos) — é o critério forte: matriz
+         e filiais compartilham a raiz e só diferem no sufixo
+         (/0001, /0002...). Pega o grupo mesmo quando os nomes divergem.
+      2. NOME — complementa os casos em que o grupo usa CNPJs de raízes
+         diferentes (empresas irmãs constituídas separadamente), que a
+         raiz sozinha não alcançaria.
+
+    O fluxo é: resolve o termo (nome/código/CNPJ) → junta as raízes de
+    CNPJ e os nomes encontrados → busca de novo por esses dois critérios.
+    Assim buscar "HOK" traz todos os HOK, e buscar o CNPJ de uma filial
+    também traz a matriz e as irmãs.
+    """
+    termo = str(termo).strip()
+    if not termo or diretorio_clientes is None or diretorio_clientes.empty:
+        return pd.DataFrame()
+
+    dir_df = diretorio_clientes.copy()
+    dir_df["_raiz_cnpj"] = dir_df["_cnpj_norm"].astype(str).str[:8]
+    digitos = "".join(ch for ch in termo if ch.isdigit())
+
+    # --- 1ª passada: quem casa diretamente com o termo? ---
+    casa_nome = dir_df["Cliente_Nome"].astype(str).str.upper().str.contains(
+        re.escape(termo.upper()), na=False
+    )
+    casa_codigo = dir_df["codigo_cliente"].astype(str) == digitos if digitos else False
+    casa_cnpj = dir_df["_cnpj_norm"].astype(str) == digitos if len(digitos) >= 11 else False
+    semente = dir_df[casa_nome | casa_codigo | casa_cnpj]
+    if semente.empty:
+        return pd.DataFrame()
+
+    # --- 2ª passada: expande pelas raízes de CNPJ e nomes da semente ---
+    # raízes vindas da semente. Quando a busca foi por NOME, a semente já
+    # pode conter empresas de raízes diferentes (ex: "HOK LOGISTICA" com
+    # CNPJ de outra raiz) — essas não devem virar "raiz confiável", senão
+    # o rótulo de confiança do match fica errado. Por isso as raízes
+    # "fortes" saem só de quem casou por CNPJ/código explícito.
+    semente_forte = dir_df[casa_codigo | casa_cnpj] if (digitos) else dir_df.iloc[0:0]
+    base_raizes = semente_forte if not semente_forte.empty else semente
+    raizes = {r for r in base_raizes["_raiz_cnpj"] if r and len(r) == 8 and not cnpj_invalido(r)}
+    # numa busca por NOME não existe raiz de referência confiável (a
+    # semente veio do próprio nome), então só faz sentido rotular como
+    # "raiz CNPJ" as raízes que aparecem em MAIS DE UMA empresa — essas
+    # sim indicam matriz/filial de verdade. Raiz única veio pelo nome.
+    if semente_forte.empty:
+        contagem_raiz = base_raizes["_raiz_cnpj"].value_counts()
+        raizes = {r for r in raizes if contagem_raiz.get(r, 0) > 1}
+    # usa a primeira palavra "forte" de cada nome (>=3 letras, ignorando
+    # tipos societários) como termo de nome — é o que faz "HOK
+    # TRANSPORTES LTDA" e "HOK LOGISTICA" caírem no mesmo grupo
+    ignorar = {"LTDA", "S.A.", "SA", "ME", "EPP", "EIRELI", "COMERCIO", "DE", "DA", "DO", "E"}
+    nomes_chave = set()
+    for nome in semente["Cliente_Nome"].astype(str):
+        for palavra in re.split(r"[\s\-/.]+", nome.upper()):
+            if len(palavra) >= 3 and palavra not in ignorar:
+                nomes_chave.add(palavra)
+                break
+
+    por_raiz = dir_df["_raiz_cnpj"].isin(raizes) if raizes else False
+    por_nome = False
+    if nomes_chave:
+        padrao = "|".join(re.escape(n) for n in nomes_chave)
+        por_nome = dir_df["Cliente_Nome"].astype(str).str.upper().str.contains(padrao, na=False, regex=True)
+
+    grupo = dir_df[por_raiz | por_nome | casa_nome | casa_codigo | casa_cnpj].copy()
+    # rótulo do critério que trouxe cada empresa — "raiz CNPJ" só pra
+    # quem REALMENTE compartilha a raiz com a semente (match forte);
+    # o resto entrou por nome (match fraco, pode ter homônimo)
+    grupo["_origem_match"] = grupo["_raiz_cnpj"].apply(
+        lambda r: "raiz CNPJ" if (raizes and r in raizes) else "nome"
+    )
+    return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
+
+
+def relatorio_grupo(termo: str):
+    """Visão consolidada de um grupo econômico: quem são as empresas,
+    quanto cada uma paga, e o total do grupo."""
+    grupo = buscar_grupo_economico(termo)
+    if grupo.empty:
+        st.error(f"Nenhuma empresa encontrada para '{termo}'.")
+        return
+
+    st.header(f"Grupo econômico — {termo}", anchor=False)
+    st.caption(f"{len(grupo)} empresa(s) encontradas por raiz de CNPJ e/ou nome.")
+
+    linhas_resumo = []
+    total_grupo = 0.0
+    with st.spinner(f"Buscando contratos de {len(grupo)} empresa(s)..."):
+        for _, emp in grupo.iterrows():
+            codigo = emp["codigo_cliente"]
+            if pd.isna(codigo):
+                continue
+            try:
+                contratos_emp = buscar_itens_contrato_do_dw((int(codigo),))
+            except Exception:
+                continue
+            ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else contratos_emp
+            mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
+            total_grupo += mensalidade
+            linhas_resumo.append({
+                "Código": int(codigo),
+                "Empresa": emp["Cliente_Nome"],
+                "CNPJ": emp["_cnpj_norm"],
+                "Contratos ativos": ativos["codigoContrato"].nunique() if not ativos.empty else 0,
+                "Mensalidade": mensalidade,
+                "Casou por": emp["_origem_match"],
+            })
+
+    if not linhas_resumo:
+        st.warning("As empresas foram encontradas, mas nenhuma tem contrato registrado.")
+        return
+
+    df_resumo = pd.DataFrame(linhas_resumo).sort_values("Mensalidade", ascending=False)
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Empresas no grupo", len(df_resumo))
+    col_b.metric("Contratos ativos", int(df_resumo["Contratos ativos"].sum()))
+    col_c.metric("Mensalidade do grupo", formatar_moeda(total_grupo))
+
+    df_exibir = df_resumo.copy()
+    df_exibir["Mensalidade"] = df_exibir["Mensalidade"].apply(formatar_moeda)
+    st.dataframe(df_exibir, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "A coluna 'Casou por' mostra o critério que trouxe cada empresa: "
+        "'raiz CNPJ' é match forte (matriz/filial do mesmo CNPJ base); "
+        "'nome' é complementar e pode trazer homônimos — vale conferir."
+    )
+
+
 _renderizar_cabecalho()
-st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
-with st.form("busca_cliente_form"):
-    identificador_input = st.text_input("Cliente:", placeholder="Ex: DNP TERRAPLANAGEM, 308, ou 57623761000117")
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
+aba_cliente, aba_grupo = st.tabs(["🔍 Cliente", "🏢 Grupo econômico"])
 
-# guarda o cliente buscado em session_state — o Streamlit reroda o script
-# INTEIRO a cada interação, inclusive ao clicar num ponto do gráfico. Sem
-# isso, `buscar_clicado` volta a ser False em qualquer rerun que não seja
-# o clique no botão e a tela do cliente sumia (parecia "resetar a
-# pesquisa" — tecnicamente resetava mesmo).
-if buscar_clicado:
-    if not identificador_input.strip():
-        st.warning("Digite um cliente pra buscar.")
-        st.session_state["identificador_buscado"] = None
-    else:
-        st.session_state["identificador_buscado"] = identificador_input.strip()
+with aba_cliente:
+    st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
 
-if st.session_state.get("identificador_buscado"):
-    # a opção de marcadores de cancelamento é uma propriedade do GRÁFICO
-    # (ver o toggle logo acima dele, dentro de relatorio_cliente), não da
-    # busca — mudar como o gráfico se apresenta não deveria exigir
-    # refazer a pesquisa
-    relatorio_cliente(st.session_state["identificador_buscado"])
+    with st.form("busca_cliente_form"):
+        identificador_input = st.text_input("Cliente:", placeholder="Ex: DNP TERRAPLANAGEM, 308, ou 57623761000117")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            buscar_clicado = st.form_submit_button("🔍 Buscar", use_container_width=True)
+
+    # guarda o cliente buscado em session_state — o Streamlit reroda o script
+    # INTEIRO a cada interação, inclusive ao clicar num ponto do gráfico. Sem
+    # isso, `buscar_clicado` volta a ser False em qualquer rerun que não seja
+    # o clique no botão e a tela do cliente sumia (parecia "resetar a
+    # pesquisa" — tecnicamente resetava mesmo).
+    if buscar_clicado:
+        if not identificador_input.strip():
+            st.warning("Digite um cliente pra buscar.")
+            st.session_state["identificador_buscado"] = None
+        else:
+            st.session_state["identificador_buscado"] = identificador_input.strip()
+
+    if st.session_state.get("identificador_buscado"):
+        # a opção de marcadores de cancelamento é uma propriedade do GRÁFICO
+        # (ver o toggle logo acima dele, dentro de relatorio_cliente), não da
+        # busca — mudar como o gráfico se apresenta não deveria exigir
+        # refazer a pesquisa
+        relatorio_cliente(st.session_state["identificador_buscado"])
+
+with aba_grupo:
+    st.caption(
+        "Busca todas as empresas de um mesmo grupo — por raiz de CNPJ "
+        "(matriz e filiais) e por nome. Ex: 'HOK' traz todos os HOK."
+    )
+    with st.form("busca_grupo_form"):
+        termo_grupo = st.text_input("Grupo:", placeholder="Ex: HOK, EDECONSIL, ou um CNPJ do grupo")
+        col_g1, col_g2 = st.columns([1, 3])
+        with col_g1:
+            buscar_grupo_clicado = st.form_submit_button("🏢 Buscar grupo", use_container_width=True)
+
+    if buscar_grupo_clicado:
+        st.session_state["grupo_buscado"] = termo_grupo.strip() or None
+
+    if st.session_state.get("grupo_buscado"):
+        relatorio_grupo(st.session_state["grupo_buscado"])
