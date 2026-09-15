@@ -165,7 +165,7 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
     # número e data à direita, régua Cobalt 3px abaixo
     logo_flowable = _p("ctasmart", fonte=POPPINS_B, tamanho=15, cor=COBALT)
     if os.path.exists(_CAMINHO_LOGO):
-        altura_logo = 34 * 0.75  # 34px @ 96dpi -> pt, como pede a especificação
+        altura_logo = 52  # maior que os 34px @ 96dpi da especificação original — ficava pequeno demais impresso
         largura_original, altura_original = PILImage.open(_CAMINHO_LOGO).size
         largura_logo = altura_logo * (largura_original / altura_original)
         logo_flowable = Image(_CAMINHO_LOGO, width=largura_logo, height=altura_logo)
@@ -268,7 +268,20 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
     )
     linhas_assinatura = [_rotulo_secao("5", "Assinatura e Aceite")]
     if signatario and signatario.get("imagem"):
-        img = Image(BytesIO(signatario["imagem"]), width=110, height=40)
+        # tamanho fixo (110x40) espremia/distorcia a imagem e saía ilegível —
+        # agora mantém a proporção original, com altura maior, e só reduz se
+        # não couber na largura do cartão (metade da página, menos padding)
+        altura_assinatura = 55
+        try:
+            largura_original, altura_original = PILImage.open(BytesIO(signatario["imagem"])).size
+            largura_assinatura = altura_assinatura * (largura_original / altura_original)
+        except Exception:
+            largura_assinatura = 160
+        largura_maxima = largura_util * 0.485 - 20
+        if largura_assinatura > largura_maxima:
+            altura_assinatura *= largura_maxima / largura_assinatura
+            largura_assinatura = largura_maxima
+        img = Image(BytesIO(signatario["imagem"]), width=largura_assinatura, height=altura_assinatura)
         img.hAlign = "LEFT"
         linhas_assinatura.append(img)
     else:
