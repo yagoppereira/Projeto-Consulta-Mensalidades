@@ -95,12 +95,14 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
     elementos.append(Spacer(1, 10))
 
     # 1 · Emissor / 2 · Destinatário
+    partes_contato = [v for v in (contato.get("nome"), contato.get("telefone"), contato.get("email")) if v]
+    linha_contato = f"<br/>Contato: {' – '.join(partes_contato)}" if partes_contato else ""
     emissor_txt = (
         f"{EMISSOR['razao_social']}<br/>"
         f"CNPJ / CPF: {EMISSOR['cnpj']}<br/>"
         f"Inscrição Estadual: {EMISSOR['insc_estadual']}<br/>"
-        f"Endereço: {EMISSOR['endereco']}<br/>"
-        f"Contato: {contato.get('nome', '')} – {contato.get('telefone', '')} – {contato.get('email', '')}"
+        f"Endereço: {EMISSOR['endereco']}"
+        f"{linha_contato}"
     )
     destinatario_txt = (
         f"Razão Social: {destinatario.get('razao_social') or ''}<br/>"
@@ -127,20 +129,22 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
 
     total = sum(item["valor"] for item in itens)
     cabecalho_tabela = [_p(t, negrito=True, alinhamento=TA_CENTER) for t in
-                         ["Item", "Título", "Descrição dos serviços / despesas", "Vencimento", "Valor (R$)"]]
+                         ["Item", "Título", "Nº NFS-e", "Descrição dos serviços / despesas",
+                          "Vencimento", "Valor (R$)"]]
     linhas_tabela = [cabecalho_tabela]
     for i, item in enumerate(itens, start=1):
         linhas_tabela.append([
             _p(f"{i:02d}", alinhamento=TA_CENTER),
             _p(item["titulo"], alinhamento=TA_CENTER),
+            _p(item.get("numero_nfse") or "-", alinhamento=TA_CENTER),
             _p(item["descricao"]),
             _p(formatar_data(item["vencimento"]), alinhamento=TA_CENTER),
             _p(formatar_moeda(item["valor"]), alinhamento=TA_RIGHT),
         ])
     tabela_debito = Table(
         linhas_tabela,
-        colWidths=[largura_util * 0.08, largura_util * 0.16, largura_util * 0.46,
-                   largura_util * 0.14, largura_util * 0.16],
+        colWidths=[largura_util * 0.07, largura_util * 0.17, largura_util * 0.12,
+                   largura_util * 0.31, largura_util * 0.14, largura_util * 0.19],
         style=TableStyle([
             ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#CBD5E1")),
             ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
