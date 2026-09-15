@@ -2584,6 +2584,49 @@ def descricao_material_do_grupo(subset: pd.DataFrame) -> str:
     return materiais[0] if len(materiais) else ""
 
 
+def resumir_equipamentos_do_grupo(subset: pd.DataFrame) -> str:
+    """Resume o que está CONTRATADO num grupo, pro rótulo do gráfico/
+    multiselect da view de grupo econômico.
+
+    Se der pra identificar UMA instalação só (mesmo com 2 linhas — um
+    par aluguel+licenciamento do MESMO equipamento repete a mesma
+    "Descricao" duas vezes), usa esse texto livre direto: costuma ser
+    mais descritivo (ex: "PEDESTAL DEMO") do que o material puro.
+
+    Com várias instalações diferentes no grupo, o texto livre de cada
+    uma (ou o serial de cada uma) virava uma string gigante e ilegível
+    num contrato "guarda-chuva" com muitos equipamentos (16+) — nesse
+    caso resume por TIPO de material em vez disso: cada linha já traz
+    seu Codigo_Material específico (ex: "LICENCIAMENTO PEDESTAL
+    SIMPLES", "LICENCIAMENTO MOBILE DUPLO", não só "ALUGUEL"/
+    "LICENCIAMENTO" genérico — ver MAPA_CODIGO_MATERIAL), então dá pra
+    contar quantos de cada tipo (ex: "5x Pedestal Simples, 2x Pedestal
+    Duplo, 3x Mobile Simples")."""
+    descricoes = subset["Descricao"].dropna().astype(str) if "Descricao" in subset.columns else pd.Series(dtype=str)
+    descricoes_unicas = descricoes[descricoes.str.strip() != ""].unique()
+    if len(descricoes_unicas) == 1:
+        return descricoes_unicas[0]
+
+    if "Descricao_Material" not in subset.columns:
+        return ""
+    materiais = subset["Descricao_Material"].dropna().astype(str)
+    materiais = materiais[materiais.str.strip() != ""]
+    if materiais.empty:
+        return ""
+    contagem = materiais.value_counts()
+    if len(contagem) == 1 and contagem.iloc[0] == 1:
+        return contagem.index[0].strip().capitalize()
+
+    def _rotulo_tipo(nome):
+        # "LICENCIAMENTO PEDESTAL SIMPLES" -> "Pedestal Simples" — o
+        # prefixo LICENCIAMENTO é redundante aqui (já sabemos que é
+        # licenciamento pelo contexto) e só ocupa espaço no rótulo
+        limpo = re.sub(r"^LICENCIAMENTO\s+", "", nome.strip(), flags=re.IGNORECASE)
+        return limpo.title()
+
+    return ", ".join(f"{qtd}x {_rotulo_tipo(nome)}" for nome, qtd in contagem.items())
+
+
 def montar_grupos_contrato(contratos: pd.DataFrame) -> list:
     """
     Monta a lista de grupos de contrato a plotar. A Base_Clientes já une
@@ -3533,24 +3576,22 @@ def relatorio_grupo(termo: str):
             df_hist = obter_historico_unificado(cod_grupo)
             if df_hist.empty:
                 continue
-            # rótulo: final do CNPJ · contrato CIGAM · equipamento
-            # (o texto de "Descricao" de cada subcontrato — ex: "PEDESTAL
-            # DEMO", ou "PEDESTAL + SONDA DEMO" quando são vários — bem
-            # diferente de Descricao_Material, que é só o tipo de
-            # cobrança tipo "Mensalidade Unificada") · seriais, só quando
-            # o texto realmente traz um (nem toda descrição tem).
+            # rótulo: final do CNPJ · contrato CIGAM · o que está
+            # contratado (1 equipamento: nome dele; vários: resumo por
+            # tipo, ex: "5x Pedestal Simples, 2x Pedestal Duplo" — ver
+            # resumir_equipamentos_do_grupo).
             #
             # Antes o rótulo era só "sufixo · contrato": faltava a
             # descrição do contrato inteira na view de grupo — o sufixo
             # do CNPJ + o código sozinhos não dizem QUAL equipamento é.
-            descricoes_subset = subset["Descricao"].dropna().astype(str) if "Descricao" in subset.columns else pd.Series(dtype=str)
-            equipamento_txt = descricoes_subset.iloc[0] if len(descricoes_subset) else ""
-            seriais = sorted({s for s in descricoes_subset.apply(extrair_serial_de_texto) if s})
+            # A primeira versão desse resumo usava o texto livre de
+            # "Descricao" + os seriais de CADA equipamento: pra um
+            # contrato "guarda-chuva" com muitos equipamentos (16+),
+            # isso virava um rótulo gigante e ilegível.
+            resumo_equip = resumir_equipamentos_do_grupo(subset)
             rotulo_grupo = f"{_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}"
-            if equipamento_txt:
-                rotulo_grupo += f" · {equipamento_txt}"
-            if seriais:
-                rotulo_grupo += f" · Série {'/'.join(seriais)}"
+            if resumo_equip:
+                rotulo_grupo += f" · {resumo_equip}"
             historicos_grupo.append({
                 # rótulo usa o SUFIXO do CNPJ (ex: 0018-01), não o nome:
                 # num grupo econômico todas as empresas têm praticamente
