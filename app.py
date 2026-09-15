@@ -3850,17 +3850,23 @@ def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos a vencer...")
 def buscar_titulos_a_vencer(codigos_cliente: tuple) -> pd.DataFrame:
-    """Título já lançado (não previsão) com vencimento a partir de hoje,
-    direto das parcelas do contrato (buscar_parcelas_bq/cigam__contratos).
+    """Título em aberto (saldo > 0) com vencimento a partir de hoje, direto de
+    silver.titulos_cigam — tabela com TODOS os lançamentos Receber/Entrada em
+    aberto (vencido OU a vencer), mesma fonte da fila de pré-inadimplentes do
+    app de Central de Fechamento.
+
+    Antes usava a agenda de parcelas do contrato (buscar_parcelas_bq), mas
+    ela é só um CRONOGRAMA esperado: pra contrato marcado como divergente do
+    faturamento (raio-x, contrato.ct_st='div'), a parcela real mais recente
+    simplesmente não aparece lá mesmo já lançada — confirmado com o cliente
+    002554 (ACO VERDE DO BRASIL), que tinha fatura de agosto/2026 já cobrada
+    (raio_x_cliente.faturamento) mas ausente na agenda do contrato.
 
     gold.inadimplencia só cobre o VENCIDO (é a própria definição de
-    inadimplência da tabela), então título a vencer não aparece lá.
-    bronze.cigam__lancamentos teria a condição certa (situacao='A'), mas a
-    service account do app não tem permissão nessa tabela (só em
-    cigam__contratos, cigam__notas_fiscais, cigam__empresas e
-    gold.inadimplencia) — por isso usa a agenda de cobrança do contrato,
-    que já está liberada, em vez de pedir acesso a mais uma tabela bronze.
-    """
+    inadimplência da tabela), então o a vencer continua vindo daqui, não de
+    lá. Se a service account não tiver permissão nessa tabela silver (mesma
+    situação que já aconteceu com bronze.cigam__lancamentos), cai pra lista
+    vazia com aviso em vez de quebrar a tela."""
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
@@ -3869,35 +3875,30 @@ def buscar_titulos_a_vencer(codigos_cliente: tuple) -> pd.DataFrame:
             ])
         return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
 
-    contratos = buscar_itens_contrato_do_dw(codigos_cliente)
-    if contratos.empty:
+    query = f"""
+    SELECT nf, fatura, dataVencimento AS vencimento, saldo AS valor
+    FROM `{PROJECT_ID}.silver.titulos_cigam`
+    WHERE SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
+      AND saldo > 0 AND dataVencimento >= CURRENT_DATE()
+    ORDER BY dataVencimento
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    try:
+        df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    except Exception as erro:
+        st.warning(
+            "Não consegui buscar título a vencer (silver.titulos_cigam) — mostrando só o "
+            f"vencido. Detalhe: {erro}"
+        )
         return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
 
-    subcodigos = set()
-    for codigo_grupo in contratos["codigoContrato"].dropna().unique():
-        subcodigos.update(normalizar_codigo_contrato(c) for c in str(codigo_grupo).split("/"))
-
-    hoje = date.today()
-    linhas = []
-    for subcodigo in sorted(subcodigos):
-        df_parcelas = buscar_parcelas_bq(subcodigo)
-        for _, p in df_parcelas.iterrows():
-            if eh_previsao(p.get("previsao")):
-                continue
-            venc = pd.to_datetime(p.get("vencimento"), dayfirst=True, errors="coerce")
-            if pd.isna(venc) or venc.date() < hoje:
-                continue  # vencido já vem de gold.inadimplencia, com diasAtraso/classe corretos
-            valor_fatura = p.get("fatura")
-            valor_lancamento = p.get("lancamento")
-            fatura = str(valor_fatura).strip() if pd.notna(valor_fatura) else (
-                str(valor_lancamento).strip() if pd.notna(valor_lancamento) else "")
-            if not fatura:
-                continue
-            linhas.append({"fatura": fatura, "nf": fatura, "vencimento": venc.date(), "valor": float(p.get("valor") or 0)})
-
-    if not linhas:
-        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
-    return pd.DataFrame(linhas).drop_duplicates(subset=["fatura", "vencimento", "valor"])
+    if df.empty:
+        return df
+    df["vencimento"] = pd.to_datetime(df["vencimento"]).dt.date
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+    return df
 
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
