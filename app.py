@@ -2565,6 +2565,25 @@ def montar_resumo_cliente_md(nome_cliente, codigos_cliente, cnpj, contratos, equ
     return "\n\n".join(linhas)
 
 
+def descricao_material_do_grupo(subset: pd.DataFrame) -> str:
+    """Determina o rótulo de MATERIAL de um grupo de contrato (ex: pra
+    legenda do gráfico e pro card de detalhe do mês).
+
+    Um grupo pode ter mais de uma linha (ex: par aluguel+licenciamento
+    pareado por montar_grupos_contrato) — pegar só a PRIMEIRA linha
+    (.iloc[0]) mostra só um dos dois tipos ("ALUGUEL"), escondendo que o
+    contrato na verdade é uma UNIÃO dos dois. Com mais de um material
+    distinto no grupo, o rótulo correto é "Mensalidade Unificada".
+
+    Usada tanto na view de cliente quanto na de grupo econômico —
+    extraída aqui pra não divergir entre as duas (a view de grupo tinha
+    ficado só com o .iloc[0], rotulando união como "ALUGUEL")."""
+    materiais = subset["Descricao_Material"].dropna().unique() if "Descricao_Material" in subset.columns else []
+    if len(materiais) > 1:
+        return "Mensalidade Unificada"
+    return materiais[0] if len(materiais) else ""
+
+
 def montar_grupos_contrato(contratos: pd.DataFrame) -> list:
     """
     Monta a lista de grupos de contrato a plotar. A Base_Clientes já une
@@ -3028,8 +3047,7 @@ def relatorio_cliente(
         do dict) — extraído em função separada pra dar pra rodar vários
         grupos em paralelo (são consultas de rede independentes entre
         si, não tem razão pra esperar uma terminar pra começar a outra)."""
-        materiais = subset["Descricao_Material"].dropna().unique()
-        descricao = "Mensalidade Unificada" if len(materiais) > 1 else (materiais[0] if len(materiais) else "")
+        descricao = descricao_material_do_grupo(subset)
         df_hist = obter_historico_unificado(cod_grupo)
 
         # junta Descricao/observacao de TODAS as linhas desse grupo (um
@@ -3222,6 +3240,13 @@ def relatorio_cliente(
         # vez de quebrar a página inteira
         pontos_selecionados = extrair_pontos_selecionados(evento_grafico)
 
+        # mesma altura (e mesma rolagem própria) nos dois estados do
+        # painel — com ou sem clique — pra não pular de tamanho ao
+        # alternar entre eles, e pra não deixar cards de mais escondidos
+        # sem rolagem quando o mês clicado tem muitos contratos.
+        _linhas_leg = max(1, (len(historicos_grafico) + 1 + 2) // 3)
+        altura_painel = min(1000, max(680, 60 * len(historicos_grafico)) + 24 * _linhas_leg)
+
         if pontos_selecionados:
             # o clique seleciona só o ponto exato debaixo do cursor, mas
             # a pessoa quer ver TODOS os contratos em exibição naquele
@@ -3241,19 +3266,23 @@ def relatorio_cliente(
                 ]
 
             st.markdown(f"**{mes_clicado}**" if mes_clicado else "**Detalhe do mês**")
-            for dado_ponto in cards_do_mes:
-                if not isinstance(dado_ponto, dict):
-                    # fallback: formato inesperado, mostra o que der
-                    if dado_ponto:
-                        with st.container(border=True):
-                            _md_seguro(dado_ponto)
-                    continue
-                renderizar_card_detalhe_ponto(dado_ponto)
-
             st.caption(
-                f"{len(cards_do_mes)} contrato(s) em exibição neste mês. "
+                f"{len(cards_do_mes)} contrato(s) em exibição neste mês — role a lista abaixo pra ver todos. "
                 "Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar."
             )
+            # contêiner de altura fixa com rolagem própria: com muitos
+            # contratos no mesmo mês (ex: 15+), a lista de cards inteira
+            # não cabia na tela e ficava sem jeito de rolar até o fim —
+            # mesma altura/rolagem do painel de cards sem clique (abaixo).
+            with st.container(height=altura_painel):
+                for dado_ponto in cards_do_mes:
+                    if not isinstance(dado_ponto, dict):
+                        # fallback: formato inesperado, mostra o que der
+                        if dado_ponto:
+                            with st.container(border=True):
+                                _md_seguro(dado_ponto)
+                        continue
+                    renderizar_card_detalhe_ponto(dado_ponto)
         else:
             st.markdown("**Contratos**")
             st.caption("Marque um contrato pra ver a linha dele no gráfico, ou clique num ponto pra ver o detalhe do mês.")
@@ -3262,8 +3291,6 @@ def relatorio_cliente(
             # outros"), mas ocupa exatamente a mesma altura do gráfico ao
             # lado, então a página não estica com clientes grandes.
             # Mesma fórmula de altura usada em plotar_historico_multi.
-            _linhas_leg = max(1, (len(historicos_grafico) + 1 + 2) // 3)
-            altura_painel = min(1000, max(680, 60 * len(historicos_grafico)) + 24 * _linhas_leg)
             with st.container(height=altura_painel):
                 mostrar_cards_contratos(historicos, chave_prefixo=prefixo_chave_cards, grupos_exibidos=grupos_marcados_nos_cards)
 
@@ -3530,7 +3557,10 @@ def relatorio_grupo(termo: str):
                 # o mesmo nome ("HOK TRANSPORTES LTDA"), então o nome não
                 # distingue nada na legenda — o que diferencia é a filial
                 "grupo": rotulo_grupo,
-                "descricao": subset["Descricao_Material"].dropna().iloc[0] if subset["Descricao_Material"].notna().any() else "",
+                # mesma função usada na view de cliente (descricao_material_do_grupo)
+                # — antes pegava só a primeira linha (.iloc[0]) e podia rotular um
+                # grupo UNIÃO (aluguel+licenciamento pareados) como só "ALUGUEL"
+                "descricao": descricao_material_do_grupo(subset),
                 "df": df_hist, "composicao": "", "data_cancelamento": None,
                 "motivo_cancelamento": None, "descricao_item": "", "observacao": "",
                 "codigos_grupo": [cod_grupo], "codigos_ativos": [cod_grupo],
@@ -3596,18 +3626,25 @@ def relatorio_grupo(termo: str):
                         d for d in (_customdata_do_ponto(p) for p in pontos_selecionados_grupo) if d is not None
                     ]
                 st.markdown(f"**{mes_clicado_grupo}**" if mes_clicado_grupo else "**Detalhe do mês**")
-                col_cards_grupo = st.columns(min(3, len(cards_do_mes_grupo)) or 1)
-                for i, dado_ponto in enumerate(cards_do_mes_grupo):
-                    with col_cards_grupo[i % len(col_cards_grupo)]:
-                        if isinstance(dado_ponto, dict):
-                            renderizar_card_detalhe_ponto(dado_ponto)
-                        elif dado_ponto:
-                            with st.container(border=True):
-                                _md_seguro(dado_ponto)
                 st.caption(
-                    f"{len(cards_do_mes_grupo)} contrato(s) em exibição neste mês. "
+                    f"{len(cards_do_mes_grupo)} contrato(s) em exibição neste mês — role a lista abaixo pra ver todos. "
                     "Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar."
                 )
+                # contêiner de altura fixa com rolagem própria — com
+                # grupos grandes (15+ contratos no mesmo mês), a grade de
+                # cards ficava comprida demais sem um jeito de rolar até
+                # o fim dentro da própria seção.
+                qtd_linhas_cards = -(-len(cards_do_mes_grupo) // 3)  # arredonda pra cima
+                altura_cards_grupo = min(1200, max(400, 340 * min(qtd_linhas_cards, 3)))
+                with st.container(height=altura_cards_grupo):
+                    col_cards_grupo = st.columns(min(3, len(cards_do_mes_grupo)) or 1)
+                    for i, dado_ponto in enumerate(cards_do_mes_grupo):
+                        with col_cards_grupo[i % len(col_cards_grupo)]:
+                            if isinstance(dado_ponto, dict):
+                                renderizar_card_detalhe_ponto(dado_ponto)
+                            elif dado_ponto:
+                                with st.container(border=True):
+                                    _md_seguro(dado_ponto)
     else:
         st.info("Nenhum histórico de faturamento encontrado para as empresas deste grupo.")
 
