@@ -2923,7 +2923,7 @@ def relatorio_cliente(
     # tema, e a posição nunca estabilizou. Controles nativos do Streamlit
     # herdam o tema, não disputam espaço com os dados, e ainda deixam a
     # seleção de contratos num lugar só (em vez de um checkbox por card).
-    col_f1, col_f2 = st.columns([1, 2])
+    col_f1, col_f2, col_f3 = st.columns([1, 2, 1])
     with col_f1:
         filtro_rotulo = st.radio(
             "Mostrar", ["Todos", "Só ativos", "Só encerrados"],
@@ -2939,6 +2939,17 @@ def relatorio_cliente(
             key=f"sel_contratos_{nome_cliente}",
             help="Escolha quais contratos desenhar. Os cards ao lado acendem conforme a seleção.",
         ))
+    with col_f3:
+        # controle independente do multiselect: escolher contratos
+        # específicos não deveria obrigar a pessoa a também ver (ou
+        # perder) a linha Total — os dois filtros combinam livremente.
+        incluir_total = st.toggle(
+            "Total no gráfico", value=incluir_total,
+            key=f"toggle_total_{nome_cliente}",
+            help="Desligue pra tirar a linha 'Total' — útil quando você já filtrou pra "
+                 "poucos contratos específicos e só quer comparar as linhas individuais "
+                 "entre si, sem a soma no meio.",
+        )
 
     fig_principal, detalhes_md = plotar_historico_multi(
         historicos_grafico,
@@ -3371,11 +3382,15 @@ def relatorio_grupo(termo: str):
             ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else contratos_emp
             mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
             total_grupo += mensalidade
+            qtd_equip_emp = (
+                int((df_bombas["cliente_cigam_pagante"] == int(codigo)).sum()) if df_bombas is not None else 0
+            )
             linhas_resumo.append({
                 "Código": int(codigo),
                 "Empresa": emp["Cliente_Nome"],
                 "CNPJ": emp["_cnpj_norm"],
                 "Contratos ativos": ativos["codigoContrato"].nunique() if not ativos.empty else 0,
+                "Equipamentos": qtd_equip_emp,
                 "Mensalidade": mensalidade,
                 "Casou por": emp["_origem_match"],
             })
@@ -3385,11 +3400,19 @@ def relatorio_grupo(termo: str):
         return
 
     df_resumo = pd.DataFrame(linhas_resumo).sort_values("Mensalidade", ascending=False)
+    total_contratos_ativos = int(df_resumo["Contratos ativos"].sum())
+    total_equipamentos = int(df_resumo["Equipamentos"].sum())
+    # valor médio POR CONTRATO ativo (não por empresa) — é o número que
+    # ajuda a notar contrato fora do padrão do grupo; "por empresa" some
+    # empresas com contrato único e outras com vários no mesmo número
+    valor_medio_contrato = (total_grupo / total_contratos_ativos) if total_contratos_ativos else 0.0
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
     col_a.metric("Empresas no grupo", len(df_resumo))
-    col_b.metric("Contratos ativos", int(df_resumo["Contratos ativos"].sum()))
-    col_c.metric("Mensalidade do grupo", formatar_moeda(total_grupo))
+    col_b.metric("Contratos ativos", total_contratos_ativos)
+    col_c.metric("Equipamentos contratados", total_equipamentos)
+    col_d.metric("Mensalidade do grupo", formatar_moeda(total_grupo))
+    col_e.metric("Valor médio por contrato", formatar_moeda(valor_medio_contrato))
 
     df_exibir = df_resumo.copy()
     df_exibir["Mensalidade"] = df_exibir["Mensalidade"].apply(formatar_moeda)
@@ -3430,11 +3453,43 @@ def relatorio_grupo(termo: str):
             })
 
     if historicos_grupo:
+        historicos_grafico_grupo = agrupar_historicos_para_grafico(historicos_grupo, max_linhas=20)
+
+        # mesmos 3 controles do gráfico do cliente (filtro de situação,
+        # contratos no gráfico, total) — antes só existiam na view de
+        # cliente, o que impedia usar o gráfico do grupo com poucas
+        # empresas/contratos de cada vez ou tirar a linha Total dele.
+        col_g1, col_g2, col_g3 = st.columns([1, 2, 1])
+        with col_g1:
+            filtro_rotulo_grupo = st.radio(
+                "Mostrar", ["Todos", "Só ativos", "Só encerrados"],
+                horizontal=True, key=f"filtro_sit_grupo_{termo}",
+            )
+        filtro_situacao_grupo = {"Só ativos": "A", "Só encerrados": "E"}.get(filtro_rotulo_grupo)
+
+        opcoes_contratos_grupo = [h["grupo"] for h in historicos_grafico_grupo]
+        with col_g2:
+            grupos_marcados_grupo = set(st.multiselect(
+                "Contratos no gráfico (vazio = todos)",
+                options=opcoes_contratos_grupo, default=[],
+                key=f"sel_contratos_grupo_{termo}",
+                help="Escolha quais empresa(s)/contrato(s) do grupo desenhar.",
+            ))
+        with col_g3:
+            incluir_total_grupo = st.toggle(
+                "Total no gráfico", value=True,
+                key=f"toggle_total_grupo_{termo}",
+                help="Desligue pra tirar a linha 'Total' e comparar só as empresas/contratos "
+                     "selecionados entre si.",
+            )
+
         fig_grupo, _ = plotar_historico_multi(
-            agrupar_historicos_para_grafico(historicos_grupo, max_linhas=20),
+            historicos_grafico_grupo,
             titulo=f"Mensalidade consolidada — grupo {termo}",
             subtitulo=f"{len(historicos_grupo)} contrato(s) em {len(df_resumo)} empresa(s)",
-            incluir_total=True, mostrar_eventos_cancelamento=False,
+            incluir_total=incluir_total_grupo, mostrar_eventos_cancelamento=False,
+            grupos_visiveis=grupos_marcados_grupo or None,
+            filtro_situacao=filtro_situacao_grupo,
         )
         if fig_grupo is not None:
             st.plotly_chart(fig_grupo, use_container_width=True)
@@ -3485,6 +3540,29 @@ def relatorio_grupo(termo: str):
                              use_container_width=True, hide_index=True)
             else:
                 st.caption("Sem equipamentos como pagante.")
+
+            # contratos cancelados/encerrados — mesma informação que já
+            # existe na view de cliente (Descricao_Cancelamento vem
+            # pronta de buscar_itens_contrato_do_dw, sem consulta extra).
+            # Não busca a DATA exata de cancelamento aqui (isso é uma
+            # chamada ao BigQuery por contrato, feita hoje só sob demanda
+            # na view de cliente) — pra não multiplicar consultas por
+            # empresa toda vez que o grupo inteiro é aberto.
+            cancelados_emp = (
+                contratos_emp[contratos_emp["situacaoContrato"] == "E"] if not contratos_emp.empty else pd.DataFrame()
+            )
+            if len(cancelados_emp):
+                st.markdown(f"**Contratos cancelados ({cancelados_emp['codigoContrato'].nunique()})**")
+                st.dataframe(
+                    renomear_para_exibicao(cancelados_emp[[
+                        "codigoContrato", "Descricao_Material", "Descricao",
+                        "Descricao_Cancelamento", "observacao", "contratoTerceiro",
+                        "Mensalidade", "diaVencimento",
+                    ]].sort_values("codigoContrato")),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.caption("Sem contratos cancelados.")
 
 
 _renderizar_cabecalho()
