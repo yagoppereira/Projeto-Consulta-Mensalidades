@@ -3992,7 +3992,18 @@ def renderizar_nota_debito():
     with col_email:
         contato_email = st.text_input("E-mail", key="nota_debito_contato_email")
 
-    if st.button("Gerar Nota de Débito", type="primary", use_container_width=True):
+    st.markdown("**Assinatura (opcional)** — sem assinatura escolhida, o bloco 5 sai com a linha em branco")
+    col_signatario, col_imagem = st.columns(2)
+    with col_signatario:
+        signatario_nome = st.text_input("Nome do signatário", key="nota_debito_signatario_nome")
+    with col_imagem:
+        signatario_imagem = st.file_uploader(
+            "Imagem da assinatura", type=["png", "jpg", "jpeg"], key="nota_debito_signatario_imagem")
+
+    if not destinatario_cnpj.strip() or not destinatario_endereco.strip():
+        st.warning("Cliente sem CNPJ e/ou endereço completo cadastrado — confira antes de exportar.")
+
+    if st.button("Gerar Nota de Débito", type="primary", use_container_width=True, disabled=selecionados.empty):
         if selecionados.empty:
             st.warning("Marque pelo menos um título na tabela.")
         elif not numero_input.strip():
@@ -4012,8 +4023,18 @@ def renderizar_nota_debito():
                     "vencimento": linha["vencimento"], "valor": float(linha["valor"]), "numero_nfse": "",
                 })
 
+            numero_puro, _, ano_puro = numero_input.strip().partition("/")
+            ano_puro = ano_puro or str(data_emissao_input.year)
+            cliente_arquivo = re.sub(r"[^A-Z0-9]+", "_", destinatario_razao.strip().upper()).strip("_") or "CLIENTE"
+            nome_arquivo = f"Nota_de_Debito_{numero_puro}_{ano_puro}_-_{cliente_arquivo}.pdf"
+            signatario = None
+            if signatario_nome.strip() or signatario_imagem is not None:
+                signatario = {
+                    "nome": signatario_nome.strip(),
+                    "imagem": signatario_imagem.getvalue() if signatario_imagem is not None else None,
+                }
+
             with tempfile.TemporaryDirectory() as pasta_temp:
-                nome_arquivo = f"nota_debito_{numero_input.strip().replace('/', '-')}.pdf"
                 caminho_pdf = os.path.join(pasta_temp, nome_arquivo)
                 try:
                     total = gerar_nota_debito.gerar_pdf_nota_debito(
@@ -4023,7 +4044,7 @@ def renderizar_nota_debito():
                             "razao_social": destinatario_razao, "cnpj": destinatario_cnpj,
                             "endereco": destinatario_endereco,
                         },
-                        itens=itens_validos, caminho_saida=caminho_pdf,
+                        itens=itens_validos, caminho_saida=caminho_pdf, signatario=signatario,
                     )
                 except Exception as erro:
                     st.error(f"Não consegui gerar a nota de débito: {erro}")
