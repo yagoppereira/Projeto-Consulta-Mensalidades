@@ -27,11 +27,12 @@ O endereço do Tomador não vem na proposta — o script busca automaticamente
 na Receita Federal (via BrasilAPI, a partir do CNPJ) quando o documento do
 cliente é um CNPJ; para CPF não há consulta pública, o campo fica em branco.
 
-Uso:
-    python gerar_espelho_nfse.py caminho/da/proposta.pdf [--saida DIR] [--aliquota 2.0]
+Também dá pra gerar pela aba "Espelho NFS-e" do app Streamlit (app.py), que
+importa as funções deste módulo — não precisa rodar nada pelo terminal.
 
-Dependências (não fazem parte do requirements.txt do app Streamlit):
-    pip install pdfplumber reportlab requests
+Uso via linha de comando:
+    pip install -r requirements.txt
+    python gerar_espelho_nfse.py caminho/da/proposta.pdf [--saida DIR] [--aliquota 2.0]
 """
 
 import argparse
