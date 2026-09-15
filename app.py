@@ -23,6 +23,7 @@ from google.oauth2 import service_account
 import streamlit as st
 
 import gerar_espelho_nfse
+import gerar_nota_debito
 
 st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wide")
 
@@ -3837,9 +3838,101 @@ def renderizar_espelho_nfse():
             )
 
 
+def renderizar_nota_debito():
+    st.caption(
+        "Gera uma Nota de Débito avulsa — lista de títulos já em aberto (licenciamento, "
+        "locação de equipamento etc.) com vencimento e valor, pro cliente usar no sistema "
+        "de contas a pagar dele. Não é uma nota fiscal nova, só um recibo de cobrança "
+        "consolidado — não passa pela emissão fiscal."
+    )
+
+    col_num, col_data = st.columns(2)
+    with col_num:
+        numero_input = st.text_input("Número da nota", placeholder="Ex: 006/2026")
+    with col_data:
+        data_emissao_input = st.date_input("Data de emissão", value=date.today(), key="nota_debito_data")
+
+    st.markdown("**Destinatário**")
+    col_razao, col_cnpj = st.columns(2)
+    with col_razao:
+        destinatario_razao = st.text_input("Razão Social", key="nota_debito_razao")
+    with col_cnpj:
+        destinatario_cnpj = st.text_input("CNPJ/CPF", key="nota_debito_cnpj")
+    destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
+
+    st.markdown("**Contato (emissor)**")
+    col_nome, col_tel, col_email = st.columns(3)
+    with col_nome:
+        contato_nome = st.text_input("Nome", key="nota_debito_contato_nome")
+    with col_tel:
+        contato_telefone = st.text_input("Telefone", key="nota_debito_contato_telefone")
+    with col_email:
+        contato_email = st.text_input("E-mail", key="nota_debito_contato_email")
+
+    st.markdown("**Títulos**")
+    df_vazio = pd.DataFrame([{"Título": "", "Descrição": "", "Vencimento": date.today(), "Valor": 0.0}])
+    itens_editados = st.data_editor(
+        st.session_state.get("nota_debito_itens_df", df_vazio),
+        num_rows="dynamic", use_container_width=True, hide_index=True, key="nota_debito_editor",
+        column_config={
+            "Título": st.column_config.TextColumn("Título"),
+            "Descrição": st.column_config.TextColumn("Descrição dos serviços / despesas", width="large"),
+            "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+            "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0),
+        },
+    )
+    st.session_state["nota_debito_itens_df"] = itens_editados
+
+    if st.button("Gerar Nota de Débito", type="primary", use_container_width=True):
+        itens_validos = [
+            {
+                "titulo": str(linha["Título"] or ""), "descricao": str(linha["Descrição"] or ""),
+                "vencimento": pd.to_datetime(linha["Vencimento"]).date(), "valor": float(linha["Valor"] or 0),
+            }
+            for _, linha in itens_editados.iterrows()
+            if str(linha["Título"]).strip() or str(linha["Descrição"]).strip()
+        ]
+        if not numero_input.strip():
+            st.warning("Informe o número da nota.")
+        elif not itens_validos:
+            st.warning("Adicione pelo menos um título na tabela.")
+        else:
+            with tempfile.TemporaryDirectory() as pasta_temp:
+                nome_arquivo = f"nota_debito_{numero_input.strip().replace('/', '-')}.pdf"
+                caminho_pdf = os.path.join(pasta_temp, nome_arquivo)
+                try:
+                    total = gerar_nota_debito.gerar_pdf_nota_debito(
+                        numero=numero_input.strip(), data_emissao=data_emissao_input,
+                        contato={"nome": contato_nome, "telefone": contato_telefone, "email": contato_email},
+                        destinatario={
+                            "razao_social": destinatario_razao, "cnpj": destinatario_cnpj,
+                            "endereco": destinatario_endereco,
+                        },
+                        itens=itens_validos, caminho_saida=caminho_pdf,
+                    )
+                except Exception as erro:
+                    st.error(f"Não consegui gerar a nota de débito: {erro}")
+                    st.session_state["nota_debito_resultado"] = None
+                else:
+                    with open(caminho_pdf, "rb") as arquivo:
+                        conteudo = arquivo.read()
+                    st.session_state["nota_debito_resultado"] = {
+                        "nome_arquivo": nome_arquivo, "conteudo": conteudo, "total": total,
+                    }
+
+    resultado = st.session_state.get("nota_debito_resultado")
+    if resultado:
+        st.success(f"Nota gerada — total {formatar_moeda(resultado['total'])}")
+        st.download_button(
+            "Baixar PDF", data=resultado["conteudo"], file_name=resultado["nome_arquivo"],
+            mime="application/pdf", use_container_width=True,
+        )
+
+
 _renderizar_cabecalho()
 
-aba_cliente, aba_grupo, aba_espelho = st.tabs(["Cliente", "Grupo econômico", "Espelho NFS-e"])
+aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
+    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -3891,3 +3984,6 @@ with aba_grupo:
 
 with aba_espelho:
     renderizar_espelho_nfse()
+
+with aba_nota_debito:
+    renderizar_nota_debito()
