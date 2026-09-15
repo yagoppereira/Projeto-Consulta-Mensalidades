@@ -13,12 +13,16 @@ import json
 import re
 import concurrent.futures
 import os
+import tempfile
+from datetime import date
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import streamlit as st
+
+import gerar_espelho_nfse
 
 st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wide")
 
@@ -3765,9 +3769,77 @@ def relatorio_grupo(termo: str):
                 st.caption("Sem contratos cancelados.")
 
 
+def renderizar_espelho_nfse():
+    st.caption(
+        "Envie a proposta comercial (PDF) e gere os espelhos de NFS-e — Adesão, "
+        "Instalação + Deslocamento e Licenciamento, considerando só os equipamentos "
+        "CTA. É uma prévia para conferência de valores, sem validade fiscal: o "
+        "número da nota e o código de verificação só existem após a emissão "
+        "oficial na prefeitura de Porto Alegre."
+    )
+
+    with st.form("espelho_nfse_form"):
+        proposta_upload = st.file_uploader("Proposta comercial (PDF)", type="pdf")
+        col_aliquota, col_data = st.columns(2)
+        with col_aliquota:
+            aliquota_input = st.number_input(
+                "Alíquota ISSQN (%)", min_value=0.0, max_value=100.0, value=2.0, step=0.5)
+        with col_data:
+            data_emissao_input = st.date_input("Data base para os vencimentos", value=date.today())
+        gerar_clicado = st.form_submit_button("Gerar espelhos", type="primary", use_container_width=True)
+
+    if gerar_clicado:
+        if proposta_upload is None:
+            st.warning("Envie o PDF da proposta antes de gerar.")
+        else:
+            with tempfile.TemporaryDirectory() as pasta_temp:
+                caminho_proposta = os.path.join(pasta_temp, proposta_upload.name)
+                with open(caminho_proposta, "wb") as arquivo:
+                    arquivo.write(proposta_upload.getvalue())
+                try:
+                    dados = gerar_espelho_nfse.parse_proposta(caminho_proposta)
+                    notas = gerar_espelho_nfse.montar_notas(dados, aliquota_input, data_emissao_input)
+                    resultados = []
+                    for nota in notas:
+                        nome_arquivo = f"espelho_nfse_{dados['numero_proposta']}_{nota['chave']}.pdf"
+                        caminho_pdf = os.path.join(pasta_temp, nome_arquivo)
+                        gerar_espelho_nfse.gerar_pdf_nota(
+                            nota, dados["tomador"], data_emissao_input, dados["numero_proposta"], caminho_pdf)
+                        with open(caminho_pdf, "rb") as arquivo_pdf:
+                            conteudo_pdf = arquivo_pdf.read()
+                        resultados.append({
+                            "nome_arquivo": nome_arquivo, "conteudo": conteudo_pdf,
+                            "titulo": nota["tipo"]["titulo"], "base_calculo": nota["base_calculo"],
+                            "total_issqn": nota["total_issqn"], "valor_liquido": nota["valor_liquido"],
+                        })
+                except Exception as erro:
+                    st.error(f"Não consegui gerar os espelhos a partir dessa proposta: {erro}")
+                    st.session_state["espelho_nfse_resultado"] = None
+                else:
+                    st.session_state["espelho_nfse_resultado"] = {
+                        "tomador": dados["tomador"]["nome"],
+                        "numero_proposta": dados["numero_proposta"],
+                        "notas": resultados,
+                    }
+
+    resultado = st.session_state.get("espelho_nfse_resultado")
+    if resultado:
+        st.success(f"Proposta Nº {resultado['numero_proposta']} — {resultado['tomador']}")
+        for nota in resultado["notas"]:
+            col_titulo, col_base, col_issqn, col_liquido, col_baixar = st.columns([1.6, 1.4, 1, 1.4, 1.2])
+            col_titulo.markdown(f"**{nota['titulo']}**")
+            col_base.metric("Base de cálculo", formatar_moeda(nota["base_calculo"]))
+            col_issqn.metric("Total ISSQN", formatar_moeda(nota["total_issqn"]))
+            col_liquido.metric("Valor líquido", formatar_moeda(nota["valor_liquido"]))
+            col_baixar.download_button(
+                "Baixar PDF", data=nota["conteudo"], file_name=nota["nome_arquivo"],
+                mime="application/pdf", use_container_width=True, key=f"baixar_{nota['nome_arquivo']}",
+            )
+
+
 _renderizar_cabecalho()
 
-aba_cliente, aba_grupo = st.tabs(["Cliente", "Grupo econômico"])
+aba_cliente, aba_grupo, aba_espelho = st.tabs(["Cliente", "Grupo econômico", "Espelho NFS-e"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -3816,3 +3888,6 @@ with aba_grupo:
 
     if st.session_state.get("grupo_buscado"):
         relatorio_grupo(st.session_state["grupo_buscado"])
+
+with aba_espelho:
+    renderizar_espelho_nfse()

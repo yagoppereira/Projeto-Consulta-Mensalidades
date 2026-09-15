@@ -6,3 +6,6 @@ db-dtypes
 google-auth
 gspread
 gspread-dataframe
+pdfplumber
+reportlab
+requests
