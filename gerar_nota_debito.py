@@ -21,6 +21,7 @@ import os
 from datetime import date
 from io import BytesIO
 
+from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
@@ -42,6 +43,7 @@ STEEL_HAIRLINE_26 = colors.Color(0x8A / 255, 0x95 / 255, 0xA8 / 255, alpha=0.26)
 STEEL_HAIRLINE_34 = colors.Color(0x8A / 255, 0x95 / 255, 0xA8 / 255, alpha=0.34)
 
 _PASTA_FONTES = os.path.join(os.path.dirname(__file__), "fonts")
+_CAMINHO_LOGO = os.path.join(os.path.dirname(__file__), "logo.png")
 
 
 def _registrar_fontes():
@@ -159,10 +161,19 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ])
 
-    # cabeçalho: wordmark à esquerda, número e data à direita, régua Cobalt 3px abaixo
+    # cabeçalho: logo à esquerda (mesmo arquivo logo.png usado no app Streamlit),
+    # número e data à direita, régua Cobalt 3px abaixo
+    logo_flowable = _p("ctasmart", fonte=POPPINS_B, tamanho=15, cor=COBALT)
+    if os.path.exists(_CAMINHO_LOGO):
+        altura_logo = 34 * 0.75  # 34px @ 96dpi -> pt, como pede a especificação
+        largura_original, altura_original = PILImage.open(_CAMINHO_LOGO).size
+        largura_logo = altura_logo * (largura_original / altura_original)
+        logo_flowable = Image(_CAMINHO_LOGO, width=largura_logo, height=altura_logo)
+        logo_flowable.hAlign = "LEFT"
+
     elementos.append(Table(
         [[
-            _p("ctasmart", fonte=POPPINS_B, tamanho=15, cor=COBALT),
+            logo_flowable,
             [
                 _p(f"NOTA DE DÉBITO Nº {numero}", fonte=POPPINS_B, tamanho=13, cor=NIGHT, alinhamento=TA_RIGHT),
                 _p(f"Data de Emissão: {formatar_data(data_emissao)}", fonte=DMSANS, tamanho=8.5, cor=STEEL, alinhamento=TA_RIGHT),
