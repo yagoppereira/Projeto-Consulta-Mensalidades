@@ -3848,66 +3848,20 @@ def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
     return digitos
 
 
-@st.cache_data(ttl=1800, show_spinner="Buscando títulos a vencer...")
-def buscar_titulos_a_vencer(codigos_cliente: tuple) -> pd.DataFrame:
-    """Título em aberto (saldo > 0) com vencimento a partir de hoje, direto de
-    silver.titulos_cigam — tabela com TODOS os lançamentos Receber/Entrada em
-    aberto (vencido OU a vencer), mesma fonte da fila de pré-inadimplentes do
-    app de Central de Fechamento.
-
-    Antes usava a agenda de parcelas do contrato (buscar_parcelas_bq), mas
-    ela é só um CRONOGRAMA esperado: pra contrato marcado como divergente do
-    faturamento (raio-x, contrato.ct_st='div'), a parcela real mais recente
-    simplesmente não aparece lá mesmo já lançada — confirmado com o cliente
-    002554 (ACO VERDE DO BRASIL), que tinha fatura de agosto/2026 já cobrada
-    (raio_x_cliente.faturamento) mas ausente na agenda do contrato.
-
-    gold.inadimplencia só cobre o VENCIDO (é a própria definição de
-    inadimplência da tabela), então o a vencer continua vindo daqui, não de
-    lá. Se a service account não tiver permissão nessa tabela silver (mesma
-    situação que já aconteceu com bronze.cigam__lancamentos), cai pra lista
-    vazia com aviso em vez de quebrar a tela."""
-    if MODO_DEMO:
-        hoje = date.today()
-        if "900001" in [str(c) for c in codigos_cliente]:
-            return pd.DataFrame([
-                {"fatura": "DEMO0003", "nf": "DEMO0003", "vencimento": hoje + pd.Timedelta(days=5), "valor": 1940.65},
-            ])
-        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
-
-    query = f"""
-    SELECT nf, fatura, dataVencimento AS vencimento, saldo AS valor
-    FROM `{PROJECT_ID}.silver.titulos_cigam`
-    WHERE SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
-      AND saldo > 0 AND dataVencimento >= CURRENT_DATE()
-    ORDER BY dataVencimento
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
-    )
-    try:
-        df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
-    except Exception as erro:
-        st.warning(
-            "Não consegui buscar título a vencer (silver.titulos_cigam) — mostrando só o "
-            f"vencido. Detalhe: {erro}"
-        )
-        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
-
-    if df.empty:
-        return df
-    df["vencimento"] = pd.to_datetime(df["vencimento"]).dt.date
-    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-    return df
-
-
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
 def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
     """Busca os títulos VENCIDOS do cliente na gold.inadimplencia — fonte
     única de inadimplência da CTA (consumida pelo Power BI e pelo app de
-    Alocação de Bombas), já com diasAtraso/classe oficiais. O que ainda não
-    venceu vem de buscar_titulos_a_vencer; as duas listas são concatenadas
-    em _buscar_titulos_cliente."""
+    Alocação de Bombas), já com diasAtraso/classe oficiais.
+
+    Só cobre vencido por enquanto: a service account do app não tem
+    permissão em bronze.cigam__lancamentos nem em silver.titulos_cigam
+    (as duas fontes candidatas pra título a vencer), e a agenda de parcelas
+    do contrato (bronze.cigam__contratos), que está liberada, se mostrou
+    pouco confiável pra isso — falta título real pra contrato marcado como
+    divergente do faturamento (raio-x, contrato.ct_st='div'), caso do
+    cliente 002554 (ACO VERDE DO BRASIL). Título a vencer fica de fora até
+    alguém liberar acesso a uma dessas tabelas pra service account."""
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
@@ -3997,28 +3951,20 @@ DESCRICAO_POR_TIPO_COBRANCA = {
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
 def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
-    """Lista completa de título em aberto: vencido (buscar_titulos_inadimplencia,
-    gold.inadimplencia, com diasAtraso/classe oficiais) + a vencer
-    (buscar_titulos_a_vencer, agenda do contrato), concatenados. Descrição vem
-    da NF real (buscar_itens_notas_fiscais_lote) quando disponível, senão do
-    tipo_cobranca da inadimplência."""
-    df_vencido = buscar_titulos_inadimplencia(codigos_cliente)
-    df_a_vencer = buscar_titulos_a_vencer(codigos_cliente)
+    """Lista de título VENCIDO em aberto (buscar_titulos_inadimplencia,
+    gold.inadimplencia, com diasAtraso/classe oficiais) — só vencido por
+    enquanto, ver o motivo no docstring de buscar_titulos_inadimplencia.
+    Descrição vem da NF real (buscar_itens_notas_fiscais_lote) quando
+    disponível, senão do tipo_cobranca da inadimplência."""
+    df = buscar_titulos_inadimplencia(codigos_cliente)
 
     mapa_tipo_cobranca = {}
-    if not df_vencido.empty:
-        for _, linha in df_vencido.iterrows():
+    if not df.empty:
+        for _, linha in df.iterrows():
             chave = linha["fatura"] or linha["nf"]
             if chave:
                 mapa_tipo_cobranca[chave] = linha["tipo_cobranca"]
 
-    if not df_a_vencer.empty:
-        df_a_vencer = df_a_vencer.copy()
-        df_a_vencer["dias_atraso"] = 0
-        df_a_vencer["classe"] = "A vencer"
-        df_a_vencer["tipo_cobranca"] = None
-
-    df = pd.concat([df_vencido, df_a_vencer], ignore_index=True)
     if df.empty:
         return pd.DataFrame(columns=["fatura", "vencimento", "valor", "descricao", "dias_atraso", "classe"])
 
@@ -4089,10 +4035,10 @@ def renderizar_nota_debito():
         destinatario_endereco = st.text_input("Endereço", value=endereco_dw, key="nota_debito_endereco")
 
     st.markdown(
-        "**Títulos em aberto** — marque os que entram na nota. Cobre vencido e a vencer. \"Classe\" "
-        "mostra se o título já foi baixado por perda, cobrança jurídica ou recuperação judicial "
-        "(vencido) ou se ainda não venceu (\"A vencer\"); título baixado ainda pode entrar na nota, "
-        "mas confira antes de incluir."
+        "**Títulos vencidos em aberto** — marque os que entram na nota. Título ainda não vencido "
+        "não entra aqui por enquanto. \"Classe\" mostra se o título já foi baixado por perda, "
+        "cobrança jurídica ou recuperação judicial; título baixado ainda pode entrar na nota, mas "
+        "confira antes de incluir."
     )
     df_grade = df_titulos.rename(columns={
         "fatura": "Título", "descricao": "Descrição", "vencimento": "Vencimento", "valor": "Valor",
