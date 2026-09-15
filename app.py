@@ -1026,16 +1026,33 @@ COR_REDUCAO = "#E74C3C"  # vermelho da paleta de apoio do brandbook
 # mudar (ex: passou a ser "Mensalidade Unificada" recentemente, antes
 # era só licenciamento), a cor acompanha automaticamente, porque a
 # classificação é refeita a cada vez com o dado mais recente disponível.
-COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#0040D0"  # Cobalt Blue · Principal
-COR_SO_LICENCIAMENTO = "#0035A8"  # Cobalt Dark 70%
+#
+# Tons CLAREADOS em vez do Cobalt Blue/Cobalt Dark 70% originais do
+# brandbook (#0040D0/#0035A8): o gráfico agora usa fundo ESCURO (ver
+# COR_FUNDO_GRAFICO), e os dois tons originais têm contraste abaixo de
+# 3:1 contra qualquer superfície escura — validado com o script da skill
+# de dataviz (validate_palette.js, --mode dark). Contra fundo branco
+# esses dois já liam bem; contra fundo escuro ficavam ilegíveis, que foi
+# exatamente o problema que a versão anterior "resolveu" fixando o
+# gráfico em branco (ver comentário em plotar_historico_multi).
+COR_UNIAO_ALUGUEL_LICENCIAMENTO = "#4C8DFF"  # Cobalt Blue, clareado pro fundo escuro
+COR_SO_LICENCIAMENTO = "#7AA8FF"  # Cobalt Dark 70%, clareado pro fundo escuro
 COR_SO_ALUGUEL = "#2ACFA1"  # Fuel Green claro
 COR_SONDA = "#8A95A8"  # Steel — textos secundários/bordas
+
+# fundo e texto do gráfico (Plotly), fixos independente do tema do
+# navegador — ver explicação completa no fig.update_layout de
+# plotar_historico_multi. Centralizados aqui (não só naquele ponto)
+# porque cores de linha/marcador acima foram escolhidas EM FUNÇÃO desse
+# fundo (teste de contraste feito contra COR_FUNDO_GRAFICO).
+COR_FUNDO_GRAFICO = "#26263A"  # secondaryBackgroundColor do tema (.streamlit/config.toml)
+COR_TEXTO_GRAFICO = "#F1F1F1"  # textColor do tema (.streamlit/config.toml)
 
 
 def variar_tom(cor_base: str, fracao: float, intensidade: float = 0.55) -> str:
     """
-    Gera uma variação de TOM da mesma cor base (mais clara ou mais
-    escura), controlada por `fracao` em [0, 1].
+    Gera uma variação de TOM da mesma cor base, controlada por `fracao`
+    em [0, 1]: fracao 0 -> cor original, fracao 1 -> mais clara.
 
     Motivo: a cor da linha carrega SIGNIFICADO (união aluguel+
     licenciamento, só aluguel, sonda...), então não dá pra simplesmente
@@ -1045,15 +1062,19 @@ def variar_tom(cor_base: str, fracao: float, intensidade: float = 0.55) -> str:
     da mesma cor e as linhas viravam um emaranhado indistinguível.
     Variando o tom, a categoria continua reconhecível (todo mundo azul)
     mas cada linha fica distinguível da vizinha.
+
+    SÓ CLAREIA, nunca escurece: antes (fundo do gráfico branco) a
+    variação ia pra os dois lados — escurecer também aumentava contraste
+    contra o branco. Agora que o gráfico é escuro (COR_FUNDO_GRAFICO),
+    escurecer reduz o contraste e podia reproduzir exatamente o problema
+    de linha "invisível" que a cor base já resolveu (ver comentário nas
+    constantes COR_UNIAO_ALUGUEL_LICENCIAMENTO/COR_SO_LICENCIAMENTO).
+    Clarear, ao contrário, só aumenta o contraste contra um fundo escuro.
     """
     cor = cor_base.lstrip("#")
     r, g, b = (int(cor[i:i + 2], 16) for i in (0, 2, 4))
-    # fracao 0 -> mais escuro; 0.5 -> cor original; 1 -> mais claro
-    desvio = (fracao - 0.5) * 2 * intensidade
-    if desvio >= 0:
-        r, g, b = (c + (255 - c) * desvio for c in (r, g, b))
-    else:
-        r, g, b = (c * (1 + desvio) for c in (r, g, b))
+    desvio = fracao * intensidade
+    r, g, b = (c + (255 - c) * desvio for c in (r, g, b))
     return "#" + "".join(f"{max(0, min(255, round(c))):02x}" for c in (r, g, b))
 
 
@@ -1090,13 +1111,17 @@ def resolver_cores_dos_grupos(historicos: list) -> dict:
     return cores
 
 
-def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#00C389", cor_fim: str = "#0040D0") -> str:
+def interpolar_cor_gradiente(fracao: float, cor_inicio: str = "#00C389", cor_fim: str = COR_UNIAO_ALUGUEL_LICENCIAMENTO) -> str:
     """
     Interpola linearmente entre duas cores hex, dado fracao em [0, 1].
     Padrão: Verde → Azul — o mesmo degradê PRIMÁRIO da identidade visual
     da CTA (Guia de Degradês, jul/2026), reaproveitado aqui pra dar um
     tom distinto a cada equipamento na tabela, em vez de deixar tudo
     com a mesma cor (ou sem cor nenhuma) e pouca identificação visual.
+    Ponta azul usa a MESMA cor (já clareada pro fundo escuro) de
+    COR_UNIAO_ALUGUEL_LICENCIAMENTO, não o Cobalt Blue original — senão
+    as linhas no fim do gradiente sofreriam o mesmo problema de
+    contraste no gráfico de fundo escuro.
     """
     fracao = max(0.0, min(1.0, fracao))
 
@@ -1187,6 +1212,12 @@ def plotar_historico_multi(
     o texto no gráfico realmente ajudar.
 
     Botões no topo permitem filtrar Todos / Só Ativos / Só Encerrados.
+
+    Retorna (fig, detalhes_md, pontos_por_mes): pontos_por_mes é
+    {mes_fmt: [dado_ponto, ...]} com um dado_ponto por GRUPO atualmente
+    visível no gráfico (respeitando grupos_visiveis/filtro_situacao) —
+    pro caller conseguir, ao clicar em UM ponto, montar um card por
+    contrato em exibição naquele mês (não só o ponto exato clicado).
     """
     historicos_validos = [h for h in historicos if not h["df"].empty]
     # filtro de situação agora vem de FORA (controle do Streamlit acima do
@@ -1197,11 +1228,11 @@ def plotar_historico_multi(
     if filtro_situacao in ("A", "E"):
         historicos_validos = [h for h in historicos_validos if h.get("situacao") == filtro_situacao]
     if not historicos_validos:
-        return None, ""
+        return None, "", {}
     mapa_cores_grupos = resolver_cores_dos_grupos(historicos_validos)
     if not historicos_validos:
         st.info(f"Sem histórico de parcelas cobradas para: {titulo}")
-        return None, ""
+        return None, "", {}
 
     todos_periodos = sorted(set().union(*[set(h["df"]["mes"]) for h in historicos_validos]))
     todos_meses_str = [str(p) for p in todos_periodos]
@@ -1221,6 +1252,14 @@ def plotar_historico_multi(
     # cards mesmo depois de clicar num botão de filtro.
     trace_grupo_dono = []
     detalhes_mudancas_console = []  # (grupo, mes_fmt, direcao, valor_bruto, pct, novos, removidos, alterados) — sem resumir, pra imprimir no console
+    # {mes_fmt: [dado_ponto, ...]} — TODOS os grupos atualmente visíveis
+    # no gráfico (respeita grupos_visiveis/filtro_situacao), indexados
+    # pelo mês formatado. Devolvido pro caller poder, ao clicar em UM
+    # ponto do gráfico, montar um card por CONTRATO em exibição naquele
+    # mês (não só o ponto exato clicado) — sem isso, cada card teria que
+    # ser reconstruído fora daqui, duplicando toda essa lógica de
+    # composição/equipamentos/variação.
+    pontos_por_mes = {}
     # valores REAIS (não decorativos) de todas as linhas — usado só pra
     # calcular o limite de zoom-out do eixo Y. Populado à parte, na hora
     # em que cada linha é montada, em vez de escanear fig.data no final:
@@ -1576,6 +1615,12 @@ def plotar_historico_multi(
                 # consiga interpretar a estrutura acima por algum motivo
                 "cabecalho": texto,
             })
+            # só entra no índice por mês se o grupo estiver DE FATO
+            # visível no gráfico agora (não escondido via multiselect) —
+            # "todos os contratos em exibição" não deve incluir um
+            # contrato que a pessoa filtrou pra fora
+            if visivel_inicial_grupo is True:
+                pontos_por_mes.setdefault(mes_fmt, []).append(dados_estruturados[-1])
 
         # linha principal — única com showlegend=True do grupo.
         # connectgaps=False é explícito (já é o padrão) pra garantir que
@@ -1715,7 +1760,11 @@ def plotar_historico_multi(
                     hover_cancel = f"<b>Contrato {h['grupo']} cancelado em {data_cancel}</b>"
                     if motivo:
                         hover_cancel += f"<br>Motivo: {motivo}"
-                    cor_marcador, simbolo, tamanho = "black", "diamond", 18
+                    # era "black" — sumia contra o fundo escuro do gráfico
+                    # (ver COR_FUNDO_GRAFICO); a cor de texto do próprio
+                    # gráfico já contrasta bem e ainda lê como "neutro/fim",
+                    # sem competir com as cores semânticas das linhas
+                    cor_marcador, simbolo, tamanho = COR_TEXTO_GRAFICO, "diamond", 18
 
                 fig.add_trace(go.Scatter(
                     x=[meses_str[idx]], y=[valores[idx]], mode="markers",
@@ -1777,7 +1826,11 @@ def plotar_historico_multi(
         fig.add_trace(go.Scatter(
             x=meses_str_t, y=valores_t, mode="lines", name=nome,
             legendgroup=legendgroup_total, showlegend=True, visible=visivel_inicialmente,
-            line=dict(color="black", width=3, dash="dot"),
+            # era "black" — sumia contra o fundo escuro do gráfico (ver
+            # COR_FUNDO_GRAFICO); a cor de texto do gráfico contrasta bem
+            # com todas as cores semânticas de linha e ainda comunica
+            # "isto é a referência/soma", não mais um tipo de contrato
+            line=dict(color=COR_TEXTO_GRAFICO, width=3, dash="dot"),
             hovertext=hover_total, hoverinfo="text", customdata=dados_estruturados_total,
         ))
         trace_situacao.append(tag); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
@@ -1810,7 +1863,17 @@ def plotar_historico_multi(
                             for j in idx_var_t_relevantes
                         ],
                         textposition="top center",
-                        textfont=dict(size=10, color="#111827"),
+                        # era um cinza-navy FIXO ("#111827"), pensado pro
+                        # fundo branco antigo — some no fundo escuro atual.
+                        # Verde/vermelho por direção (igual ao texto de
+                        # variação de cada linha individual, mais acima) em
+                        # vez de reaproveitar COR_TEXTO_GRAFICO puro: assim
+                        # o texto também carrega a direção da variação, não
+                        # só lê no escuro.
+                        textfont=dict(
+                            size=10,
+                            color=[COR_AUMENTO if var_bruto_t[j] > 0 else COR_REDUCAO for j in idx_var_t_relevantes],
+                        ),
                         legendgroup=legendgroup_total, showlegend=False, hoverinfo="skip",
                         visible=visivel_inicialmente,
                     ))
@@ -1878,14 +1941,30 @@ def plotar_historico_multi(
         xaxis_title="Mês de referência", yaxis_title="Valor (R$)",
         yaxis_tickprefix="R$ ", yaxis_tickformat=",.2f",
         yaxis=dict(minallowed=y_min_permitido, maxallowed=y_max_permitido) if y_min_permitido is not None else {},
-        template="plotly_white", hovermode="closest",
-        # fundo claro FIXO no gráfico: por padrão o Plotly no Streamlit
-        # herda o tema do app, e no modo escuro as linhas em Cobalt Dark
-        # (#0035A8) sumiam contra o fundo preto — o gráfico parecia vazio
-        # mesmo com os dados lá. Fixando aqui, o gráfico fica legível
-        # independente do tema que o navegador/usuário estiver usando.
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-        font=dict(color="#060D1F"),
+        template="plotly_dark", hovermode="closest",
+        # fundo do gráfico FIXO (não herda o tema do navegador) — mas
+        # agora ESCURO, acompanhando o tema escuro do app
+        # (.streamlit/config.toml), em vez do branco forçado que ficava
+        # como uma caixa clara destoando do resto da página escura.
+        #
+        # O branco tinha sido a correção rápida pra um problema real: o
+        # Cobalt Dark (#0035A8) usado em "só licenciamento" tinha
+        # contraste abaixo de 3:1 contra um fundo escuro e a linha
+        # sumia. Só que fundo BRANCO fixo também escondia outra coisa
+        # que dependia dele sem que ninguém tivesse notado: a linha
+        # "Total" e o marcador de cancelamento definitivo eram
+        # desenhados em preto — se o gráfico virasse escuro de novo sem
+        # também mexer nessas cores, os dois somem de novo.
+        #
+        # A correção desta vez foi na origem: COR_UNIAO_ALUGUEL_LICENCIAMENTO
+        # e COR_SO_LICENCIAMENTO foram clareadas (validado com a skill de
+        # dataviz, validate_palette.js, contra este fundo — ver comentário
+        # nas constantes), variar_tom() só clareia (nunca mais escurece
+        # até ficar ilegível), e "Total"/marcador de cancelamento
+        # definitivo passaram de preto pra COR_TEXTO_GRAFICO. Com a causa
+        # raiz corrigida, o gráfico pode acompanhar o tema escuro do app.
+        paper_bgcolor=COR_FUNDO_GRAFICO, plot_bgcolor=COR_FUNDO_GRAFICO,
+        font=dict(color=COR_TEXTO_GRAFICO),
         height=altura_fig,
         # width REMOVIDO de propósito: o gráfico é exibido com
         # use_container_width=True, dentro de uma coluna estreita (3:1,
@@ -1954,7 +2033,161 @@ def plotar_historico_multi(
         linhas_detalhe_md.append("")
     detalhes_md = "\n".join(linhas_detalhe_md)
 
-    return fig, detalhes_md
+    return fig, detalhes_md, pontos_por_mes
+
+
+def extrair_pontos_selecionados(evento_grafico):
+    """Extração defensiva do(s) ponto(s) clicado(s) num st.plotly_chart
+    com on_select="rerun" — o formato exato do objeto devolvido varia
+    (acesso por atributo ou por chave, dependendo da versão do
+    Streamlit). Qualquer coisa que dê errado aqui cai pra lista vazia
+    (o caller mostra os cards normais) em vez de quebrar a página
+    inteira. Compartilhada entre a view de cliente e a de grupo — as
+    duas têm o mesmo gráfico com on_select, então a mesma extração."""
+    if evento_grafico is None:
+        return []
+    try:
+        selecao = getattr(evento_grafico, "selection", None)
+        if selecao is not None:
+            pontos = getattr(selecao, "points", None)
+            if pontos is None and hasattr(selecao, "get"):
+                pontos = selecao.get("points", [])
+        elif hasattr(evento_grafico, "get"):
+            pontos = evento_grafico.get("selection", {}).get("points", [])
+        else:
+            pontos = []
+        return pontos or []
+    except Exception:
+        return []
+
+
+def _customdata_do_ponto(ponto):
+    """Puxa o customdata (dict estruturado, ver plotar_historico_multi)
+    de UM ponto do jeito que o Streamlit devolveu — objeto ou dict."""
+    try:
+        dado = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
+    except Exception:
+        dado = None
+    if isinstance(dado, (list, tuple)):
+        dado = dado[0] if dado else None
+    return dado
+
+
+def _md_seguro(texto):
+    """Troca '$' pela entidade HTML &#36; antes de exibir. Dentro de
+    HTML (unsafe_allow_html=True) o escape com barra invertida NÃO
+    funciona — aparece literal na tela ("R\\$ 11.475,00"). A entidade
+    resolve os dois lados: o markdown não vê '$' pra abrir fórmula
+    LaTeX, e o navegador renderiza como cifrão normal."""
+    st.markdown(str(texto).replace("$", "&#36;"), unsafe_allow_html=True)
+
+
+def renderizar_card_detalhe_ponto(dado_ponto: dict):
+    """Renderiza UM card de detalhe (cabeçalho + composição + tabela de
+    equipamentos) pro dado_ponto estruturado (ver customdata em
+    plotar_historico_multi). Extraído da view de cliente pra ser
+    reaproveitado também na de grupo, e pra dar pra chamar uma vez por
+    CONTRATO quando vários aparecem no mesmo mês (ver pontos_por_mes)."""
+    valor_total = dado_ponto.get("valor_total")
+    composicao = dado_ponto.get("composicao_por_tipo") or {}
+    equipamentos = dado_ponto.get("equipamentos") or []
+
+    # 1) CABEÇALHO enxuto: valor em destaque, contrato e NFs como linha
+    # secundária. Antes o cabeçalho era o texto inteiro do hover (com
+    # composição, itens, variação, tudo concatenado), virando um
+    # parágrafo ilegível.
+    with st.container(border=True):
+        linhas_cab = [
+            f"<div style='font-size:1.4em;'><b>{formatar_moeda(valor_total) if valor_total is not None else 'N/D'}</b></div>",
+            f"<div style='font-size:0.85em; opacity:0.75;'>Contrato {dado_ponto.get('grupo','')} · {dado_ponto.get('descricao','')}</div>",
+        ]
+        if dado_ponto.get("nfs"):
+            linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
+        if not dado_ponto.get("completo", True):
+            linhas_cab.append(
+                "<div style='font-size:0.85em; color:#f59e0b;'>⚠ Mês incompleto — "
+                "nem todos os itens emitiram NF (não é redução de preço)</div>"
+            )
+        variacao_pct = dado_ponto.get("variacao_pct")
+        if variacao_pct is not None:
+            variacao_bruto = dado_ponto.get("variacao_bruto") or 0
+            seta = "▲" if variacao_bruto > 0 else "▼"
+            cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
+            linhas_cab.append(
+                f"<div style='font-size:0.9em; color:{cor_var};'>{seta} "
+                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%)</div>"
+            )
+        _md_seguro("".join(linhas_cab))
+
+    # 2) COMPOSIÇÃO por tipo — barrinha proporcional, não texto corrido:
+    # com 2+ tipos dá pra ver o peso de cada um de relance, em vez de
+    # ler "58.8% | 41.2%" no meio de um parágrafo
+    if len(composicao) >= 2:
+        st.markdown("**Composição**")
+        total_comp = sum(composicao.values()) or 1
+        for tipo, valor_tipo in sorted(composicao.items(), key=lambda x: -x[1]):
+            pct = valor_tipo / total_comp * 100
+            _md_seguro(
+                f"<div style='font-size:0.85em; margin-bottom:2px;'>{str(tipo).capitalize()} — "
+                f"<b>{formatar_moeda(valor_tipo)}</b> ({pct:.1f}%)</div>"
+                f"<div style='background:#ffffff1a; border-radius:3px; height:6px; margin-bottom:8px;'>"
+                f"<div style='background:{COR_UNIAO_ALUGUEL_LICENCIAMENTO}; width:{pct:.1f}%; height:6px; border-radius:3px;'></div></div>"
+            )
+
+    # 3) EQUIPAMENTOS como TABELA (não cards empilhados) — escala pra
+    # 16+ itens sem virar um muro de texto, e dá pra ordenar/rolar
+    if equipamentos:
+        st.markdown(f"**Equipamentos ({len(equipamentos)})**")
+
+        def _rotulo_equipamento(texto_item):
+            """Prefere o número de série (SERIE ####) quando existe — é
+            o identificador curto e útil. Sem série, usa o texto da NF
+            sem o sufixo genérico de período ('LICENCIAMENTO DE
+            SOFTWARE PERIODO: ...'), que é igual em todas as linhas e
+            não ajuda a distinguir um equipamento do outro."""
+            serial = extrair_serial_de_texto(texto_item)
+            if serial:
+                return f"SERIE {serial}"
+            limpo = re.split(r"LICENCIAMENTO DE SOFTWARE", str(texto_item or ""), flags=re.IGNORECASE)[0]
+            return (limpo.strip(" -") or str(texto_item or ""))[:40]
+
+        def _id_aparelho(texto_item):
+            """Extrai o ID do aparelho do texto da NF (formato 'SERIE
+            20802 #1 - ID 1285143632') — é o mesmo ID que aparece na
+            descrição do contrato, então serve de ponte entre a nota e
+            o cadastro do equipamento."""
+            m = re.search(r"\bID\s*(\d+)", str(texto_item or ""), re.IGNORECASE)
+            return m.group(1) if m else ""
+
+        def _marca_variacao(item):
+            """Sinaliza o que mudou nesse item desde a última cobrança:
+            verde pra aumento, vermelho pra queda, azul pra 'entrou
+            agora'. O percentual acompanha as duas primeiras (num item
+            novo não há base de comparação pra calcular %)."""
+            situacao = item.get("situacao_item")
+            pct = item.get("pct_item")
+            if situacao == "novo":
+                return "🔵 Novo"
+            if situacao == "subiu" and pct is not None:
+                return f"🟢 +{pct:.1f}%"
+            if situacao == "caiu" and pct is not None:
+                return f"🔴 {pct:.1f}%"
+            if situacao == "igual":
+                return "—"
+            return ""
+
+        df_equip_ponto = pd.DataFrame([
+            {
+                "Descrição": _rotulo_equipamento(e.get("texto")),
+                "ID": _id_aparelho(e.get("texto")),
+                "Tipo": str(e.get("tipo", "")).capitalize(),
+                "Valor": formatar_moeda(e.get("valor", 0)),
+                "Variação": _marca_variacao(e),
+                "NF": e.get("nf", ""),
+            }
+            for e in equipamentos
+        ])
+        st.dataframe(df_equip_ponto, use_container_width=True, hide_index=True, height=min(400, 40 + 35 * len(df_equip_ponto)))
 
 
 def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", grupos_exibidos: set = None):
@@ -2904,16 +3137,28 @@ def relatorio_cliente(
 
     # --- 3) Histórico de mensalidade (gráfico principal) ---
     st.subheader("Histórico de mensalidade", anchor=False)
-    # opção do GRÁFICO (não da busca): muda como o gráfico se apresenta,
-    # então mora junto dele — antes ficava no formulário de pesquisa, o
+    # opções do GRÁFICO (não da busca): mudam como o gráfico se apresenta,
+    # então moram junto dele — antes ficavam no formulário de pesquisa, o
     # que obrigava a refazer a busca inteira só pra ligar/desligar uns
-    # marcadores.
-    mostrar_eventos_cancelamento = st.toggle(
-        "Marcadores de eventos no gráfico", value=mostrar_eventos_cancelamento,
-        key=f"toggle_cancelamento_{nome_cliente}",
-        help="Desligue pra ver só as linhas limpas — esconde os marcadores de cancelamento "
-             "(losangos/círculos + linha vertical) e os de aumento/redução de valor.",
-    )
+    # marcadores. "Total" fica ao lado de "Marcadores de eventos" (não
+    # junto do multiselect de contratos): os dois são liga/desliga do
+    # gráfico como um todo, o multiselect é filtro de QUAIS contratos.
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        mostrar_eventos_cancelamento = st.toggle(
+            "Marcadores de eventos no gráfico", value=mostrar_eventos_cancelamento,
+            key=f"toggle_cancelamento_{nome_cliente}",
+            help="Desligue pra ver só as linhas limpas — esconde os marcadores de cancelamento "
+                 "(losangos/círculos + linha vertical) e os de aumento/redução de valor.",
+        )
+    with col_t2:
+        incluir_total = st.toggle(
+            "Total no gráfico", value=incluir_total,
+            key=f"toggle_total_{nome_cliente}",
+            help="Desligue pra tirar a linha 'Total' — útil quando você já filtrou pra "
+                 "poucos contratos específicos e só quer comparar as linhas individuais "
+                 "entre si, sem a soma no meio.",
+        )
     historicos_grafico = agrupar_historicos_para_grafico(historicos, max_linhas=max_linhas_grafico)
     prefixo_chave_cards = f"card_{nome_cliente}_"
 
@@ -2923,7 +3168,7 @@ def relatorio_cliente(
     # tema, e a posição nunca estabilizou. Controles nativos do Streamlit
     # herdam o tema, não disputam espaço com os dados, e ainda deixam a
     # seleção de contratos num lugar só (em vez de um checkbox por card).
-    col_f1, col_f2, col_f3 = st.columns([1, 2, 1])
+    col_f1, col_f2 = st.columns([1, 2])
     with col_f1:
         filtro_rotulo = st.radio(
             "Mostrar", ["Todos", "Só ativos", "Só encerrados"],
@@ -2939,19 +3184,8 @@ def relatorio_cliente(
             key=f"sel_contratos_{nome_cliente}",
             help="Escolha quais contratos desenhar. Os cards ao lado acendem conforme a seleção.",
         ))
-    with col_f3:
-        # controle independente do multiselect: escolher contratos
-        # específicos não deveria obrigar a pessoa a também ver (ou
-        # perder) a linha Total — os dois filtros combinam livremente.
-        incluir_total = st.toggle(
-            "Total no gráfico", value=incluir_total,
-            key=f"toggle_total_{nome_cliente}",
-            help="Desligue pra tirar a linha 'Total' — útil quando você já filtrou pra "
-                 "poucos contratos específicos e só quer comparar as linhas individuais "
-                 "entre si, sem a soma no meio.",
-        )
 
-    fig_principal, detalhes_md = plotar_historico_multi(
+    fig_principal, detalhes_md, pontos_por_mes = plotar_historico_multi(
         historicos_grafico,
         titulo=f"Histórico de mensalidade — {nome_cliente}",
         subtitulo=f"{len(historicos_grafico)} linha(s) no gráfico ({len(historicos)} grupo(s) de contrato reais) — código(s) CIGAM {codigos_cliente} — CNPJ {cnpj or 'N/D'}",
@@ -2986,153 +3220,40 @@ def relatorio_cliente(
         # por chave, dependendo da versão) — qualquer coisa que dê
         # errado aqui cai pra lista vazia (mostra os cards normais) em
         # vez de quebrar a página inteira
-        pontos_selecionados = []
-        if evento_grafico is not None:
-            try:
-                selecao = getattr(evento_grafico, "selection", None)
-                if selecao is not None:
-                    pontos_selecionados = getattr(selecao, "points", None)
-                    if pontos_selecionados is None and hasattr(selecao, "get"):
-                        pontos_selecionados = selecao.get("points", [])
-                elif hasattr(evento_grafico, "get"):
-                    pontos_selecionados = evento_grafico.get("selection", {}).get("points", [])
-                pontos_selecionados = pontos_selecionados or []
-            except Exception:
-                pontos_selecionados = []
+        pontos_selecionados = extrair_pontos_selecionados(evento_grafico)
 
         if pontos_selecionados:
-            for ponto in pontos_selecionados:
-                try:
-                    dado_ponto = ponto.get("customdata") if hasattr(ponto, "get") else getattr(ponto, "customdata", None)
-                except Exception:
-                    dado_ponto = None
-                if isinstance(dado_ponto, (list, tuple)):
-                    dado_ponto = dado_ponto[0] if dado_ponto else None
+            # o clique seleciona só o ponto exato debaixo do cursor, mas
+            # a pessoa quer ver TODOS os contratos em exibição naquele
+            # mês — usa o mês do primeiro ponto clicado como chave em
+            # pontos_por_mes (todos os grupos visíveis, já calculados em
+            # plotar_historico_multi) em vez de mostrar só o que foi
+            # clicado.
+            dado_primeiro = _customdata_do_ponto(pontos_selecionados[0])
+            mes_clicado = dado_primeiro.get("mes") if isinstance(dado_primeiro, dict) else None
+            cards_do_mes = pontos_por_mes.get(mes_clicado) if mes_clicado else None
+            if not cards_do_mes:
+                # não achou pelo mês (ex: clicou na linha Total antes de
+                # ela existir em pontos_por_mes, ou customdata inesperado)
+                # — cai pro comportamento antigo, só o(s) ponto(s) clicado(s)
+                cards_do_mes = [
+                    d for d in (_customdata_do_ponto(p) for p in pontos_selecionados) if d is not None
+                ]
 
-                def _md_seguro(texto):
-                    """Troca '$' pela entidade HTML &#36; antes de exibir.
-                    Dentro de HTML (unsafe_allow_html=True) o escape com
-                    barra invertida NÃO funciona — aparece literal na tela
-                    ("R\\$ 11.475,00"). A entidade resolve os dois lados:
-                    o markdown não vê '$' pra abrir fórmula LaTeX, e o
-                    navegador renderiza como cifrão normal."""
-                    st.markdown(str(texto).replace("$", "&#36;"), unsafe_allow_html=True)
-
+            st.markdown(f"**{mes_clicado}**" if mes_clicado else "**Detalhe do mês**")
+            for dado_ponto in cards_do_mes:
                 if not isinstance(dado_ponto, dict):
                     # fallback: formato inesperado, mostra o que der
                     if dado_ponto:
                         with st.container(border=True):
                             _md_seguro(dado_ponto)
                     continue
+                renderizar_card_detalhe_ponto(dado_ponto)
 
-                mes = dado_ponto.get("mes", "")
-                valor_total = dado_ponto.get("valor_total")
-                composicao = dado_ponto.get("composicao_por_tipo") or {}
-                equipamentos = dado_ponto.get("equipamentos") or []
-
-                # 1) CABEÇALHO enxuto: mês + valor em destaque, contrato e
-                # NFs como linha secundária. Antes o cabeçalho era o texto
-                # inteiro do hover (com composição, itens, variação, tudo
-                # concatenado), virando um parágrafo ilegível.
-                st.markdown(f"**{mes}**" if mes else "**Detalhe do mês**")
-                with st.container(border=True):
-                    linhas_cab = [
-                        f"<div style='font-size:1.4em;'><b>{formatar_moeda(valor_total) if valor_total is not None else 'N/D'}</b></div>",
-                        f"<div style='font-size:0.85em; opacity:0.75;'>Contrato {dado_ponto.get('grupo','')} · {dado_ponto.get('descricao','')}</div>",
-                    ]
-                    if dado_ponto.get("nfs"):
-                        linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
-                    if not dado_ponto.get("completo", True):
-                        linhas_cab.append(
-                            "<div style='font-size:0.85em; color:#f59e0b;'>⚠ Mês incompleto — "
-                            "nem todos os itens emitiram NF (não é redução de preço)</div>"
-                        )
-                    variacao_pct = dado_ponto.get("variacao_pct")
-                    if variacao_pct is not None:
-                        variacao_bruto = dado_ponto.get("variacao_bruto") or 0
-                        seta = "▲" if variacao_bruto > 0 else "▼"
-                        cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
-                        linhas_cab.append(
-                            f"<div style='font-size:0.9em; color:{cor_var};'>{seta} "
-                            f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%)</div>"
-                        )
-                    _md_seguro("".join(linhas_cab))
-
-                # 2) COMPOSIÇÃO por tipo — barrinha proporcional, não texto
-                # corrido: com 2+ tipos dá pra ver o peso de cada um de
-                # relance, em vez de ler "58.8% | 41.2%" no meio de um
-                # parágrafo
-                if len(composicao) >= 2:
-                    st.markdown("**Composição**")
-                    total_comp = sum(composicao.values()) or 1
-                    for tipo, valor_tipo in sorted(composicao.items(), key=lambda x: -x[1]):
-                        pct = valor_tipo / total_comp * 100
-                        _md_seguro(
-                            f"<div style='font-size:0.85em; margin-bottom:2px;'>{str(tipo).capitalize()} — "
-                            f"<b>{formatar_moeda(valor_tipo)}</b> ({pct:.1f}%)</div>"
-                            f"<div style='background:#ffffff1a; border-radius:3px; height:6px; margin-bottom:8px;'>"
-                            f"<div style='background:{COR_UNIAO_ALUGUEL_LICENCIAMENTO}; width:{pct:.1f}%; height:6px; border-radius:3px;'></div></div>"
-                        )
-
-                # 3) EQUIPAMENTOS como TABELA (não cards empilhados) —
-                # escala pra 16+ itens sem virar um muro de texto, e dá
-                # pra ordenar/rolar
-                if equipamentos:
-                    st.markdown(f"**Equipamentos ({len(equipamentos)})**")
-
-                    def _rotulo_equipamento(texto_item):
-                        """Prefere o número de série (SERIE ####) quando
-                        existe — é o identificador curto e útil. Sem
-                        série, usa o texto da NF sem o sufixo genérico
-                        de período ('LICENCIAMENTO DE SOFTWARE PERIODO:
-                        ...'), que é igual em todas as linhas e não
-                        ajuda a distinguir um equipamento do outro."""
-                        serial = extrair_serial_de_texto(texto_item)
-                        if serial:
-                            return f"SERIE {serial}"
-                        limpo = re.split(r"LICENCIAMENTO DE SOFTWARE", str(texto_item or ""), flags=re.IGNORECASE)[0]
-                        return (limpo.strip(" -") or str(texto_item or ""))[:40]
-
-                    def _id_aparelho(texto_item):
-                        """Extrai o ID do aparelho do texto da NF (formato
-                        'SERIE 20802 #1 - ID 1285143632') — é o mesmo ID
-                        que aparece na descrição do contrato, então serve
-                        de ponte entre a nota e o cadastro do equipamento."""
-                        m = re.search(r"\bID\s*(\d+)", str(texto_item or ""), re.IGNORECASE)
-                        return m.group(1) if m else ""
-
-                    def _marca_variacao(item):
-                        """Sinaliza o que mudou nesse item desde a última
-                        cobrança: verde pra aumento, vermelho pra queda,
-                        azul pra 'entrou agora'. O percentual acompanha
-                        as duas primeiras (num item novo não há base de
-                        comparação pra calcular %)."""
-                        situacao = item.get("situacao_item")
-                        pct = item.get("pct_item")
-                        if situacao == "novo":
-                            return "🔵 Novo"
-                        if situacao == "subiu" and pct is not None:
-                            return f"🟢 +{pct:.1f}%"
-                        if situacao == "caiu" and pct is not None:
-                            return f"🔴 {pct:.1f}%"
-                        if situacao == "igual":
-                            return "—"
-                        return ""
-
-                    df_equip_ponto = pd.DataFrame([
-                        {
-                            "Descrição": _rotulo_equipamento(e.get("texto")),
-                            "ID": _id_aparelho(e.get("texto")),
-                            "Tipo": str(e.get("tipo", "")).capitalize(),
-                            "Valor": formatar_moeda(e.get("valor", 0)),
-                            "Variação": _marca_variacao(e),
-                            "NF": e.get("nf", ""),
-                        }
-                        for e in equipamentos
-                    ])
-                    st.dataframe(df_equip_ponto, use_container_width=True, hide_index=True, height=min(400, 40 + 35 * len(df_equip_ponto)))
-
-            st.caption("Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar.")
+            st.caption(
+                f"{len(cards_do_mes)} contrato(s) em exibição neste mês. "
+                "Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar."
+            )
         else:
             st.markdown("**Contratos**")
             st.caption("Marque um contrato pra ver a linha dele no gráfico, ou clique num ponto pra ver o detalhe do mês.")
@@ -3275,60 +3396,6 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
 
 
-def detectar_operador_do_equipamento(bomba_nome: str, nomes_cliente) -> str:
-    """
-    O nome do equipamento costuma trazer o OPERADOR real no início
-    (ex: "MG LOG Transportes - Brasília/DF"), que nem sempre é o cliente
-    cadastrado como local/pagante no CIGAM (nesse caso, HOK 2522).
-
-    Isso importa porque é a única pista de que o equipamento está
-    operando por conta de um terceiro — nenhum campo de cliente mostra
-    isso. Retorna o nome do operador quando ele DIVERGE do cliente, ou
-    string vazia quando bate (caso normal).
-
-    A comparação é por palavra-chave (primeira palavra significativa),
-    pra tolerar as diferenças naturais de grafia entre o cadastro da
-    bomba e a razão social ("MG LOG Transportes" vs "MG LOG LTDA").
-    """
-    if not bomba_nome or pd.isna(bomba_nome):
-        return ""
-    # o operador é o trecho antes do primeiro " - " (o resto é local)
-    prefixo = str(bomba_nome).split(" - ")[0].strip()
-    if not prefixo:
-        return ""
-
-    # palavras genéricas que NÃO identificam uma empresa — precisam ser
-    # ignoradas nos dois lados, senão "MG LOG Transportes" bateria com
-    # "HOK Transportes" só por compartilharem o ramo, escondendo um
-    # operador terceiro de verdade
-    ignorar = {
-        "LTDA", "S.A.", "SA", "ME", "EPP", "EIRELI", "DE", "DA", "DO", "E", "POSTO", "CO",
-        "TRANSPORTES", "TRANSPORTE", "LOGISTICA", "LOGÍSTICA", "COMERCIO", "COMÉRCIO",
-        "SERVICOS", "SERVIÇOS", "EMPRESA", "INDUSTRIA", "INDÚSTRIA", "DISTRIBUIDORA",
-        "CONSTRUCOES", "CONSTRUÇÕES", "LOCACOES", "LOCAÇÕES", "COMBOIO", "PEDESTAL",
-    }
-
-    def _palavras(texto):
-        """Todas as palavras significativas, não só a primeira: nomes de
-        bomba como 'Oesa Hok Transportes' têm o cliente no MEIO, e
-        comparar só a primeira palavra dava falso positivo (acusava
-        terceiro quando era o próprio cliente)."""
-        return {
-            p for p in re.split(r"[\s\-/.]+", str(texto).upper())
-            if len(p) >= 3 and p not in ignorar
-        }
-
-    palavras_bomba = _palavras(prefixo)
-    if not palavras_bomba:
-        return ""
-    palavras_cliente = set()
-    for n in nomes_cliente:
-        if n and not pd.isna(n):
-            palavras_cliente |= _palavras(n)
-    # se QUALQUER palavra significativa coincide, é o próprio cliente
-    return "" if (palavras_bomba & palavras_cliente) else prefixo
-
-
 def _sufixo_cnpj(cnpj: str) -> str:
     """Formata só a parte que DIFERENCIA as empresas de um grupo: o
     sufixo de filial + dígito verificador. A raiz (8 primeiros dígitos)
@@ -3402,17 +3469,18 @@ def relatorio_grupo(termo: str):
     df_resumo = pd.DataFrame(linhas_resumo).sort_values("Mensalidade", ascending=False)
     total_contratos_ativos = int(df_resumo["Contratos ativos"].sum())
     total_equipamentos = int(df_resumo["Equipamentos"].sum())
-    # valor médio POR CONTRATO ativo (não por empresa) — é o número que
-    # ajuda a notar contrato fora do padrão do grupo; "por empresa" some
-    # empresas com contrato único e outras com vários no mesmo número
-    valor_medio_contrato = (total_grupo / total_contratos_ativos) if total_contratos_ativos else 0.0
+    # valor médio POR EQUIPAMENTO (mensalidade do grupo / qtd. de
+    # equipamentos) — mesma métrica (e mesma fórmula) já usada no resumo
+    # do cliente ("Valor médio por equipamento"), só que somada pro
+    # grupo inteiro em vez de por contrato ativo
+    valor_medio_equipamento = (total_grupo / total_equipamentos) if total_equipamentos else 0.0
 
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
     col_a.metric("Empresas no grupo", len(df_resumo))
     col_b.metric("Contratos ativos", total_contratos_ativos)
     col_c.metric("Equipamentos contratados", total_equipamentos)
     col_d.metric("Mensalidade do grupo", formatar_moeda(total_grupo))
-    col_e.metric("Valor médio por contrato", formatar_moeda(valor_medio_contrato))
+    col_e.metric("Valor médio por equipamento", formatar_moeda(valor_medio_equipamento))
 
     df_exibir = df_resumo.copy()
     df_exibir["Mensalidade"] = df_exibir["Mensalidade"].apply(formatar_moeda)
@@ -3438,12 +3506,30 @@ def relatorio_grupo(termo: str):
             df_hist = obter_historico_unificado(cod_grupo)
             if df_hist.empty:
                 continue
+            # rótulo: final do CNPJ · contrato CIGAM · equipamento
+            # (o texto de "Descricao" de cada subcontrato — ex: "PEDESTAL
+            # DEMO", ou "PEDESTAL + SONDA DEMO" quando são vários — bem
+            # diferente de Descricao_Material, que é só o tipo de
+            # cobrança tipo "Mensalidade Unificada") · seriais, só quando
+            # o texto realmente traz um (nem toda descrição tem).
+            #
+            # Antes o rótulo era só "sufixo · contrato": faltava a
+            # descrição do contrato inteira na view de grupo — o sufixo
+            # do CNPJ + o código sozinhos não dizem QUAL equipamento é.
+            descricoes_subset = subset["Descricao"].dropna().astype(str) if "Descricao" in subset.columns else pd.Series(dtype=str)
+            equipamento_txt = descricoes_subset.iloc[0] if len(descricoes_subset) else ""
+            seriais = sorted({s for s in descricoes_subset.apply(extrair_serial_de_texto) if s})
+            rotulo_grupo = f"{_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}"
+            if equipamento_txt:
+                rotulo_grupo += f" · {equipamento_txt}"
+            if seriais:
+                rotulo_grupo += f" · Série {'/'.join(seriais)}"
             historicos_grupo.append({
                 # rótulo usa o SUFIXO do CNPJ (ex: 0018-01), não o nome:
                 # num grupo econômico todas as empresas têm praticamente
                 # o mesmo nome ("HOK TRANSPORTES LTDA"), então o nome não
                 # distingue nada na legenda — o que diferencia é a filial
-                "grupo": f"{_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}",
+                "grupo": rotulo_grupo,
                 "descricao": subset["Descricao_Material"].dropna().iloc[0] if subset["Descricao_Material"].notna().any() else "",
                 "df": df_hist, "composicao": "", "data_cancelamento": None,
                 "motivo_cancelamento": None, "descricao_item": "", "observacao": "",
@@ -3483,7 +3569,7 @@ def relatorio_grupo(termo: str):
                      "selecionados entre si.",
             )
 
-        fig_grupo, _ = plotar_historico_multi(
+        fig_grupo, _, pontos_por_mes_grupo = plotar_historico_multi(
             historicos_grafico_grupo,
             titulo=f"Mensalidade consolidada — grupo {termo}",
             subtitulo=f"{len(historicos_grupo)} contrato(s) em {len(df_resumo)} empresa(s)",
@@ -3492,7 +3578,36 @@ def relatorio_grupo(termo: str):
             filtro_situacao=filtro_situacao_grupo,
         )
         if fig_grupo is not None:
-            st.plotly_chart(fig_grupo, use_container_width=True)
+            # mesmo clique-pra-detalhe da view de cliente: clicar num
+            # ponto mostra um card por CONTRATO em exibição naquele mês
+            # (não só o ponto exato clicado) — antes o gráfico do grupo
+            # não tinha nenhuma interação de clique.
+            evento_grafico_grupo = st.plotly_chart(
+                fig_grupo, use_container_width=True,
+                on_select="rerun", selection_mode="points", key=f"grafico_grupo_{termo}",
+            )
+            pontos_selecionados_grupo = extrair_pontos_selecionados(evento_grafico_grupo)
+            if pontos_selecionados_grupo:
+                dado_primeiro_grupo = _customdata_do_ponto(pontos_selecionados_grupo[0])
+                mes_clicado_grupo = dado_primeiro_grupo.get("mes") if isinstance(dado_primeiro_grupo, dict) else None
+                cards_do_mes_grupo = pontos_por_mes_grupo.get(mes_clicado_grupo) if mes_clicado_grupo else None
+                if not cards_do_mes_grupo:
+                    cards_do_mes_grupo = [
+                        d for d in (_customdata_do_ponto(p) for p in pontos_selecionados_grupo) if d is not None
+                    ]
+                st.markdown(f"**{mes_clicado_grupo}**" if mes_clicado_grupo else "**Detalhe do mês**")
+                col_cards_grupo = st.columns(min(3, len(cards_do_mes_grupo)) or 1)
+                for i, dado_ponto in enumerate(cards_do_mes_grupo):
+                    with col_cards_grupo[i % len(col_cards_grupo)]:
+                        if isinstance(dado_ponto, dict):
+                            renderizar_card_detalhe_ponto(dado_ponto)
+                        elif dado_ponto:
+                            with st.container(border=True):
+                                _md_seguro(dado_ponto)
+                st.caption(
+                    f"{len(cards_do_mes_grupo)} contrato(s) em exibição neste mês. "
+                    "Clique em outro ponto do gráfico, ou num espaço vazio, pra trocar/limpar."
+                )
     else:
         st.info("Nenhum histórico de faturamento encontrado para as empresas deste grupo.")
 
@@ -3518,24 +3633,31 @@ def relatorio_grupo(termo: str):
                 st.caption("Sem contratos ativos.")
 
             if len(equip_emp):
-                # sinaliza equipamentos cujo NOME aponta pra outra empresa
-                # (operador terceiro) — ex: bomba "MG LOG Transportes -
-                # Brasília/DF" cadastrada em HOK. É a única pista de que
-                # o equipamento opera por conta de um terceiro.
-                nomes_do_grupo = set(df_resumo["Empresa"].astype(str)) | {str(emp["Empresa"])}
-                equip_emp["Operador (se terceiro)"] = equip_emp["bomba_nome"].apply(
-                    lambda b: detectar_operador_do_equipamento(b, nomes_do_grupo)
+                # sinaliza equipamento instalado em OUTRA empresa (local
+                # ≠ pagante) — mesma lógica robusta já usada na view de
+                # cliente ("Local ≠ Pagante?", cliente_cigam_local vs
+                # cliente_cigam_pagante, dado de cadastro de verdade).
+                # Antes isso tentava adivinhar por texto (nome da bomba,
+                # ex: "MG LOG Transportes - Brasília/DF") — trocado pelo
+                # campo local_nome direto, que não depende de o texto da
+                # bomba seguir esse padrão.
+                equip_emp["Empresa Instalada (se terceiro)"] = equip_emp.apply(
+                    lambda r: r["local_nome"]
+                    if pd.notna(r.get("cliente_cigam_local")) and pd.notna(r.get("cliente_cigam_pagante"))
+                    and r["cliente_cigam_local"] != r["cliente_cigam_pagante"]
+                    else "",
+                    axis=1,
                 )
-                qtd_terceiro = int((equip_emp["Operador (se terceiro)"] != "").sum())
+                qtd_terceiro = int((equip_emp["Empresa Instalada (se terceiro)"] != "").sum())
                 st.markdown(f"**Equipamentos ({len(equip_emp)})**")
                 if qtd_terceiro:
                     st.warning(
-                        f"⚠️ {qtd_terceiro} equipamento(s) com nome de OUTRA empresa — "
-                        f"provável operação por terceiro, veja a coluna 'Operador'.",
+                        f"⚠️ {qtd_terceiro} equipamento(s) instalados em OUTRA empresa — "
+                        f"provável operação por terceiro, veja a coluna 'Empresa Instalada'.",
                         icon="🔀",
                     )
                 colunas_eq = [c for c in ["bomba_nome", "serial_equipamento", "id_op_operacional",
-                                          "local_nome", "Operador (se terceiro)"] if c in equip_emp.columns]
+                                          "Empresa Instalada (se terceiro)"] if c in equip_emp.columns]
                 st.dataframe(renomear_para_exibicao(equip_emp[colunas_eq]),
                              use_container_width=True, hide_index=True)
             else:
