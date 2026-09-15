@@ -2,19 +2,26 @@
 Gera um "espelho" (prévia, sem validade fiscal) das Notas Fiscais de Serviço
 a partir de uma Proposta Comercial da CTA Smart (PDF).
 
-Cada proposta assinada gera 2 notas fiscais de serviço:
-  1. Instalação     (deslocamento técnico + instalação física — cobrança única)
-  2. Licenciamento  (mensalidade — comodato do equipamento + licenciamento)
-
-A Adesão (venda/configuração dos equipamentos) não é nota de serviço — é
-nota de venda de mercadoria, emitida pelo operacional por fora deste
-espelho.
+Cada proposta assinada gera 3 notas fiscais de serviço, sempre considerando
+só os equipamentos "CTA" (Pedestal, Mobile) — acessórios e periféricos
+(Antena, Válvula, Chaveiro, Kit Wi-Fi etc.) são vendidos como mercadoria à
+parte, o operacional emite essa nota de venda por fora deste espelho:
+  1. Adesão                    (parametrização/configuração — cobrança única)
+  2. Instalação + Deslocamento (instalação física + deslocamento técnico — cobrança única)
+  3. Licenciamento             (mensalidade — comodato do equipamento + licenciamento)
 
 O script lê o ANEXO I da proposta (tabela de produtos e o quadro "Preços
 Totais"), calcula a base de cálculo, o ISSQN e o valor líquido de cada nota,
 e desenha um PDF no mesmo formato do modelo de NFS-e da Prefeitura de Porto
 Alegre — mas claramente identificado como espelho/prévia, já que o número da
 nota e o código de verificação só existem depois da emissão oficial.
+
+O parser é orientado a cabeçalho de coluna, não a posição fixa: aceita tanto
+o modelo de proposta com uma tabela única (Produto/Qtd/Adesão Unitária/
+Instalação Unitária/Adesão + Instalação Total/Mensalidade Unitária/
+Mensalidade Total) quanto o modelo com desconto por item, que separa
+"Adesão e Instalação" de "Mensalidades" em duas tabelas e já traz o valor
+por linha com desconto aplicado (coluna "Adesão com Desconto").
 
 O endereço do Tomador não vem na proposta — o script busca automaticamente
 na Receita Federal (via BrasilAPI, a partir do CNPJ) quando o documento do
@@ -30,6 +37,7 @@ Dependências (não fazem parte do requirements.txt do app Streamlit):
 import argparse
 import os
 import re
+import unicodedata
 from datetime import date, timedelta
 
 import pdfplumber
@@ -54,19 +62,27 @@ PRESTADOR = {
 # diretamente de NFS-e já emitidas pela CTA Smart para o mesmo tipo de
 # serviço; a alíquota default (2%) é a de Porto Alegre/RS.
 #
-# A Adesão (venda/configuração dos equipamentos) não entra aqui: ela vira
-# nota de venda de mercadoria, não nota de serviço, e quem emite é o
-# operacional — este espelho cobre só o que é NFS-e de fato (Instalação e
-# Licenciamento).
+# "cod_atividade" da Instalação muda pra "0-DESLOCAMENTO" quando a proposta
+# cobra deslocamento técnico (visto em NFS-e real que soma os dois na mesma
+# nota); sem deslocamento, fica "0-INSTALACAO".
 TIPOS_NOTA = {
+    "adesao": {
+        "titulo": "ADESÃO",
+        "codigo_servico": "90000100003",
+        "descricao_servico": "CONFIGURAÇAO",
+        "cod_atividade": "0-CONFIGURACAO",
+        "item_lc116": "0",
+        "cnae": "6203100",
+        "filtro_produto": lambda p: p["adesao_total"] > 0,
+    },
     "instalacao": {
-        "titulo": "INSTALAÇÃO",
+        "titulo": "INSTALAÇÃO + DESLOCAMENTO",
         "codigo_servico": "90000100004",
         "descricao_servico": "INSTALAÇAO",
         "cod_atividade": "0-INSTALACAO",
         "item_lc116": "0",
         "cnae": "3329599",
-        "filtro_produto": lambda p: p["instalacao_unit"] > 0,
+        "filtro_produto": lambda p: p["instalacao_total"] > 0,
     },
     "licenciamento": {
         "titulo": "LICENCIAMENTO",
@@ -75,7 +91,7 @@ TIPOS_NOTA = {
         "cod_atividade": "0-LICENCIAMENTO -10500100",
         "item_lc116": "0",
         "cnae": "6202300",
-        "filtro_produto": lambda p: p["mensalidade_unit"] > 0,
+        "filtro_produto": lambda p: p["mensalidade_total"] > 0,
     },
 }
 
@@ -153,27 +169,87 @@ def _split_coluna(celula: str) -> list:
     return [linha.strip() for linha in (celula or "").split("\n")]
 
 
-def _extrair_tabela_produtos(tabelas) -> list:
+def _normalizar_cabecalho(texto: str) -> str:
+    """'Adesão +\\nInstalação Total' -> 'adesao instalacao total'.
+
+    Cabeçalhos de tabela na proposta vêm com quebra de linha por célula e às
+    vezes mudam de "Adesão Unitária" pra "Adesão com Desconto" dependendo do
+    modelo de proposta (com ou sem desconto por item) — casar por texto
+    normalizado em vez de posição de coluna aguenta as duas variações.
+    """
+    texto = unicodedata.normalize("NFKD", (texto or "").replace("\n", " "))
+    texto = texto.encode("ascii", "ignore").decode()
+    texto = re.sub(r"[^a-zA-Z0-9 ]", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip().lower()
+
+
+# mapeia cabeçalho normalizado -> papel do valor daquela coluna. Colunas de
+# "com Desconto" já vêm com o valor por linha corrigido (qtd × unitário ×
+# (1 - desconto)); quando presentes, são preferidas às colunas "Unitária"
+# cruas, que exigiriam multiplicar por Qtd e não têm desconto embutido.
+PAPEL_POR_CABECALHO = {
+    "produto": "nome",
+    "qtd": "qtd",
+    "adesao unitaria": "adesao_unitaria",
+    "instalacao unitaria": "instalacao_unitaria",
+    "adesao instalacao total": "adesao_instalacao_total",
+    "adesao com desconto": "adesao_total_linha",
+    "mensalidade unitaria": "mensalidade_unitaria",
+    "mensalidade total": "mensalidade_total_linha",
+}
+
+
+def _extrair_produtos(tabelas) -> list:
+    """Lê todas as tabelas 'Produto' da proposta (pode ser uma só, com tudo
+    junto, ou duas — 'Adesão e Instalação' e 'Mensalidades' — dependendo do
+    modelo) e mescla por nome do produto, já que a mesma lista de produtos
+    aparece em ambas quando estão separadas."""
+    produtos = {}
+    ordem = []
     for tabela in tabelas:
         if not tabela or not tabela[0]:
             continue
-        cabecalho = [c.strip() if c else "" for c in tabela[0]]
-        if cabecalho[0] != "Produto":
+        cabecalho_normalizado = [_normalizar_cabecalho(c) for c in tabela[0]]
+        papel_por_indice = {i: PAPEL_POR_CABECALHO[c] for i, c in enumerate(cabecalho_normalizado) if c in PAPEL_POR_CABECALHO}
+        if papel_por_indice.get(0) != "nome":
             continue
-        produtos = []
         for linha in tabela[1:]:
             colunas = [_split_coluna(c) for c in linha]
             n = len(colunas[0])
             for i in range(n):
-                produtos.append({
-                    "nome": colunas[0][i],
-                    "qtd": to_float(colunas[1][i]),
-                    "adesao_unit": to_float(colunas[2][i]),
-                    "instalacao_unit": to_float(colunas[3][i]),
-                    "mensalidade_unit": to_float(colunas[5][i]),
-                })
-        return produtos
-    raise ValueError("Não encontrei a tabela de produtos (ANEXO I) na proposta.")
+                valores = {papel: (colunas[idx][i] if idx < len(colunas) and i < len(colunas[idx]) else "")
+                           for idx, papel in papel_por_indice.items()}
+                nome = valores.get("nome", "").strip()
+                if not nome:
+                    continue
+                if nome not in produtos:
+                    produtos[nome] = {"nome": nome}
+                    ordem.append(nome)
+                registro = produtos[nome]
+                for campo, bruto in valores.items():
+                    if campo != "nome":
+                        registro[campo] = to_float(bruto)
+    if not produtos:
+        raise ValueError("Não encontrei a tabela de produtos (ANEXO I) na proposta.")
+
+    resultado = []
+    for nome in ordem:
+        p = produtos[nome]
+        qtd = p.get("qtd", 0.0)
+        if "adesao_total_linha" in p:
+            adesao = p["adesao_total_linha"]
+        elif "adesao_instalacao_total" in p:
+            adesao = p["adesao_instalacao_total"] - p.get("instalacao_unitaria", 0.0) * qtd
+        else:
+            adesao = p.get("adesao_unitaria", 0.0) * qtd
+        instalacao = p.get("instalacao_unitaria", 0.0) * qtd
+        mensalidade = p.get("mensalidade_total_linha", p.get("mensalidade_unitaria", 0.0) * qtd)
+        resultado.append({
+            "nome": nome, "qtd": qtd,
+            "adesao_total": round(adesao, 2), "instalacao_total": round(instalacao, 2),
+            "mensalidade_total": round(mensalidade, 2),
+        })
+    return resultado
 
 
 def _extrair_precos_totais(tabelas) -> dict:
@@ -204,7 +280,7 @@ def parse_proposta(caminho_pdf: str) -> dict:
     # página inteira.
     texto_tabelas = "\n".join(celula for tabela in tabelas for linha in tabela for celula in linha if celula)
 
-    produtos = _extrair_tabela_produtos(tabelas)
+    produtos = _extrair_produtos(tabelas)
     precos = _extrair_precos_totais(tabelas)
 
     numero_proposta = re.search(r"Proposta:\s*(\d+)", texto_completo)
@@ -223,19 +299,29 @@ def parse_proposta(caminho_pdf: str) -> dict:
 
     deslocamento_total = precos.get("Deslocamento Técnico Automação", (0.0, 0.0))[0] + \
         precos.get("Deslocamento Técnico Medição", (0.0, 0.0))[0]
-    mensalidade_total = precos.get("Investimento Total", (0.0, 0.0))[1]
-    adesao_instalacao_total = precos.get("Investimento Total", (0.0, 0.0))[0]
+    adesao_instalacao_total_proposta = precos.get("Investimento Total", (0.0, 0.0))[0]
 
-    adesao_total = sum(p["qtd"] * p["adesao_unit"] for p in produtos)
-    instalacao_total = sum(p["qtd"] * p["instalacao_unit"] for p in produtos) + deslocamento_total
+    # a proposta pode ter CTAs (controladores) junto com acessórios/periféricos
+    # (Antena, Válvula, Chaveiro, Kit Wi-Fi...); só os CTAs entram nesta nota
+    # de serviço — o resto é mercadoria, vendida à parte pelo operacional
+    produtos_cta = [p for p in produtos if p["nome"].strip().upper().startswith("CTA")]
 
-    diferenca = adesao_instalacao_total - (adesao_total + instalacao_total)
+    adesao_total = sum(p["adesao_total"] for p in produtos_cta)
+    instalacao_total = sum(p["instalacao_total"] for p in produtos_cta) + deslocamento_total
+    mensalidade_total = sum(p["mensalidade_total"] for p in produtos_cta)
+
+    # conferência: soma de TODOS os produtos (CTAs + acessórios) precisa bater
+    # com o Investimento Total da proposta — isso pega erro de leitura de
+    # tabela sem depender do filtro "só CTA" de cima
+    adesao_todos = sum(p["adesao_total"] for p in produtos)
+    instalacao_todos = sum(p["instalacao_total"] for p in produtos) + deslocamento_total
+    diferenca = adesao_instalacao_total_proposta - (adesao_todos + instalacao_todos)
     if abs(diferenca) > 0.02:
         print(
-            f"[aviso] Adesão ({formatar_moeda(adesao_total)}) + Instalação "
-            f"({formatar_moeda(instalacao_total)}) não bate com o Investimento Total "
-            f"da proposta ({formatar_moeda(adesao_instalacao_total)}); diferença de "
-            f"{formatar_moeda(diferenca)}. Confira a proposta manualmente."
+            f"[aviso] Adesão ({formatar_moeda(adesao_todos)}) + Instalação "
+            f"({formatar_moeda(instalacao_todos)}) de todos os produtos não bate com o "
+            f"Investimento Total da proposta ({formatar_moeda(adesao_instalacao_total_proposta)}); "
+            f"diferença de {formatar_moeda(diferenca)}. Confira a proposta manualmente."
         )
 
     if not (nome_tomador and cidade_uf_doc):
@@ -247,7 +333,7 @@ def parse_proposta(caminho_pdf: str) -> dict:
     return {
         "numero_proposta": numero_proposta.group(1) if numero_proposta else "",
         "data_proposta": data_proposta.group(1) if data_proposta else "",
-        "produtos": produtos,
+        "produtos_cta": produtos_cta,
         "tomador": {
             "nome": nome_tomador.group(1).strip(),
             "cidade": cidade_uf_doc.group(1).strip(),
@@ -260,6 +346,7 @@ def parse_proposta(caminho_pdf: str) -> dict:
         "adesao_total": adesao_total,
         "instalacao_total": instalacao_total,
         "mensalidade_total": mensalidade_total,
+        "deslocamento_total": deslocamento_total,
         "parcelas_adesao": [int(d) for d in parcelas_adesao.group(1).split("/")] if parcelas_adesao else [30],
         "parcelas_instalacao": [int(d) for d in parcelas_instalacao.group(1).split("/")] if parcelas_instalacao else [30],
         "carencia_meses": int(carencia.group(1)) if carencia else 0,
@@ -277,12 +364,22 @@ def _vencimentos_parcelados(valor_total: float, dias: list, data_base: date) -> 
 def montar_notas(dados: dict, aliquota: float, data_emissao: date) -> list:
     notas = []
     for chave, tipo in TIPOS_NOTA.items():
-        itens = [p for p in dados["produtos"] if tipo["filtro_produto"](p)]
-        descricao_itens = " + ".join(p["nome"] for p in itens) or "(nenhum item identificado)"
+        itens = [p for p in dados["produtos_cta"] if tipo["filtro_produto"](p)]
+        linhas_descricao = [
+            f'{tipo["codigo_servico"]} - {tipo["descricao_servico"]} {p["nome"].upper()} - Proposta Nº {dados["numero_proposta"]}'
+            for p in itens
+        ] or ["(nenhum CTA identificado na proposta para este tipo de nota)"]
+        cod_atividade = tipo["cod_atividade"]
 
-        if chave == "instalacao":
+        if chave == "adesao":
+            valor_total = dados["adesao_total"]
+            vencimentos = _vencimentos_parcelados(valor_total, dados["parcelas_adesao"], data_emissao)
+        elif chave == "instalacao":
             valor_total = dados["instalacao_total"]
             vencimentos = _vencimentos_parcelados(valor_total, dados["parcelas_instalacao"], data_emissao)
+            if dados["deslocamento_total"] > 0:
+                linhas_descricao.append("90000100008 - DESLOCAMENTO")
+                cod_atividade = "0-DESLOCAMENTO"
         else:  # licenciamento — mensalidade recorrente, cobrada mês a mês após carência
             valor_total = dados["mensalidade_total"]
             primeira_cobranca = data_emissao + timedelta(days=30 * dados["carencia_meses"] + 30)
@@ -292,8 +389,8 @@ def montar_notas(dados: dict, aliquota: float, data_emissao: date) -> list:
 
         notas.append({
             "chave": chave,
-            "tipo": tipo,
-            "descricao": f'{tipo["codigo_servico"]} - {tipo["descricao_servico"]} {descricao_itens} - Proposta Nº {dados["numero_proposta"]}',
+            "tipo": {**tipo, "cod_atividade": cod_atividade},
+            "descricao_linhas": linhas_descricao,
             "vencimentos": vencimentos,
             "aliquota": aliquota,
             "valor_total_servicos": valor_total,
@@ -402,8 +499,9 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     ))
 
     # descrição dos serviços
+    descricao_html = "<br/>".join(nota["descricao_linhas"])
     elementos.append(Table(
-        [[Paragraph(f"<b>Descrição dos Serviços</b><br/>{nota['descricao']}", _estilo_texto())]],
+        [[Paragraph(f"<b>Descrição dos Serviços</b><br/>{descricao_html}", _estilo_texto())]],
         colWidths=[largura_util], style=borda,
     ))
 
