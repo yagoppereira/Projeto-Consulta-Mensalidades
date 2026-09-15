@@ -4003,6 +4003,27 @@ FILTROS_DESCRICAO = [
 ]
 
 
+def calcular_juros(valor: float, dias_atraso) -> float:
+    """Juros de mora sobre título vencido — mesma fórmula da planilha de
+    cobrança usada pelo financeiro:
+    =IF(AND(incluir;aplicar_juros); IF(dias<=4; ROUND(ROUND(valor*0,01/30;2)*dias;2);
+    ROUND(ROUND(valor*0,02;2)+ROUND(ROUND(valor*0,01/30;2)*dias;2);2)); 0)
+
+    1% ao mês pro-rata diário (0,01/30 por dia) sempre que há atraso, mais
+    multa de 2% quando o atraso passa de 4 dias (tolerância). O AND(incluir;
+    aplicar_juros) da planilha já é replicado por quem chama esta função: só
+    soma juros pra título marcado como incluído E com o toggle "aplicar
+    juros" ligado."""
+    dias = int(dias_atraso or 0)
+    if dias <= 0:
+        return 0.0
+    juros_diario = round(round(valor * 0.01 / 30, 2) * dias, 2)
+    if dias <= 4:
+        return juros_diario
+    multa = round(valor * 0.02, 2)
+    return round(multa + juros_diario, 2)
+
+
 def normalizar_descricao(texto) -> str:
     """Troca a descrição bruta do CIGAM (item da NF ou tipo_cobranca da
     inadimplência — ex.: 'LICENCIAMENTO PEDESTAL DUPLO', 'Adesão/Config',
@@ -4132,11 +4153,18 @@ def renderizar_nota_debito():
 
     selecionados = titulos_editados[titulos_editados["Incluir"]]
 
-    col_num, col_data = st.columns(2)
+    col_num, col_data, col_juros = st.columns(3)
     with col_num:
         numero_input = st.text_input("Número da nota", placeholder="Ex: 006/2026", key="nota_debito_numero")
     with col_data:
         data_emissao_input = st.date_input("Data de emissão", value=date.today(), key="nota_debito_data")
+    with col_juros:
+        st.markdown("&nbsp;")
+        aplicar_juros = st.toggle(
+            "Cobrar juros de mora", key="nota_debito_aplicar_juros",
+            help="Multa de 2% (atraso acima de 4 dias) + juros de 1% ao mês pro-rata diário sobre "
+                 "cada título incluído — soma uma linha \"Juros de mora\" por título vencido na nota.",
+        )
 
     st.markdown("**Contato (emissor)**")
     col_nome, col_tel, col_email = st.columns(3)
@@ -4164,14 +4192,22 @@ def renderizar_nota_debito():
         elif not numero_input.strip():
             st.warning("Informe o número da nota.")
         else:
-            itens_validos = [
-                {
+            itens_validos = []
+            for _, linha in selecionados.iterrows():
+                valor_titulo = float(linha["Valor"])
+                itens_validos.append({
                     "titulo": str(linha["Título"]), "descricao": str(linha["Descrição"]),
-                    "vencimento": linha["Vencimento"], "valor": float(linha["Valor"]),
+                    "vencimento": linha["Vencimento"], "valor": valor_titulo,
                     "numero_nfse": str(linha["Nº NFS-e (opcional)"] or "").strip(),
-                }
-                for _, linha in selecionados.iterrows()
-            ]
+                })
+                if aplicar_juros:
+                    juros = calcular_juros(valor_titulo, linha["Dias em atraso"])
+                    if juros > 0:
+                        itens_validos.append({
+                            "titulo": str(linha["Título"]), "descricao": "Juros de mora",
+                            "vencimento": linha["Vencimento"], "valor": juros,
+                            "numero_nfse": "",
+                        })
 
             numero_puro, _, ano_puro = numero_input.strip().partition("/")
             ano_puro = ano_puro or str(data_emissao_input.year)
