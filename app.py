@@ -3848,50 +3848,65 @@ def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
     return digitos
 
 
-@st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
-def buscar_titulos_abertos(codigos_cliente: tuple) -> pd.DataFrame:
-    """Busca TODO título a receber em aberto do cliente — vencido ou a
-    vencer — direto em bronze.cigam__lancamentos: situacao='A' é a condição
-    oficial de "Aberto" no CIGAM, codigoTipo='R' restringe a título a
-    receber (exclui pagamento nosso a fornecedor). gold.inadimplencia (ver
-    buscar_titulos_inadimplencia) só cobre o vencido — é definição de
-    inadimplência —, por isso não serve sozinha pra listar título a vencer."""
+@st.cache_data(ttl=1800, show_spinner="Buscando títulos a vencer...")
+def buscar_titulos_a_vencer(codigos_cliente: tuple) -> pd.DataFrame:
+    """Título já lançado (não previsão) com vencimento a partir de hoje,
+    direto das parcelas do contrato (buscar_parcelas_bq/cigam__contratos).
+
+    gold.inadimplencia só cobre o VENCIDO (é a própria definição de
+    inadimplência da tabela), então título a vencer não aparece lá.
+    bronze.cigam__lancamentos teria a condição certa (situacao='A'), mas a
+    service account do app não tem permissão nessa tabela (só em
+    cigam__contratos, cigam__notas_fiscais, cigam__empresas e
+    gold.inadimplencia) — por isso usa a agenda de cobrança do contrato,
+    que já está liberada, em vez de pedir acesso a mais uma tabela bronze.
+    """
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
             return pd.DataFrame([
-                {"nf": "DEMO0001", "fatura": "DEMO0001", "vencimento": hoje - pd.Timedelta(days=95), "valor": 1150.00},
-                {"nf": "DEMO0002", "fatura": "DEMO0002", "vencimento": hoje - pd.Timedelta(days=32), "valor": 242.09},
-                {"nf": "DEMO0003", "fatura": "DEMO0003", "vencimento": hoje + pd.Timedelta(days=5), "valor": 1940.65},
+                {"fatura": "DEMO0003", "nf": "DEMO0003", "vencimento": hoje + pd.Timedelta(days=5), "valor": 1940.65},
             ])
         return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
 
-    query = f"""
-    SELECT nf, fatura, dataVencimento, saldo, previsao
-    FROM `{PROJECT_ID}.bronze.cigam__lancamentos`
-    WHERE situacao = 'A' AND codigoTipo = 'R'
-      AND SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
-    )
-    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
-    if df.empty:
+    contratos = buscar_itens_contrato_do_dw(codigos_cliente)
+    if contratos.empty:
         return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
-    df = df[~df["previsao"].apply(eh_previsao)]
-    df["vencimento"] = pd.to_datetime(df["dataVencimento"], dayfirst=True, errors="coerce").dt.date
-    df["valor"] = pd.to_numeric(df["saldo"], errors="coerce")
-    df = df.dropna(subset=["vencimento", "valor"])
-    return df[["fatura", "nf", "vencimento", "valor"]]
+
+    subcodigos = set()
+    for codigo_grupo in contratos["codigoContrato"].dropna().unique():
+        subcodigos.update(normalizar_codigo_contrato(c) for c in str(codigo_grupo).split("/"))
+
+    hoje = date.today()
+    linhas = []
+    for subcodigo in sorted(subcodigos):
+        df_parcelas = buscar_parcelas_bq(subcodigo)
+        for _, p in df_parcelas.iterrows():
+            if eh_previsao(p.get("previsao")):
+                continue
+            venc = pd.to_datetime(p.get("vencimento"), dayfirst=True, errors="coerce")
+            if pd.isna(venc) or venc.date() < hoje:
+                continue  # vencido já vem de gold.inadimplencia, com diasAtraso/classe corretos
+            valor_fatura = p.get("fatura")
+            valor_lancamento = p.get("lancamento")
+            fatura = str(valor_fatura).strip() if pd.notna(valor_fatura) else (
+                str(valor_lancamento).strip() if pd.notna(valor_lancamento) else "")
+            if not fatura:
+                continue
+            linhas.append({"fatura": fatura, "nf": fatura, "vencimento": venc.date(), "valor": float(p.get("valor") or 0)})
+
+    if not linhas:
+        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
+    return pd.DataFrame(linhas).drop_duplicates(subset=["fatura", "vencimento", "valor"])
 
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
 def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
     """Busca os títulos VENCIDOS do cliente na gold.inadimplencia — fonte
     única de inadimplência da CTA (consumida pelo Power BI e pelo app de
-    Alocação de Bombas) — só pra enriquecer com diasAtraso/classe (usada em
-    _buscar_titulos_cliente); a lista completa de título em aberto vem de
-    buscar_titulos_abertos, que também cobre o que ainda não venceu."""
+    Alocação de Bombas), já com diasAtraso/classe oficiais. O que ainda não
+    venceu vem de buscar_titulos_a_vencer; as duas listas são concatenadas
+    em _buscar_titulos_cliente."""
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
@@ -3922,6 +3937,57 @@ def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner="Buscando endereço do cliente...")
+def buscar_endereco_cliente(codigos_cliente: tuple) -> str:
+    """Monta o endereço do cliente a partir de bronze.cigam__empresas
+    (endereco, numero, complemento, bairro, municipio, uf, cep), pra
+    pré-preencher o destinatário da Nota de Débito. Retorna string vazia
+    se não achar nenhuma empresa com esses códigos."""
+    if MODO_DEMO:
+        if "900001" in [str(c) for c in codigos_cliente]:
+            return "Av. Demonstração, 1000 - Sala 2, Centro, Porto Alegre/RS - CEP 90000-000"
+        return ""
+
+    query = f"""
+    SELECT endereco, numero, complemento, bairro, municipio, uf, cep
+    FROM `{PROJECT_ID}.bronze.cigam__empresas`
+    WHERE SAFE_CAST(codigo AS INT64) IN UNNEST(@codigos)
+      AND endereco IS NOT NULL AND endereco != ''
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df.empty:
+        return ""
+
+    linha = df.iloc[0]
+    partes_logradouro = [str(linha["endereco"]).strip()]
+    if pd.notna(linha["numero"]) and str(linha["numero"]).strip():
+        partes_logradouro.append(str(linha["numero"]).strip())
+    logradouro = ", ".join(partes_logradouro)
+
+    complemento = str(linha["complemento"]).strip() if pd.notna(linha["complemento"]) else ""
+    bairro = str(linha["bairro"]).strip() if pd.notna(linha["bairro"]) else ""
+    municipio = str(linha["municipio"]).strip() if pd.notna(linha["municipio"]) else ""
+    uf = str(linha["uf"]).strip() if pd.notna(linha["uf"]) else ""
+    cep = str(linha["cep"]).strip() if pd.notna(linha["cep"]) else ""
+
+    segmentos = [logradouro]
+    if complemento:
+        segmentos.append(complemento)
+    if bairro:
+        segmentos.append(bairro)
+    cidade_uf = "/".join(p for p in (municipio, uf) if p)
+    if cidade_uf:
+        segmentos.append(cidade_uf)
+    endereco = " - ".join(segmentos)
+    if cep:
+        endereco = f"{endereco} - CEP {cep}"
+    return endereco
+
+
 DESCRICAO_POR_TIPO_COBRANCA = {
     "Licenciamento": "Licenciamento de software",
     "Aluguel": "Fatura de locação de equipamento",
@@ -3930,36 +3996,30 @@ DESCRICAO_POR_TIPO_COBRANCA = {
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
 def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
-    """Lista completa de título em aberto (buscar_titulos_abertos, vencido +
-    a vencer) enriquecida com dias em atraso/classe pra quem já apareceu
-    vencido na gold.inadimplencia — título ainda não vencido não tem
-    diasAtraso ali, então calcula localmente (0, ou "A vencer" na classe).
-    Descrição vem da NF real (buscar_itens_notas_fiscais_lote) quando
-    disponível, senão do tipo_cobranca da inadimplência."""
-    df = buscar_titulos_abertos(codigos_cliente)
+    """Lista completa de título em aberto: vencido (buscar_titulos_inadimplencia,
+    gold.inadimplencia, com diasAtraso/classe oficiais) + a vencer
+    (buscar_titulos_a_vencer, agenda do contrato), concatenados. Descrição vem
+    da NF real (buscar_itens_notas_fiscais_lote) quando disponível, senão do
+    tipo_cobranca da inadimplência."""
+    df_vencido = buscar_titulos_inadimplencia(codigos_cliente)
+    df_a_vencer = buscar_titulos_a_vencer(codigos_cliente)
+
+    mapa_tipo_cobranca = {}
+    if not df_vencido.empty:
+        for _, linha in df_vencido.iterrows():
+            chave = linha["fatura"] or linha["nf"]
+            if chave:
+                mapa_tipo_cobranca[chave] = linha["tipo_cobranca"]
+
+    if not df_a_vencer.empty:
+        df_a_vencer = df_a_vencer.copy()
+        df_a_vencer["dias_atraso"] = 0
+        df_a_vencer["classe"] = "A vencer"
+        df_a_vencer["tipo_cobranca"] = None
+
+    df = pd.concat([df_vencido, df_a_vencer], ignore_index=True)
     if df.empty:
         return pd.DataFrame(columns=["fatura", "vencimento", "valor", "descricao", "dias_atraso", "classe"])
-
-    df_inad = buscar_titulos_inadimplencia(codigos_cliente)
-    mapa_enriquecimento = {}
-    mapa_tipo_cobranca = {}
-    for _, linha in df_inad.iterrows():
-        chave = linha["fatura"] or linha["nf"]
-        if chave:
-            mapa_enriquecimento[chave] = {"dias_atraso": linha["dias_atraso"], "classe": linha["classe"]}
-            mapa_tipo_cobranca[chave] = linha["tipo_cobranca"]
-
-    hoje = date.today()
-
-    def _enriquecer(linha):
-        chave = linha["fatura"] or linha["nf"]
-        if chave in mapa_enriquecimento:
-            return pd.Series(mapa_enriquecimento[chave])
-        dias = max(0, (hoje - linha["vencimento"]).days)
-        classe = "A vencer" if linha["vencimento"] > hoje else "Em aberto"
-        return pd.Series({"dias_atraso": dias, "classe": classe})
-
-    df[["dias_atraso", "classe"]] = df.apply(_enriquecer, axis=1)
 
     referencias = [r for r in pd.concat([df["fatura"], df["nf"]]).dropna().unique() if r]
     mapa_itens = buscar_itens_notas_fiscais_lote(referencias) if referencias else {}
@@ -4024,7 +4084,8 @@ def renderizar_nota_debito():
         destinatario_cnpj = st.text_input(
             "CNPJ/CPF", value=_formatar_cnpj_cpf_mascara(cliente_info.get("cnpj") or ""), key="nota_debito_cnpj")
     with col_endereco:
-        destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
+        endereco_dw = buscar_endereco_cliente(cliente_info["codigos"])
+        destinatario_endereco = st.text_input("Endereço", value=endereco_dw, key="nota_debito_endereco")
 
     st.markdown(
         "**Títulos em aberto** — marque os que entram na nota. Cobre vencido e a vencer. \"Classe\" "
