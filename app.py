@@ -14,6 +14,7 @@ import re
 import concurrent.futures
 import os
 import tempfile
+import unicodedata
 from datetime import date
 import pandas as pd
 import plotly.graph_objects as go
@@ -3943,10 +3944,27 @@ def buscar_endereco_cliente(codigos_cliente: tuple) -> str:
     return endereco
 
 
-DESCRICAO_POR_TIPO_COBRANCA = {
-    "Licenciamento": "Licenciamento de software",
-    "Aluguel": "Fatura de locação de equipamento",
-}
+FILTROS_DESCRICAO = [
+    ("LICENCIAMENTO", "Licenciamento de software"),
+    ("ALUGUEL", "Fatura de locação de equipamento"),
+    ("ADESAO", "Adesão de equipamento"),
+    ("MATERIA", "Compra de materiais"),
+]
+
+
+def normalizar_descricao(texto) -> str:
+    """Troca a descrição bruta do CIGAM (item da NF ou tipo_cobranca da
+    inadimplência — ex.: 'LICENCIAMENTO PEDESTAL DUPLO', 'Adesão/Config',
+    'Aluguel') por um texto padronizado pro cliente, batendo por
+    palavra-chave (sem acento, case insensitive) via FILTROS_DESCRICAO. Sem
+    nenhum match, mantém o texto original em vez de esconder a informação."""
+    if not texto:
+        return texto
+    texto_norm = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().upper()
+    for chave, amigavel in FILTROS_DESCRICAO:
+        if chave in texto_norm:
+            return amigavel
+    return str(texto)
 
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
@@ -3974,12 +3992,12 @@ def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
     def _descricao(linha):
         itens = mapa_itens.get(linha["fatura"]) or mapa_itens.get(linha["nf"])
         if itens:
-            descricoes = sorted({desc for desc, _valor, _texto in itens if desc})
+            descricoes = sorted({normalizar_descricao(desc) for desc, _valor, _texto in itens if desc})
             if descricoes:
                 return " + ".join(descricoes)
         chave = linha["fatura"] or linha["nf"]
         tipo_cobranca = mapa_tipo_cobranca.get(chave)
-        return DESCRICAO_POR_TIPO_COBRANCA.get(tipo_cobranca, tipo_cobranca or "Licenciamento de software")
+        return normalizar_descricao(tipo_cobranca) if tipo_cobranca else "Licenciamento de software"
 
     df["descricao"] = df.apply(_descricao, axis=1)
     df["fatura"] = df["fatura"].fillna(df["nf"])
