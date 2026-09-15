@@ -3848,55 +3848,75 @@ def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
     return digitos
 
 
+@st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
+def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
+    """Busca os títulos com saldo em aberto do cliente na gold.inadimplencia —
+    fonte única de inadimplência da CTA (consumida pelo Power BI e pelo app
+    de Alocação de Bombas). Já exclui lançamento de previsão/provisão na
+    origem (dbt filtra cigam__lancamentos.previsao='1'), então cobre só
+    título de verdade. Traz tanto 'Em aberto' quanto título já baixado por
+    perda/cobrança jurídica/recuperação judicial (aparece com a classe
+    correspondente) — quem monta a nota decide se inclui um título baixado.
+    """
+    if MODO_DEMO:
+        hoje = date.today()
+        if "900001" in [str(c) for c in codigos_cliente]:
+            return pd.DataFrame([
+                {"nf": "DEMO0001", "fatura": "DEMO0001", "vencimento": hoje - pd.Timedelta(days=95),
+                 "valor": 1150.00, "dias_atraso": 95, "tipo_cobranca": "Licenciamento", "classe": "Em aberto"},
+                {"nf": "DEMO0002", "fatura": "DEMO0002", "vencimento": hoje - pd.Timedelta(days=32),
+                 "valor": 242.09, "dias_atraso": 32, "tipo_cobranca": "Aluguel", "classe": "Em aberto"},
+            ])
+        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor", "dias_atraso", "tipo_cobranca", "classe"])
+
+    query = f"""
+    SELECT nf, fatura, dataVencimento AS vencimento, saldo AS valor,
+           diasAtraso AS dias_atraso, tipo_cobranca, classe
+    FROM `{PROJECT_ID}.gold.inadimplencia`
+    WHERE origem = 'cigam' AND SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
+    ORDER BY dataVencimento
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df.empty:
+        return df
+    df["vencimento"] = pd.to_datetime(df["vencimento"]).dt.date
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+    df["dias_atraso"] = pd.to_numeric(df["dias_atraso"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+DESCRICAO_POR_TIPO_COBRANCA = {
+    "Licenciamento": "Licenciamento de software",
+    "Aluguel": "Fatura de locação de equipamento",
+}
+
+
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
 def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
-    """Junta as parcelas reais (via buscar_parcelas_bq) de todos os
-    subcontratos do cliente com a descrição real de cada NF (via
-    buscar_itens_notas_fiscais_lote), pronta pra virar linha de Nota de
-    Débito. Uma linha por parcela; situação 'J' (juros) fica marcada à
-    parte — só entra na nota se o usuário confirmar que houve incidência."""
-    contratos = buscar_itens_contrato_do_dw(codigos_cliente)
-    if contratos.empty:
-        return pd.DataFrame(columns=["fatura", "situacao", "vencimento", "valor", "descricao"])
+    """Junta os títulos em aberto (gold.inadimplencia) com a descrição real
+    da NF (via buscar_itens_notas_fiscais_lote) quando disponível; cai pro
+    tipo_cobranca da própria inadimplência quando a NF não tem itens
+    catalogados. Pronta pra virar linha de Nota de Débito."""
+    df = buscar_titulos_inadimplencia(codigos_cliente)
+    if df.empty:
+        return pd.DataFrame(columns=["fatura", "vencimento", "valor", "descricao", "dias_atraso", "classe"])
 
-    subcodigos = set()
-    for codigo_grupo in contratos["codigoContrato"].dropna().unique():
-        subcodigos.update(normalizar_codigo_contrato(c) for c in str(codigo_grupo).split("/"))
+    referencias = [r for r in pd.concat([df["fatura"], df["nf"]]).dropna().unique() if r]
+    mapa_itens = buscar_itens_notas_fiscais_lote(referencias) if referencias else {}
 
-    linhas = []
-    for subcodigo in sorted(subcodigos):
-        df_parcelas = buscar_parcelas_bq(subcodigo)
-        for _, p in df_parcelas.iterrows():
-            if eh_previsao(p.get("previsao")):
-                continue  # previsão/projeção futura — ainda não é cobrança de verdade
-            venc = pd.to_datetime(p.get("vencimento"), dayfirst=True, errors="coerce")
-            if pd.isna(venc):
-                continue
-            valor_fatura = p.get("fatura")
-            valor_lancamento = p.get("lancamento")
-            fatura = str(valor_fatura).strip() if pd.notna(valor_fatura) else (
-                str(valor_lancamento).strip() if pd.notna(valor_lancamento) else "")
-            if not fatura:
-                continue
-            linhas.append({
-                "fatura": fatura, "situacao": p.get("situacao"),
-                "vencimento": venc.date(), "valor": float(p.get("valor") or 0),
-            })
-    if not linhas:
-        return pd.DataFrame(columns=["fatura", "situacao", "vencimento", "valor", "descricao"])
+    def _descricao(linha):
+        itens = mapa_itens.get(linha["fatura"]) or mapa_itens.get(linha["nf"])
+        if itens:
+            descricoes = sorted({desc for desc, _valor, _texto in itens if desc})
+            if descricoes:
+                return " + ".join(descricoes)
+        return DESCRICAO_POR_TIPO_COBRANCA.get(linha["tipo_cobranca"], linha["tipo_cobranca"] or "Licenciamento de software")
 
-    df = pd.DataFrame(linhas).drop_duplicates(subset=["fatura", "vencimento", "valor", "situacao"])
-
-    mapa_itens = buscar_itens_notas_fiscais_lote(list(df["fatura"].unique()))
-
-    def _descricao(fatura):
-        itens = mapa_itens.get(fatura)
-        if not itens:
-            return "Licenciamento de software"
-        descricoes = sorted({desc for desc, _valor, _texto in itens if desc})
-        return " + ".join(descricoes) if descricoes else "Licenciamento de software"
-
-    df["descricao"] = df["fatura"].apply(_descricao)
+    df["descricao"] = df.apply(_descricao, axis=1)
+    df["fatura"] = df["fatura"].fillna(df["nf"])
     return df.sort_values("vencimento", ascending=False).reset_index(drop=True)
 
 
@@ -3932,11 +3952,9 @@ def renderizar_nota_debito():
         return
 
     df_titulos = _buscar_titulos_cliente(cliente_info["codigos"])
-    df_normais = df_titulos[df_titulos["situacao"] != "J"].reset_index(drop=True)
-    df_juros = df_titulos[df_titulos["situacao"] == "J"].reset_index(drop=True)
 
-    if df_normais.empty:
-        st.info(f"Não encontrei títulos pra {cliente_info['nome']}.")
+    if df_titulos.empty:
+        st.info(f"Não encontrei títulos em aberto pra {cliente_info['nome']}.")
         return
 
     st.success(f"Cliente: {cliente_info['nome']}")
@@ -3949,10 +3967,15 @@ def renderizar_nota_debito():
     with col_endereco:
         destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
 
-    st.markdown("**Títulos disponíveis** — marque os que entram na nota")
-    df_grade = df_normais.rename(columns={
+    st.markdown(
+        "**Títulos em aberto** — marque os que entram na nota. \"Classe\" mostra se o título já foi "
+        "baixado por perda, cobrança jurídica ou recuperação judicial; título assim ainda pode entrar "
+        "na nota, mas confira antes de incluir."
+    )
+    df_grade = df_titulos.rename(columns={
         "fatura": "Título", "descricao": "Descrição", "vencimento": "Vencimento", "valor": "Valor",
-    })[["Título", "Descrição", "Vencimento", "Valor"]].copy()
+        "dias_atraso": "Dias em atraso", "classe": "Classe",
+    })[["Título", "Descrição", "Vencimento", "Valor", "Dias em atraso", "Classe"]].copy()
     df_grade.insert(0, "Incluir", False)
     df_grade["Nº NFS-e (opcional)"] = ""
 
@@ -3964,24 +3987,13 @@ def renderizar_nota_debito():
             "Descrição": st.column_config.TextColumn("Descrição dos serviços / despesas", disabled=True, width="large"),
             "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY", disabled=True),
             "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", disabled=True),
+            "Dias em atraso": st.column_config.NumberColumn("Dias em atraso", disabled=True),
+            "Classe": st.column_config.TextColumn("Classe", disabled=True),
             "Nº NFS-e (opcional)": st.column_config.TextColumn("Nº NFS-e (opcional)"),
         },
     )
 
     selecionados = titulos_editados[titulos_editados["Incluir"]]
-
-    houve_juros = st.checkbox("Houve incidência de juros nesses títulos?", key="nota_debito_houve_juros")
-    itens_juros_incluidos = pd.DataFrame()
-    if houve_juros and not selecionados.empty:
-        faturas_selecionadas = set(selecionados["Título"])
-        itens_juros_incluidos = df_juros[df_juros["fatura"].isin(faturas_selecionadas)]
-        if not itens_juros_incluidos.empty:
-            st.caption(
-                f"{len(itens_juros_incluidos)} lançamento(s) de juros encontrados no CIGAM pra esses "
-                "títulos — entram na nota junto."
-            )
-        else:
-            st.caption("Não encontrei lançamento de juros no CIGAM pra nenhum dos títulos marcados.")
 
     col_num, col_data = st.columns(2)
     with col_num:
@@ -4023,11 +4035,6 @@ def renderizar_nota_debito():
                 }
                 for _, linha in selecionados.iterrows()
             ]
-            for _, linha in itens_juros_incluidos.iterrows():
-                itens_validos.append({
-                    "titulo": str(linha["fatura"]), "descricao": "Juros de mora",
-                    "vencimento": linha["vencimento"], "valor": float(linha["valor"]), "numero_nfse": "",
-                })
 
             numero_puro, _, ano_puro = numero_input.strip().partition("/")
             ano_puro = ano_puro or str(data_emissao_input.year)
