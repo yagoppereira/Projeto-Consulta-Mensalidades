@@ -3838,27 +3838,150 @@ def renderizar_espelho_nfse():
             )
 
 
+def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
+    digitos = "".join(ch for ch in str(digitos or "") if ch.isdigit())
+    if len(digitos) == 14:
+        return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
+    if len(digitos) == 11:
+        return f"{digitos[:3]}.{digitos[3:6]}.{digitos[6:9]}-{digitos[9:]}"
+    return digitos
+
+
+@st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
+def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
+    """Junta as parcelas reais (via buscar_parcelas_bq) de todos os
+    subcontratos do cliente com a descrição real de cada NF (via
+    buscar_itens_notas_fiscais_lote), pronta pra virar linha de Nota de
+    Débito. Uma linha por parcela; situação 'J' (juros) fica marcada à
+    parte — só entra na nota se o usuário confirmar que houve incidência."""
+    contratos = buscar_itens_contrato_do_dw(codigos_cliente)
+    if contratos.empty:
+        return pd.DataFrame(columns=["fatura", "situacao", "vencimento", "valor", "descricao"])
+
+    subcodigos = set()
+    for codigo_grupo in contratos["codigoContrato"].dropna().unique():
+        subcodigos.update(normalizar_codigo_contrato(c) for c in str(codigo_grupo).split("/"))
+
+    linhas = []
+    for subcodigo in sorted(subcodigos):
+        df_parcelas = buscar_parcelas_bq(subcodigo)
+        for _, p in df_parcelas.iterrows():
+            venc = pd.to_datetime(p.get("vencimento"), dayfirst=True, errors="coerce")
+            if pd.isna(venc):
+                continue
+            fatura = str(p.get("fatura") or p.get("lancamento") or "").strip()
+            if not fatura:
+                continue
+            linhas.append({
+                "fatura": fatura, "situacao": p.get("situacao"),
+                "vencimento": venc.date(), "valor": float(p.get("valor") or 0),
+            })
+    if not linhas:
+        return pd.DataFrame(columns=["fatura", "situacao", "vencimento", "valor", "descricao"])
+
+    df = pd.DataFrame(linhas).drop_duplicates(subset=["fatura", "vencimento", "valor", "situacao"])
+
+    mapa_itens = buscar_itens_notas_fiscais_lote(list(df["fatura"].unique()))
+
+    def _descricao(fatura):
+        itens = mapa_itens.get(fatura)
+        if not itens:
+            return "Licenciamento de software"
+        descricoes = sorted({desc for desc, _valor, _texto in itens if desc})
+        return " + ".join(descricoes) if descricoes else "Licenciamento de software"
+
+    df["descricao"] = df["fatura"].apply(_descricao)
+    return df.sort_values("vencimento", ascending=False).reset_index(drop=True)
+
+
 def renderizar_nota_debito():
     st.caption(
         "Gera uma Nota de Débito avulsa — lista de títulos já em aberto (licenciamento, "
         "locação de equipamento etc.) com vencimento e valor, pro cliente usar no sistema "
         "de contas a pagar dele. Não é uma nota fiscal nova, só um recibo de cobrança "
-        "consolidado — não passa pela emissão fiscal."
+        "consolidado — não passa pela emissão fiscal. Os títulos vêm direto do CIGAM/BigQuery, "
+        "você só marca quais entram na nota."
     )
+
+    with st.form("nota_debito_busca_form"):
+        col_busca, col_btn = st.columns([5, 1], vertical_alignment="bottom")
+        with col_busca:
+            identificador_nd = st.text_input(
+                "Cliente", placeholder="Nome, código CIGAM ou CNPJ/CPF", key="nota_debito_busca_cliente")
+        with col_btn:
+            buscar_nd_clicado = st.form_submit_button("Buscar títulos", use_container_width=True, type="primary")
+
+    if buscar_nd_clicado:
+        if not identificador_nd.strip():
+            st.warning("Digite um cliente pra buscar.")
+        else:
+            resultado_cliente = buscar_cliente(identificador_nd.strip())
+            if resultado_cliente:
+                codigos, nome, cnpj = resultado_cliente
+                st.session_state["nota_debito_cliente"] = {"codigos": tuple(sorted(codigos)), "nome": nome, "cnpj": cnpj}
+                st.session_state["nota_debito_resultado"] = None
+
+    cliente_info = st.session_state.get("nota_debito_cliente")
+    if not cliente_info:
+        return
+
+    df_titulos = _buscar_titulos_cliente(cliente_info["codigos"])
+    df_normais = df_titulos[df_titulos["situacao"] != "J"].reset_index(drop=True)
+    df_juros = df_titulos[df_titulos["situacao"] == "J"].reset_index(drop=True)
+
+    if df_normais.empty:
+        st.info(f"Não encontrei títulos pra {cliente_info['nome']}.")
+        return
+
+    st.success(f"Cliente: {cliente_info['nome']}")
+    col_razao, col_cnpj, col_endereco = st.columns(3)
+    with col_razao:
+        destinatario_razao = st.text_input("Razão Social do destinatário", value=cliente_info["nome"], key="nota_debito_razao")
+    with col_cnpj:
+        destinatario_cnpj = st.text_input(
+            "CNPJ/CPF", value=_formatar_cnpj_cpf_mascara(cliente_info.get("cnpj") or ""), key="nota_debito_cnpj")
+    with col_endereco:
+        destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
+
+    st.markdown("**Títulos disponíveis** — marque os que entram na nota")
+    df_grade = df_normais.rename(columns={
+        "fatura": "Título", "descricao": "Descrição", "vencimento": "Vencimento", "valor": "Valor",
+    })[["Título", "Descrição", "Vencimento", "Valor"]].copy()
+    df_grade.insert(0, "Incluir", False)
+    df_grade["Nº NFS-e (opcional)"] = ""
+
+    titulos_editados = st.data_editor(
+        df_grade, hide_index=True, use_container_width=True, key="nota_debito_titulos_editor",
+        column_config={
+            "Incluir": st.column_config.CheckboxColumn("Incluir"),
+            "Título": st.column_config.TextColumn("Título", disabled=True),
+            "Descrição": st.column_config.TextColumn("Descrição dos serviços / despesas", disabled=True, width="large"),
+            "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY", disabled=True),
+            "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", disabled=True),
+            "Nº NFS-e (opcional)": st.column_config.TextColumn("Nº NFS-e (opcional)"),
+        },
+    )
+
+    selecionados = titulos_editados[titulos_editados["Incluir"]]
+
+    houve_juros = st.checkbox("Houve incidência de juros nesses títulos?", key="nota_debito_houve_juros")
+    itens_juros_incluidos = pd.DataFrame()
+    if houve_juros and not selecionados.empty:
+        faturas_selecionadas = set(selecionados["Título"])
+        itens_juros_incluidos = df_juros[df_juros["fatura"].isin(faturas_selecionadas)]
+        if not itens_juros_incluidos.empty:
+            st.caption(
+                f"{len(itens_juros_incluidos)} lançamento(s) de juros encontrados no CIGAM pra esses "
+                "títulos — entram na nota junto."
+            )
+        else:
+            st.caption("Não encontrei lançamento de juros no CIGAM pra nenhum dos títulos marcados.")
 
     col_num, col_data = st.columns(2)
     with col_num:
-        numero_input = st.text_input("Número da nota", placeholder="Ex: 006/2026")
+        numero_input = st.text_input("Número da nota", placeholder="Ex: 006/2026", key="nota_debito_numero")
     with col_data:
         data_emissao_input = st.date_input("Data de emissão", value=date.today(), key="nota_debito_data")
-
-    st.markdown("**Destinatário**")
-    col_razao, col_cnpj = st.columns(2)
-    with col_razao:
-        destinatario_razao = st.text_input("Razão Social", key="nota_debito_razao")
-    with col_cnpj:
-        destinatario_cnpj = st.text_input("CNPJ/CPF", key="nota_debito_cnpj")
-    destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
 
     st.markdown("**Contato (emissor)**")
     col_nome, col_tel, col_email = st.columns(3)
@@ -3869,36 +3992,49 @@ def renderizar_nota_debito():
     with col_email:
         contato_email = st.text_input("E-mail", key="nota_debito_contato_email")
 
-    st.markdown("**Títulos**")
-    df_vazio = pd.DataFrame([{"Título": "", "Descrição": "", "Vencimento": date.today(), "Valor": 0.0}])
-    itens_editados = st.data_editor(
-        st.session_state.get("nota_debito_itens_df", df_vazio),
-        num_rows="dynamic", use_container_width=True, hide_index=True, key="nota_debito_editor",
-        column_config={
-            "Título": st.column_config.TextColumn("Título"),
-            "Descrição": st.column_config.TextColumn("Descrição dos serviços / despesas", width="large"),
-            "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
-            "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0),
-        },
-    )
-    st.session_state["nota_debito_itens_df"] = itens_editados
+    st.markdown("**Assinatura (opcional)** — sem assinatura escolhida, o bloco 5 sai com a linha em branco")
+    col_signatario, col_imagem = st.columns(2)
+    with col_signatario:
+        signatario_nome = st.text_input("Nome do signatário", key="nota_debito_signatario_nome")
+    with col_imagem:
+        signatario_imagem = st.file_uploader(
+            "Imagem da assinatura", type=["png", "jpg", "jpeg"], key="nota_debito_signatario_imagem")
 
-    if st.button("Gerar Nota de Débito", type="primary", use_container_width=True):
-        itens_validos = [
-            {
-                "titulo": str(linha["Título"] or ""), "descricao": str(linha["Descrição"] or ""),
-                "vencimento": pd.to_datetime(linha["Vencimento"]).date(), "valor": float(linha["Valor"] or 0),
-            }
-            for _, linha in itens_editados.iterrows()
-            if str(linha["Título"]).strip() or str(linha["Descrição"]).strip()
-        ]
-        if not numero_input.strip():
+    if not destinatario_cnpj.strip() or not destinatario_endereco.strip():
+        st.warning("Cliente sem CNPJ e/ou endereço completo cadastrado — confira antes de exportar.")
+
+    if st.button("Gerar Nota de Débito", type="primary", use_container_width=True, disabled=selecionados.empty):
+        if selecionados.empty:
+            st.warning("Marque pelo menos um título na tabela.")
+        elif not numero_input.strip():
             st.warning("Informe o número da nota.")
-        elif not itens_validos:
-            st.warning("Adicione pelo menos um título na tabela.")
         else:
+            itens_validos = [
+                {
+                    "titulo": str(linha["Título"]), "descricao": str(linha["Descrição"]),
+                    "vencimento": linha["Vencimento"], "valor": float(linha["Valor"]),
+                    "numero_nfse": str(linha["Nº NFS-e (opcional)"] or "").strip(),
+                }
+                for _, linha in selecionados.iterrows()
+            ]
+            for _, linha in itens_juros_incluidos.iterrows():
+                itens_validos.append({
+                    "titulo": str(linha["fatura"]), "descricao": "Juros de mora",
+                    "vencimento": linha["vencimento"], "valor": float(linha["valor"]), "numero_nfse": "",
+                })
+
+            numero_puro, _, ano_puro = numero_input.strip().partition("/")
+            ano_puro = ano_puro or str(data_emissao_input.year)
+            cliente_arquivo = re.sub(r"[^A-Z0-9]+", "_", destinatario_razao.strip().upper()).strip("_") or "CLIENTE"
+            nome_arquivo = f"Nota_de_Debito_{numero_puro}_{ano_puro}_-_{cliente_arquivo}.pdf"
+            signatario = None
+            if signatario_nome.strip() or signatario_imagem is not None:
+                signatario = {
+                    "nome": signatario_nome.strip(),
+                    "imagem": signatario_imagem.getvalue() if signatario_imagem is not None else None,
+                }
+
             with tempfile.TemporaryDirectory() as pasta_temp:
-                nome_arquivo = f"nota_debito_{numero_input.strip().replace('/', '-')}.pdf"
                 caminho_pdf = os.path.join(pasta_temp, nome_arquivo)
                 try:
                     total = gerar_nota_debito.gerar_pdf_nota_debito(
@@ -3908,7 +4044,7 @@ def renderizar_nota_debito():
                             "razao_social": destinatario_razao, "cnpj": destinatario_cnpj,
                             "endereco": destinatario_endereco,
                         },
-                        itens=itens_validos, caminho_saida=caminho_pdf,
+                        itens=itens_validos, caminho_saida=caminho_pdf, signatario=signatario,
                     )
                 except Exception as erro:
                     st.error(f"Não consegui gerar a nota de débito: {erro}")
