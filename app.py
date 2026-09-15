@@ -3458,20 +3458,23 @@ def _renderizar_legenda_abas():
 
 def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     """
-    Acha todas as empresas de um mesmo grupo econômico.
+    Acha todas as empresas de um mesmo grupo econômico, usando só critérios
+    fortes e verificáveis:
+      1. RAIZ DO CNPJ (8 primeiros dígitos) — matriz e filiais compartilham
+         a raiz e só diferem no sufixo (/0001, /0002...). É o critério que
+         de fato prova que duas empresas são do mesmo grupo.
+      2. Busca direta pelo termo digitado (nome, código CIGAM, CNPJ/CPF
+         completo OU raiz de CNPJ isolada) — resolve a "semente" a partir
+         da qual a raiz de CNPJ expande.
 
-    Combina dois critérios (como pedido):
-      1. RAIZ DO CNPJ (8 primeiros dígitos) — é o critério forte: matriz
-         e filiais compartilham a raiz e só diferem no sufixo
-         (/0001, /0002...). Pega o grupo mesmo quando os nomes divergem.
-      2. NOME — complementa os casos em que o grupo usa CNPJs de raízes
-         diferentes (empresas irmãs constituídas separadamente), que a
-         raiz sozinha não alcançaria.
-
-    O fluxo é: resolve o termo (nome/código/CNPJ) → junta as raízes de
-    CNPJ e os nomes encontrados → busca de novo por esses dois critérios.
-    Assim buscar "HOK" traz todos os HOK, e buscar o CNPJ de uma filial
-    também traz a matriz e as irmãs.
+    Antes também expandia por PALAVRA-CHAVE do nome (pegar toda empresa
+    cujo nome contivesse a mesma palavra da semente, ex: "HOK") — removido:
+    esse critério é fraco (basta duas empresas sem nenhum vínculo real
+    compartilharem uma palavra comum no nome pra virarem "grupo" por
+    engano) e não tinha como confirmar de verdade o vínculo. Efeito
+    colateral aceito: empresa "irmã" de fato, mas com raiz de CNPJ
+    diferente e nome muito distinto do resto do grupo, não entra sozinha —
+    dá pra buscar ela também e comparar à parte.
     """
     termo = str(termo).strip()
     if not termo or diretorio_clientes is None or diretorio_clientes.empty:
@@ -3481,55 +3484,34 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     dir_df["_raiz_cnpj"] = dir_df["_cnpj_norm"].astype(str).str[:8]
     digitos = "".join(ch for ch in termo if ch.isdigit())
 
-    # --- 1ª passada: quem casa diretamente com o termo? ---
+    # --- quem casa diretamente com o termo digitado? ---
     casa_nome = dir_df["Cliente_Nome"].astype(str).str.upper().str.contains(
         re.escape(termo.upper()), na=False
     )
     casa_codigo = dir_df["codigo_cliente"].astype(str) == digitos if digitos else False
     casa_cnpj = dir_df["_cnpj_norm"].astype(str) == digitos if len(digitos) >= 11 else False
-    semente = dir_df[casa_nome | casa_codigo | casa_cnpj]
+    # raiz de CNPJ digitada direto (8 dígitos, sem sufixo de filial) — sem
+    # isso, buscar só a raiz não achava nada, mesmo sendo o critério que a
+    # própria ferramenta anuncia como principal
+    casa_raiz_direta = dir_df["_raiz_cnpj"].astype(str) == digitos if len(digitos) == 8 else False
+
+    semente = dir_df[casa_nome | casa_codigo | casa_cnpj | casa_raiz_direta]
     if semente.empty:
         return pd.DataFrame()
 
-    # --- 2ª passada: expande pelas raízes de CNPJ e nomes da semente ---
-    # raízes vindas da semente. Quando a busca foi por NOME, a semente já
-    # pode conter empresas de raízes diferentes (ex: "HOK LOGISTICA" com
-    # CNPJ de outra raiz) — essas não devem virar "raiz confiável", senão
-    # o rótulo de confiança do match fica errado. Por isso as raízes
-    # "fortes" saem só de quem casou por CNPJ/código explícito.
-    semente_forte = dir_df[casa_codigo | casa_cnpj] if (digitos) else dir_df.iloc[0:0]
-    base_raizes = semente_forte if not semente_forte.empty else semente
-    raizes = {r for r in base_raizes["_raiz_cnpj"] if r and len(r) == 8 and not cnpj_invalido(r)}
-    # numa busca por NOME não existe raiz de referência confiável (a
-    # semente veio do próprio nome), então só faz sentido rotular como
-    # "raiz CNPJ" as raízes que aparecem em MAIS DE UMA empresa — essas
-    # sim indicam matriz/filial de verdade. Raiz única veio pelo nome.
-    if semente_forte.empty:
-        contagem_raiz = base_raizes["_raiz_cnpj"].value_counts()
-        raizes = {r for r in raizes if contagem_raiz.get(r, 0) > 1}
-    # usa a primeira palavra "forte" de cada nome (>=3 letras, ignorando
-    # tipos societários) como termo de nome — é o que faz "HOK
-    # TRANSPORTES LTDA" e "HOK LOGISTICA" caírem no mesmo grupo
-    ignorar = {"LTDA", "S.A.", "SA", "ME", "EPP", "EIRELI", "COMERCIO", "DE", "DA", "DO", "E"}
-    nomes_chave = set()
-    for nome in semente["Cliente_Nome"].astype(str):
-        for palavra in re.split(r"[\s\-/.]+", nome.upper()):
-            if len(palavra) >= 3 and palavra not in ignorar:
-                nomes_chave.add(palavra)
-                break
-
+    # só a raiz de CNPJ da semente expande o grupo — raiz vazia/inválida
+    # (CNPJ não cadastrado) não conta
+    raizes = {r for r in semente["_raiz_cnpj"] if r and len(r) == 8 and not cnpj_invalido(r)}
     por_raiz = dir_df["_raiz_cnpj"].isin(raizes) if raizes else False
-    por_nome = False
-    if nomes_chave:
-        padrao = "|".join(re.escape(n) for n in nomes_chave)
-        por_nome = dir_df["Cliente_Nome"].astype(str).str.upper().str.contains(padrao, na=False, regex=True)
 
-    grupo = dir_df[por_raiz | por_nome | casa_nome | casa_codigo | casa_cnpj].copy()
-    # rótulo do critério que trouxe cada empresa — "raiz CNPJ" só pra
-    # quem REALMENTE compartilha a raiz com a semente (match forte);
-    # o resto entrou por nome (match fraco, pode ter homônimo)
+    grupo = dir_df[por_raiz | casa_nome | casa_codigo | casa_cnpj | casa_raiz_direta].copy()
+    # rótulo do critério que trouxe cada empresa — "raiz CNPJ" só quando a
+    # raiz aparece em MAIS DE UMA empresa do grupo final (matriz/filial de
+    # verdade); empresa sozinha no grupo é "busca direta", mesmo que a raiz
+    # dela mesma tecnicamente esteja em `raizes` (ela sempre está, trivialmente)
+    contagem_raiz_grupo = grupo["_raiz_cnpj"].value_counts()
     grupo["_origem_match"] = grupo["_raiz_cnpj"].apply(
-        lambda r: "raiz CNPJ" if (raizes and r in raizes) else "nome"
+        lambda r: "raiz CNPJ" if (r and contagem_raiz_grupo.get(r, 0) > 1) else "busca direta"
     )
     return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
 
@@ -3556,8 +3538,15 @@ def relatorio_grupo(termo: str):
         st.error(f"Nenhuma empresa encontrada para '{termo}'.")
         return
 
-    st.header(f"Grupo econômico — {termo}", anchor=False)
-    st.caption(f"{len(grupo)} empresa(s) encontradas por raiz de CNPJ e/ou nome.")
+    # nome do grupo vem do próprio cadastro (nome mais frequente entre as
+    # empresas achadas), não do termo digitado — buscar por CNPJ ou código
+    # antes deixava o cabeçalho com o número em vez de um nome de verdade
+    nome_grupo = grupo["Cliente_Nome"].astype(str).mode().iloc[0]
+    st.header(f"Grupo econômico — {nome_grupo}", anchor=False)
+    st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por raiz de CNPJ e/ou busca direta.")
+
+    codigos_grupo = tuple(int(c) for c in grupo["codigo_cliente"].dropna().unique())
+    municipios_uf = buscar_municipio_uf_lote(codigos_grupo)
 
     linhas_resumo = []
     total_grupo = 0.0
@@ -3585,6 +3574,7 @@ def relatorio_grupo(termo: str):
                 )
                 contratos_por_empresa[int(codigo)] = contratos_emp
             ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else contratos_emp
+            qtd_contratos_ativos = ativos["codigoContrato"].nunique() if not ativos.empty else 0
             mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
             total_grupo += mensalidade
             qtd_equip_emp = (
@@ -3594,7 +3584,9 @@ def relatorio_grupo(termo: str):
                 "Código": int(codigo),
                 "Empresa": emp["Cliente_Nome"],
                 "CNPJ": emp["_cnpj_norm"],
-                "Contratos ativos": ativos["codigoContrato"].nunique() if not ativos.empty else 0,
+                "Município/UF": municipios_uf.get(int(codigo), ""),
+                "Situação": "Ativo" if qtd_contratos_ativos > 0 else "Inativo",
+                "Contratos ativos": qtd_contratos_ativos,
                 "Equipamentos": qtd_equip_emp,
                 "Mensalidade": mensalidade,
                 "Casou por": emp["_origem_match"],
@@ -3625,9 +3617,9 @@ def relatorio_grupo(termo: str):
     st.dataframe(df_exibir, use_container_width=True, hide_index=True)
 
     st.caption(
-        "A coluna 'Casou por' mostra o critério que trouxe cada empresa: "
-        "'raiz CNPJ' é match forte (matriz/filial do mesmo CNPJ base); "
-        "'nome' é complementar e pode trazer homônimos — vale conferir."
+        "A coluna 'Casou por' mostra o critério que trouxe cada empresa: 'raiz CNPJ' é "
+        "match forte (matriz/filial do mesmo CNPJ base); 'busca direta' bateu só com o "
+        "termo digitado (nome/código/CNPJ), sem raiz de CNPJ em comum com o resto do grupo."
     )
 
     # ------------------------------------------------------------------
@@ -3923,34 +3915,42 @@ def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
     pouco confiável pra isso — falta título real pra contrato marcado como
     divergente do faturamento (raio-x, contrato.ct_st='div'), caso do
     cliente 002554 (ACO VERDE DO BRASIL). Título a vencer fica de fora até
-    alguém liberar acesso a uma dessas tabelas pra service account."""
+    alguém liberar acesso a uma dessas tabelas pra service account.
+
+    `dias_atraso` é RECALCULADO aqui a partir do `vencimento` (hoje real do
+    servidor), em vez de usar direto o `diasAtraso` que vem da gold — essa
+    coluna é calculada no ETL noturno da tabela, então fica sempre um dia
+    atrasada em relação ao "hoje" de quem está usando o app (e a Nota de
+    Débito soma juros em cima desse número errado, cobrando um dia a menos
+    do que deveria)."""
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
-            return pd.DataFrame([
+            df = pd.DataFrame([
                 {"nf": "DEMO0001", "fatura": "DEMO0001", "vencimento": hoje - pd.Timedelta(days=95),
-                 "valor": 1150.00, "dias_atraso": 95, "tipo_cobranca": "Licenciamento", "classe": "Em aberto"},
+                 "valor": 1150.00, "tipo_cobranca": "Licenciamento", "classe": "Em aberto"},
                 {"nf": "DEMO0002", "fatura": "DEMO0002", "vencimento": hoje - pd.Timedelta(days=32),
-                 "valor": 242.09, "dias_atraso": 32, "tipo_cobranca": "Aluguel", "classe": "Em aberto"},
+                 "valor": 242.09, "tipo_cobranca": "Aluguel", "classe": "Em aberto"},
             ])
-        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor", "dias_atraso", "tipo_cobranca", "classe"])
+        else:
+            return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor", "dias_atraso", "tipo_cobranca", "classe"])
+    else:
+        query = f"""
+        SELECT nf, fatura, dataVencimento AS vencimento, saldo AS valor, tipo_cobranca, classe
+        FROM `{PROJECT_ID}.gold.inadimplencia`
+        WHERE origem = 'cigam' AND SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
+        ORDER BY dataVencimento
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+        )
+        df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+        if df.empty:
+            return df
+        df["vencimento"] = pd.to_datetime(df["vencimento"]).dt.date
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
 
-    query = f"""
-    SELECT nf, fatura, dataVencimento AS vencimento, saldo AS valor,
-           diasAtraso AS dias_atraso, tipo_cobranca, classe
-    FROM `{PROJECT_ID}.gold.inadimplencia`
-    WHERE origem = 'cigam' AND SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
-    ORDER BY dataVencimento
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
-    )
-    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
-    if df.empty:
-        return df
-    df["vencimento"] = pd.to_datetime(df["vencimento"]).dt.date
-    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-    df["dias_atraso"] = pd.to_numeric(df["dias_atraso"], errors="coerce").fillna(0).astype(int)
+    df["dias_atraso"] = df["vencimento"].apply(lambda v: max(0, (date.today() - v).days))
     return df
 
 
@@ -4003,6 +4003,41 @@ def buscar_endereco_cliente(codigos_cliente: tuple) -> str:
     if cep:
         endereco = f"{endereco} - CEP {cep}"
     return endereco
+
+
+@st.cache_data(ttl=1800, show_spinner="Buscando município das empresas do grupo...")
+def buscar_municipio_uf_lote(codigos_cliente: tuple) -> dict:
+    """Município/UF de VÁRIOS códigos de uma vez (bronze.cigam__empresas),
+    pra enriquecer o resumo de grupo econômico sem 1 query por empresa.
+    Retorna {codigo_cliente: "Município/UF"}; código sem endereço cadastrado
+    simplesmente não aparece no dict."""
+    if not codigos_cliente:
+        return {}
+    if MODO_DEMO:
+        return {900001: "Porto Alegre/RS"}
+
+    query = f"""
+    SELECT SAFE_CAST(codigo AS INT64) AS codigo, municipio, uf
+    FROM `{PROJECT_ID}.bronze.cigam__empresas`
+    WHERE SAFE_CAST(codigo AS INT64) IN UNNEST(@codigos)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df.empty:
+        return {}
+
+    resultado = {}
+    for _, linha in df.iterrows():
+        if pd.isna(linha["codigo"]):
+            continue
+        municipio = str(linha["municipio"]).strip() if pd.notna(linha["municipio"]) else ""
+        uf = str(linha["uf"]).strip() if pd.notna(linha["uf"]) else ""
+        cidade_uf = "/".join(p for p in (municipio, uf) if p)
+        if cidade_uf:
+            resultado[int(linha["codigo"])] = cidade_uf
+    return resultado
 
 
 FILTROS_DESCRICAO = [
