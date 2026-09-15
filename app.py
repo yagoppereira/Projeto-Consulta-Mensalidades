@@ -3384,8 +3384,8 @@ def _renderizar_cabecalho():
         logo_b64 = base64.b64encode(open("logo.png", "rb").read()).decode()
         st.markdown(
             f"""
-            <div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
-                <img src="data:image/png;base64,{logo_b64}" style="height:104px; width:auto;">
+            <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:0.5rem;">
+                <img src="data:image/png;base64,{logo_b64}" style="height:120px; width:auto;">
                 <h1 style="margin:0; font-size:2.25rem;">Análises Financeiras</h1>
             </div>
             """,
@@ -3404,24 +3404,34 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 def _renderizar_legenda_abas():
     """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
-    econômico' (Análise) de 'Espelho NFS-e' e 'Nota de Débito' (Ferramentas).
-    st.tabs não tem grupo/cor nativo — o CSS mira as abas pelo atributo
-    data-key (posição 0-3, estável entre versões do Streamlit; bem mais
-    confiável que mirar pela classe emotion-cache, que muda a cada build) e
-    pinta o texto/sublinhado da aba ativa por grupo, além de uma borda
-    separando os dois grupos entre a aba 1 e a 2."""
+    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
+    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
+    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
+    mirar pela classe emotion-cache, que muda a cada build):
+    - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
+      no container flex (truque clássico de flexbox pra "quebrar" um grupo
+      de itens em dois blocos nas pontas), com uma borda antes marcando a
+      separação;
+    - pinta o texto/sublinhado da aba ativa com a cor do grupo dela.
+    O rótulo Análise/Ferramentas acima usa a mesma técnica (space-between)
+    pra ficar alinhado com as pontas da barra de abas."""
     st.markdown(
         f"""
-        <div style="display:flex; gap:28px; margin:0.4rem 0 -0.6rem 0;">
+        <div style="display:flex; justify-content:space-between; margin:0.4rem 0 -0.6rem 0;">
             <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
                          text-transform:uppercase; color:{_COR_GRUPO_ANALISE};">🔎 Análise</span>
             <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
                          text-transform:uppercase; color:{_COR_GRUPO_FERRAMENTAS};">🛠️ Ferramentas</span>
         </div>
         <style>
+        div[data-testid="stTabs"] div[role="tablist"] {{
+            display: flex !important;
+            width: 100% !important;
+        }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
+            margin-left: auto !important;
             border-left: 1px solid rgba(138,149,168,0.4);
-            margin-left: 8px;
             padding-left: 16px;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
