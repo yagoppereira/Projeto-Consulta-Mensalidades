@@ -639,6 +639,18 @@ def buscar_cliente(identificador: str):
 
 
 # --- 5. BigQuery: histórico real de parcelas por contrato ---
+def eh_previsao(valor) -> bool:
+    """O campo 'previsao' é a marcação OFICIAL do CIGAM pra "essa parcela é
+    só previsão/projeção futura, ainda não é uma cobrança de verdade" (o
+    checkbox "Previsão" na tela de Parcelas do Contrato). Mais confiável que
+    qualquer heurística por data."""
+    if pd.isna(valor):
+        return False
+    if isinstance(valor, bool):
+        return valor
+    return str(valor).strip().lower() in ("true", "1", "sim", "s", "yes", "y")
+
+
 def normalizar_codigo_contrato(codigo: str) -> str:
     codigo = codigo.strip()
     if codigo.isdigit() and len(codigo) < TAMANHO_CODIGO_CONTRATO:
@@ -800,18 +812,7 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     df = df_parcelas.copy()
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
 
-    # FILTRO PRINCIPAL: o campo 'previsao' é a marcação OFICIAL do CIGAM
-    # pra "essa parcela é só previsão/projeção futura, ainda não é uma
-    # cobrança de verdade" (o checkbox "Previsão" que aparece na tela de
-    # Parcelas do Contrato). É mais confiável que qualquer heurística por
-    # data — usa direto o que o próprio CIGAM já marcou.
-    def eh_previsao(valor):
-        if pd.isna(valor):
-            return False
-        if isinstance(valor, (bool,)):
-            return valor
-        return str(valor).strip().lower() in ("true", "1", "sim", "s", "yes", "y")
-
+    # FILTRO PRINCIPAL: exclui previsão/projeção futura (ver eh_previsao)
     if "previsao" in df.columns:
         df = df[~df["previsao"].apply(eh_previsao)]
 
@@ -3866,10 +3867,15 @@ def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
     for subcodigo in sorted(subcodigos):
         df_parcelas = buscar_parcelas_bq(subcodigo)
         for _, p in df_parcelas.iterrows():
+            if eh_previsao(p.get("previsao")):
+                continue  # previsão/projeção futura — ainda não é cobrança de verdade
             venc = pd.to_datetime(p.get("vencimento"), dayfirst=True, errors="coerce")
             if pd.isna(venc):
                 continue
-            fatura = str(p.get("fatura") or p.get("lancamento") or "").strip()
+            valor_fatura = p.get("fatura")
+            valor_lancamento = p.get("lancamento")
+            fatura = str(valor_fatura).strip() if pd.notna(valor_fatura) else (
+                str(valor_lancamento).strip() if pd.notna(valor_lancamento) else "")
             if not fatura:
                 continue
             linhas.append({
