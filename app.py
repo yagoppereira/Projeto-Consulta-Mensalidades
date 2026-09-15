@@ -3849,15 +3849,49 @@ def _formatar_cnpj_cpf_mascara(digitos: str) -> str:
 
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
-def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
-    """Busca os títulos com saldo em aberto do cliente na gold.inadimplencia —
-    fonte única de inadimplência da CTA (consumida pelo Power BI e pelo app
-    de Alocação de Bombas). Já exclui lançamento de previsão/provisão na
-    origem (dbt filtra cigam__lancamentos.previsao='1'), então cobre só
-    título de verdade. Traz tanto 'Em aberto' quanto título já baixado por
-    perda/cobrança jurídica/recuperação judicial (aparece com a classe
-    correspondente) — quem monta a nota decide se inclui um título baixado.
+def buscar_titulos_abertos(codigos_cliente: tuple) -> pd.DataFrame:
+    """Busca TODO título a receber em aberto do cliente — vencido ou a
+    vencer — direto em bronze.cigam__lancamentos: situacao='A' é a condição
+    oficial de "Aberto" no CIGAM, codigoTipo='R' restringe a título a
+    receber (exclui pagamento nosso a fornecedor). gold.inadimplencia (ver
+    buscar_titulos_inadimplencia) só cobre o vencido — é definição de
+    inadimplência —, por isso não serve sozinha pra listar título a vencer."""
+    if MODO_DEMO:
+        hoje = date.today()
+        if "900001" in [str(c) for c in codigos_cliente]:
+            return pd.DataFrame([
+                {"nf": "DEMO0001", "fatura": "DEMO0001", "vencimento": hoje - pd.Timedelta(days=95), "valor": 1150.00},
+                {"nf": "DEMO0002", "fatura": "DEMO0002", "vencimento": hoje - pd.Timedelta(days=32), "valor": 242.09},
+                {"nf": "DEMO0003", "fatura": "DEMO0003", "vencimento": hoje + pd.Timedelta(days=5), "valor": 1940.65},
+            ])
+        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
+
+    query = f"""
+    SELECT nf, fatura, dataVencimento, saldo, previsao
+    FROM `{PROJECT_ID}.bronze.cigam__lancamentos`
+    WHERE situacao = 'A' AND codigoTipo = 'R'
+      AND SAFE_CAST(codigoEmpresa AS INT64) IN UNNEST(@codigos)
     """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente))]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df.empty:
+        return pd.DataFrame(columns=["fatura", "nf", "vencimento", "valor"])
+    df = df[~df["previsao"].apply(eh_previsao)]
+    df["vencimento"] = pd.to_datetime(df["dataVencimento"], dayfirst=True, errors="coerce").dt.date
+    df["valor"] = pd.to_numeric(df["saldo"], errors="coerce")
+    df = df.dropna(subset=["vencimento", "valor"])
+    return df[["fatura", "nf", "vencimento", "valor"]]
+
+
+@st.cache_data(ttl=1800, show_spinner="Buscando títulos em aberto...")
+def buscar_titulos_inadimplencia(codigos_cliente: tuple) -> pd.DataFrame:
+    """Busca os títulos VENCIDOS do cliente na gold.inadimplencia — fonte
+    única de inadimplência da CTA (consumida pelo Power BI e pelo app de
+    Alocação de Bombas) — só pra enriquecer com diasAtraso/classe (usada em
+    _buscar_titulos_cliente); a lista completa de título em aberto vem de
+    buscar_titulos_abertos, que também cobre o que ainda não venceu."""
     if MODO_DEMO:
         hoje = date.today()
         if "900001" in [str(c) for c in codigos_cliente]:
@@ -3896,13 +3930,36 @@ DESCRICAO_POR_TIPO_COBRANCA = {
 
 @st.cache_data(ttl=1800, show_spinner="Buscando títulos do cliente...")
 def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
-    """Junta os títulos em aberto (gold.inadimplencia) com a descrição real
-    da NF (via buscar_itens_notas_fiscais_lote) quando disponível; cai pro
-    tipo_cobranca da própria inadimplência quando a NF não tem itens
-    catalogados. Pronta pra virar linha de Nota de Débito."""
-    df = buscar_titulos_inadimplencia(codigos_cliente)
+    """Lista completa de título em aberto (buscar_titulos_abertos, vencido +
+    a vencer) enriquecida com dias em atraso/classe pra quem já apareceu
+    vencido na gold.inadimplencia — título ainda não vencido não tem
+    diasAtraso ali, então calcula localmente (0, ou "A vencer" na classe).
+    Descrição vem da NF real (buscar_itens_notas_fiscais_lote) quando
+    disponível, senão do tipo_cobranca da inadimplência."""
+    df = buscar_titulos_abertos(codigos_cliente)
     if df.empty:
         return pd.DataFrame(columns=["fatura", "vencimento", "valor", "descricao", "dias_atraso", "classe"])
+
+    df_inad = buscar_titulos_inadimplencia(codigos_cliente)
+    mapa_enriquecimento = {}
+    mapa_tipo_cobranca = {}
+    for _, linha in df_inad.iterrows():
+        chave = linha["fatura"] or linha["nf"]
+        if chave:
+            mapa_enriquecimento[chave] = {"dias_atraso": linha["dias_atraso"], "classe": linha["classe"]}
+            mapa_tipo_cobranca[chave] = linha["tipo_cobranca"]
+
+    hoje = date.today()
+
+    def _enriquecer(linha):
+        chave = linha["fatura"] or linha["nf"]
+        if chave in mapa_enriquecimento:
+            return pd.Series(mapa_enriquecimento[chave])
+        dias = max(0, (hoje - linha["vencimento"]).days)
+        classe = "A vencer" if linha["vencimento"] > hoje else "Em aberto"
+        return pd.Series({"dias_atraso": dias, "classe": classe})
+
+    df[["dias_atraso", "classe"]] = df.apply(_enriquecer, axis=1)
 
     referencias = [r for r in pd.concat([df["fatura"], df["nf"]]).dropna().unique() if r]
     mapa_itens = buscar_itens_notas_fiscais_lote(referencias) if referencias else {}
@@ -3913,7 +3970,9 @@ def _buscar_titulos_cliente(codigos_cliente: tuple) -> pd.DataFrame:
             descricoes = sorted({desc for desc, _valor, _texto in itens if desc})
             if descricoes:
                 return " + ".join(descricoes)
-        return DESCRICAO_POR_TIPO_COBRANCA.get(linha["tipo_cobranca"], linha["tipo_cobranca"] or "Licenciamento de software")
+        chave = linha["fatura"] or linha["nf"]
+        tipo_cobranca = mapa_tipo_cobranca.get(chave)
+        return DESCRICAO_POR_TIPO_COBRANCA.get(tipo_cobranca, tipo_cobranca or "Licenciamento de software")
 
     df["descricao"] = df.apply(_descricao, axis=1)
     df["fatura"] = df["fatura"].fillna(df["nf"])
@@ -3968,9 +4027,10 @@ def renderizar_nota_debito():
         destinatario_endereco = st.text_input("Endereço", key="nota_debito_endereco")
 
     st.markdown(
-        "**Títulos em aberto** — marque os que entram na nota. \"Classe\" mostra se o título já foi "
-        "baixado por perda, cobrança jurídica ou recuperação judicial; título assim ainda pode entrar "
-        "na nota, mas confira antes de incluir."
+        "**Títulos em aberto** — marque os que entram na nota. Cobre vencido e a vencer. \"Classe\" "
+        "mostra se o título já foi baixado por perda, cobrança jurídica ou recuperação judicial "
+        "(vencido) ou se ainda não venceu (\"A vencer\"); título baixado ainda pode entrar na nota, "
+        "mas confira antes de incluir."
     )
     df_grade = df_titulos.rename(columns={
         "fatura": "Título", "descricao": "Descrição", "vencimento": "Vencimento", "valor": "Valor",
@@ -4004,11 +4064,11 @@ def renderizar_nota_debito():
     st.markdown("**Contato (emissor)**")
     col_nome, col_tel, col_email = st.columns(3)
     with col_nome:
-        contato_nome = st.text_input("Nome", key="nota_debito_contato_nome")
+        contato_nome = st.text_input("Nome", value="Giovana Rissi Dall'Agnol", key="nota_debito_contato_nome")
     with col_tel:
-        contato_telefone = st.text_input("Telefone", key="nota_debito_contato_telefone")
+        contato_telefone = st.text_input("Telefone", value="(51) 99242-5976", key="nota_debito_contato_telefone")
     with col_email:
-        contato_email = st.text_input("E-mail", key="nota_debito_contato_email")
+        contato_email = st.text_input("E-mail", value="giovanna.rissi@ctasmart.com.br", key="nota_debito_contato_email")
 
     st.markdown("**Assinatura (opcional)** — sem assinatura escolhida, o bloco 5 sai com a linha em branco")
     col_signatario, col_imagem = st.columns(2)
