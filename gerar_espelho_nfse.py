@@ -16,11 +16,15 @@ e desenha um PDF no mesmo formato do modelo de NFS-e da Prefeitura de Porto
 Alegre — mas claramente identificado como espelho/prévia, já que o número da
 nota e o código de verificação só existem depois da emissão oficial.
 
+O endereço do Tomador não vem na proposta — o script busca automaticamente
+na Receita Federal (via BrasilAPI, a partir do CNPJ) quando o documento do
+cliente é um CNPJ; para CPF não há consulta pública, o campo fica em branco.
+
 Uso:
     python gerar_espelho_nfse.py caminho/da/proposta.pdf [--saida DIR] [--aliquota 2.0]
 
 Dependências (não fazem parte do requirements.txt do app Streamlit):
-    pip install pdfplumber reportlab
+    pip install pdfplumber reportlab requests
 """
 
 import argparse
@@ -29,6 +33,7 @@ import re
 from datetime import date, timedelta
 
 import pdfplumber
+import requests
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -97,6 +102,51 @@ def formatar_moeda(valor: float) -> str:
 
 def formatar_data(d: date) -> str:
     return d.strftime("%d/%m/%y")
+
+
+def _formatar_cep(cep: str) -> str:
+    digitos = re.sub(r"\D", "", cep or "")
+    return f"{digitos[:5]}-{digitos[5:]}" if len(digitos) == 8 else cep
+
+
+def _formatar_telefone(numero: str) -> str:
+    digitos = re.sub(r"\D", "", numero or "")
+    if len(digitos) == 11:
+        return f"({digitos[:2]}) {digitos[2:7]}-{digitos[7:]}"
+    if len(digitos) == 10:
+        return f"({digitos[:2]}) {digitos[2:6]}-{digitos[6:]}"
+    return numero
+
+
+def consultar_endereco_cnpj(documento: str) -> dict:
+    """Busca o endereço do Tomador na Receita Federal via BrasilAPI.
+
+    A proposta só traz cidade/UF do cliente, não o endereço completo. Só dá
+    pra consultar quando o documento é CNPJ (14 dígitos) — CPF não tem
+    consulta pública de endereço. Qualquer falha de rede/CNPJ inválido
+    retorna vazio em vez de derrubar a geração do espelho.
+    """
+    digitos = re.sub(r"\D", "", documento or "")
+    if len(digitos) != 14:
+        return {}
+    try:
+        resposta = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{digitos}", timeout=15)
+        resposta.raise_for_status()
+        dados = resposta.json()
+    except Exception as erro:
+        print(f"[aviso] Não consegui consultar o CNPJ {documento} na Receita Federal: {erro}")
+        return {}
+
+    return {
+        "logradouro": dados.get("logradouro") or "",
+        "numero": dados.get("numero") or "",
+        "complemento": dados.get("complemento") or "",
+        "bairro": dados.get("bairro") or "",
+        "municipio": dados.get("municipio") or "",
+        "uf": dados.get("uf") or "",
+        "cep": _formatar_cep(dados.get("cep", "")),
+        "telefone": _formatar_telefone(dados.get("ddd_telefone_1", "")),
+    }
 
 
 def _split_coluna(celula: str) -> list:
@@ -191,6 +241,9 @@ def parse_proposta(caminho_pdf: str) -> dict:
     if not (nome_tomador and cidade_uf_doc):
         raise ValueError("Não consegui identificar o Tomador do Serviço na proposta.")
 
+    documento_tomador = cidade_uf_doc.group(3).strip()
+    endereco_tomador = consultar_endereco_cnpj(documento_tomador)
+
     return {
         "numero_proposta": numero_proposta.group(1) if numero_proposta else "",
         "data_proposta": data_proposta.group(1) if data_proposta else "",
@@ -199,9 +252,10 @@ def parse_proposta(caminho_pdf: str) -> dict:
             "nome": nome_tomador.group(1).strip(),
             "cidade": cidade_uf_doc.group(1).strip(),
             "uf": cidade_uf_doc.group(2).strip(),
-            "documento": cidade_uf_doc.group(3).strip(),
+            "documento": documento_tomador,
             "email": email_resp.group(1).strip() if email_resp else "",
             "responsavel": nome_resp.group(1).strip() if nome_resp else "",
+            "endereco": endereco_tomador,
         },
         "adesao_total": adesao_total,
         "instalacao_total": instalacao_total,
@@ -246,7 +300,6 @@ def montar_notas(dados: dict, aliquota: float, data_emissao: date) -> list:
             "base_calculo": valor_total,
             "total_issqn": total_issqn,
             "valor_liquido": valor_total,  # ISSQN não retido nos exemplos de referência
-            "recorrente": chave == "licenciamento",
         })
     return notas
 
@@ -279,6 +332,17 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
         ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ])
+    # grades de valor (ISSQN/Retenções): título + valor centralizados e
+    # alinhados ao meio da célula, senão um cabeçalho que quebra em 2 linhas
+    # (ex: "Dedução da base de Cálculo") fica desalinhado com os vizinhos
+    # de 1 linha só
+    borda_centro = TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ])
 
     # título
     elementos.append(Table(
@@ -306,23 +370,32 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     )
     elementos.append(Table([[Paragraph(prestador_txt, _estilo_texto())]], colWidths=[largura_util], style=borda))
 
-    # tomador
+    # tomador — endereço vem da consulta de CNPJ (proposta só traz cidade/UF)
+    endereco = tomador.get("endereco") or {}
+    if endereco.get("logradouro"):
+        linha_endereco = f"{endereco['logradouro']}, {endereco['numero']}"
+        if endereco.get("complemento"):
+            linha_endereco += f" - {endereco['complemento']}"
+        if endereco.get("bairro"):
+            linha_endereco += f" - {endereco['bairro']}"
+        linha_endereco += f" - Cep: {endereco['cep']}<br/>{endereco['municipio']}/{endereco['uf']}"
+        linha_telefone = f"Telefone: {endereco['telefone']} " if endereco.get("telefone") else ""
+    else:
+        linha_endereco = (
+            f"{tomador['cidade']}/{tomador['uf']}<br/>"
+            "<i>Endereço completo não encontrado na consulta de CNPJ — confira no cadastro do cliente "
+            "antes de emitir a nota oficial.</i>"
+        )
+        linha_telefone = ""
     tomador_txt = (
         f"<b>Tomador do Serviço</b><br/>{tomador['nome']} - CPF/CNPJ: {tomador['documento']}<br/>"
-        f"{tomador['cidade']}/{tomador['uf']}<br/>"
-        f"E-mail: {tomador['email'] or '(não informado na proposta)'}"
-        "<br/><i>Endereço completo e telefone não constam na proposta — confira no cadastro do cliente "
-        "antes de emitir a nota oficial.</i>"
+        f"{linha_endereco}<br/>"
+        f"{linha_telefone}E-mail: {tomador['email'] or '(não informado na proposta)'}"
     )
     elementos.append(Table([[Paragraph(tomador_txt, _estilo_texto())]], colWidths=[largura_util], style=borda))
 
     # vencimentos
-    if nota["recorrente"]:
-        linha_venc = " ".join(
-            f"{formatar_data(d)}  {formatar_moeda(v)}" for d, v in nota["vencimentos"]
-        ) + "  (recorrente mensalmente enquanto o contrato estiver ativo)"
-    else:
-        linha_venc = "     ".join(f"{formatar_data(d)}  {formatar_moeda(v)}" for d, v in nota["vencimentos"])
+    linha_venc = "     ".join(f"{formatar_data(d)}  {formatar_moeda(v)}" for d, v in nota["vencimentos"])
     elementos.append(Table(
         [[Paragraph(f"<b>Vencimentos</b><br/>{linha_venc}", _estilo_texto())]],
         colWidths=[largura_util], style=borda,
@@ -335,23 +408,23 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     ))
 
     # ISSQN
-    cabecalho_issqn = [_celula(t, negrito=True) for t in
+    cabecalho_issqn = [_celula(t, negrito=True, alinhamento=TA_CENTER) for t in
                        ["Cod.Atividade do Município", "Alíquota", "Item da LC 116/2003", "Cod. Nacional Ativ. Econômica"]]
-    valores_issqn = [_celula(t) for t in [
+    valores_issqn = [_celula(t, alinhamento=TA_CENTER) for t in [
         nota["tipo"]["cod_atividade"], f'{nota["aliquota"]:.2f}'.replace(".", ","),
         nota["tipo"]["item_lc116"], nota["tipo"]["cnae"],
     ]]
-    tabela_issqn_1 = Table([cabecalho_issqn, valores_issqn], colWidths=[largura_util / 4] * 4, style=borda)
+    tabela_issqn_1 = Table([cabecalho_issqn, valores_issqn], colWidths=[largura_util / 4] * 4, style=borda_centro)
 
-    cabecalho_issqn_2 = [_celula(t, negrito=True) for t in [
+    cabecalho_issqn_2 = [_celula(t, negrito=True, alinhamento=TA_CENTER) for t in [
         "Valor total dos serviços", "Dedução da base de Cálculo", "Base de Cálculo",
         "Desconto Padrão", "Total ISSQN", "ISSQN Retido",
     ]]
-    valores_issqn_2 = [_celula(t) for t in [
+    valores_issqn_2 = [_celula(t, alinhamento=TA_CENTER) for t in [
         formatar_moeda(nota["valor_total_servicos"]), formatar_moeda(0), formatar_moeda(nota["base_calculo"]),
         formatar_moeda(0), formatar_moeda(nota["total_issqn"]), "Não",
     ]]
-    tabela_issqn_2 = Table([cabecalho_issqn_2, valores_issqn_2], colWidths=[largura_util / 6] * 6, style=borda)
+    tabela_issqn_2 = Table([cabecalho_issqn_2, valores_issqn_2], colWidths=[largura_util / 6] * 6, style=borda_centro)
 
     # tabelas aninhadas (tabela dentro de célula de tabela) herdam o padding
     # default do reportlab (6pt) se não for zerado — como as tabelas internas
@@ -370,11 +443,13 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     ))
 
     # retenções
-    cabecalho_ret = [_celula(t, negrito=True) for t in ["PIS", "COFINS", "INSS", "IR", "CSLL", "Outras retenções", "ISSQN"]]
-    valores_ret = [_celula(formatar_moeda(0)) for _ in range(6)] + [_celula("0,00")]
+    cabecalho_ret = [_celula(t, negrito=True, alinhamento=TA_CENTER) for t in
+                      ["PIS", "COFINS", "INSS", "IR", "CSLL", "Outras retenções", "ISSQN"]]
+    valores_ret = [_celula(formatar_moeda(0), alinhamento=TA_CENTER) for _ in range(6)] + \
+        [_celula("0,00", alinhamento=TA_CENTER)]
     elementos.append(Table(
         [[Paragraph("<b>Retenções de impostos</b>", _estilo_texto())],
-         [Table([cabecalho_ret, valores_ret], colWidths=[largura_util / 7] * 7, style=borda)]],
+         [Table([cabecalho_ret, valores_ret], colWidths=[largura_util / 7] * 7, style=borda_centro)]],
         colWidths=[largura_util], style=sem_padding,
     ))
 
