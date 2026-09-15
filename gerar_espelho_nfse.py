@@ -2,10 +2,13 @@
 Gera um "espelho" (prévia, sem validade fiscal) das Notas Fiscais de Serviço
 a partir de uma Proposta Comercial da CTA Smart (PDF).
 
-Cada proposta assinada gera 3 notas fiscais separadas:
-  1. Adesão        (parametrização/configuração do sistema — cobrança única)
-  2. Instalação     (deslocamento técnico + instalação física — cobrança única)
-  3. Licenciamento  (mensalidade — comodato do equipamento + licenciamento)
+Cada proposta assinada gera 2 notas fiscais de serviço:
+  1. Instalação     (deslocamento técnico + instalação física — cobrança única)
+  2. Licenciamento  (mensalidade — comodato do equipamento + licenciamento)
+
+A Adesão (venda/configuração dos equipamentos) não é nota de serviço — é
+nota de venda de mercadoria, emitida pelo operacional por fora deste
+espelho.
 
 O script lê o ANEXO I da proposta (tabela de produtos e o quadro "Preços
 Totais"), calcula a base de cálculo, o ISSQN e o valor líquido de cada nota,
@@ -45,16 +48,12 @@ PRESTADOR = {
 # Enquadramento fiscal de cada tipo de nota — os códigos abaixo foram lidos
 # diretamente de NFS-e já emitidas pela CTA Smart para o mesmo tipo de
 # serviço; a alíquota default (2%) é a de Porto Alegre/RS.
+#
+# A Adesão (venda/configuração dos equipamentos) não entra aqui: ela vira
+# nota de venda de mercadoria, não nota de serviço, e quem emite é o
+# operacional — este espelho cobre só o que é NFS-e de fato (Instalação e
+# Licenciamento).
 TIPOS_NOTA = {
-    "adesao": {
-        "titulo": "ADESÃO",
-        "codigo_servico": "90000100003",
-        "descricao_servico": "CONFIGURAÇAO",
-        "cod_atividade": "0-CONFIGURACAO",
-        "item_lc116": "0",
-        "cnae": "6203100",
-        "filtro_produto": lambda p: p["adesao_unit"] > 0,
-    },
     "instalacao": {
         "titulo": "INSTALAÇÃO",
         "codigo_servico": "90000100004",
@@ -227,10 +226,7 @@ def montar_notas(dados: dict, aliquota: float, data_emissao: date) -> list:
         itens = [p for p in dados["produtos"] if tipo["filtro_produto"](p)]
         descricao_itens = " + ".join(p["nome"] for p in itens) or "(nenhum item identificado)"
 
-        if chave == "adesao":
-            valor_total = dados["adesao_total"]
-            vencimentos = _vencimentos_parcelados(valor_total, dados["parcelas_adesao"], data_emissao)
-        elif chave == "instalacao":
+        if chave == "instalacao":
             valor_total = dados["instalacao_total"]
             vencimentos = _vencimentos_parcelados(valor_total, dados["parcelas_instalacao"], data_emissao)
         else:  # licenciamento — mensalidade recorrente, cobrada mês a mês após carência
@@ -357,10 +353,20 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     ]]
     tabela_issqn_2 = Table([cabecalho_issqn_2, valores_issqn_2], colWidths=[largura_util / 6] * 6, style=borda)
 
+    # tabelas aninhadas (tabela dentro de célula de tabela) herdam o padding
+    # default do reportlab (6pt) se não for zerado — como as tabelas internas
+    # já são dimensionadas para ocupar largura_util inteira, esse padding
+    # extra empurrava o conteúdo pra fora da borda externa
+    sem_padding = TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.black),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ])
+
     elementos.append(Table(
         [[Paragraph("<b>Imposto Sobre Serviços de Qualquer Natureza - ISSQN</b>", _estilo_texto())],
          [tabela_issqn_1], [tabela_issqn_2]],
-        colWidths=[largura_util], style=TableStyle([("BOX", (0, 0), (-1, -1), 0.75, colors.black)]),
+        colWidths=[largura_util], style=sem_padding,
     ))
 
     # retenções
@@ -369,7 +375,7 @@ def gerar_pdf_nota(nota: dict, tomador: dict, data_emissao: date, numero_propost
     elementos.append(Table(
         [[Paragraph("<b>Retenções de impostos</b>", _estilo_texto())],
          [Table([cabecalho_ret, valores_ret], colWidths=[largura_util / 7] * 7, style=borda)]],
-        colWidths=[largura_util], style=TableStyle([("BOX", (0, 0), (-1, -1), 0.75, colors.black)]),
+        colWidths=[largura_util], style=sem_padding,
     ))
 
     # valor líquido
