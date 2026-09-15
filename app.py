@@ -3386,13 +3386,64 @@ def _renderizar_cabecalho():
             f"""
             <div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
                 <img src="data:image/png;base64,{logo_b64}" style="height:104px; width:auto;">
-                <h1 style="margin:0; font-size:2.25rem;">Histórico de Mensalidade — CIGAM</h1>
+                <h1 style="margin:0; font-size:2.25rem;">Análises Financeiras</h1>
             </div>
             """,
             unsafe_allow_html=True,
         )
     else:
-        st.title("Histórico de Mensalidade — CIGAM", anchor=False)
+        st.title("Análises Financeiras", anchor=False)
+
+
+# Cores do design system usado na Nota de Débito (COBALT/FUEL_GREEN em
+# gerar_nota_debito.py) — reaproveitadas aqui só como strings CSS pra não
+# criar dependência entre os dois módulos por causa de 2 cores.
+_COR_GRUPO_ANALISE = "#0040D0"
+_COR_GRUPO_FERRAMENTAS = "#00A97A"
+
+
+def _renderizar_legenda_abas():
+    """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
+    econômico' (Análise) de 'Espelho NFS-e' e 'Nota de Débito' (Ferramentas).
+    st.tabs não tem grupo/cor nativo — o CSS mira as abas pelo atributo
+    data-key (posição 0-3, estável entre versões do Streamlit; bem mais
+    confiável que mirar pela classe emotion-cache, que muda a cada build) e
+    pinta o texto/sublinhado da aba ativa por grupo, além de uma borda
+    separando os dois grupos entre a aba 1 e a 2."""
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:28px; margin:0.4rem 0 -0.6rem 0;">
+            <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
+                         text-transform:uppercase; color:{_COR_GRUPO_ANALISE};">🔎 Análise</span>
+            <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
+                         text-transform:uppercase; color:{_COR_GRUPO_FERRAMENTAS};">🛠️ Ferramentas</span>
+        </div>
+        <style>
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
+            border-left: 1px solid rgba(138,149,168,0.4);
+            margin-left: 8px;
+            padding-left: 16px;
+        }}
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p {{
+            color: {_COR_GRUPO_ANALISE} !important;
+        }}
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator {{
+            background: {_COR_GRUPO_ANALISE} !important;
+        }}
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p {{
+            color: {_COR_GRUPO_FERRAMENTAS} !important;
+        }}
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator {{
+            background: {_COR_GRUPO_FERRAMENTAS} !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def buscar_grupo_economico(termo: str) -> pd.DataFrame:
@@ -4165,6 +4216,7 @@ def renderizar_nota_debito():
 
 
 _renderizar_cabecalho()
+_renderizar_legenda_abas()
 
 aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
     ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
