@@ -3384,8 +3384,8 @@ def _renderizar_cabecalho():
         logo_b64 = base64.b64encode(open("logo.png", "rb").read()).decode()
         st.markdown(
             f"""
-            <div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
-                <img src="data:image/png;base64,{logo_b64}" style="height:104px; width:auto;">
+            <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:0.5rem;">
+                <img src="data:image/png;base64,{logo_b64}" style="height:120px; width:auto;">
                 <h1 style="margin:0; font-size:2.25rem;">Análises Financeiras</h1>
             </div>
             """,
@@ -3404,24 +3404,34 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 def _renderizar_legenda_abas():
     """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
-    econômico' (Análise) de 'Espelho NFS-e' e 'Nota de Débito' (Ferramentas).
-    st.tabs não tem grupo/cor nativo — o CSS mira as abas pelo atributo
-    data-key (posição 0-3, estável entre versões do Streamlit; bem mais
-    confiável que mirar pela classe emotion-cache, que muda a cada build) e
-    pinta o texto/sublinhado da aba ativa por grupo, além de uma borda
-    separando os dois grupos entre a aba 1 e a 2."""
+    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
+    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
+    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
+    mirar pela classe emotion-cache, que muda a cada build):
+    - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
+      no container flex (truque clássico de flexbox pra "quebrar" um grupo
+      de itens em dois blocos nas pontas), com uma borda antes marcando a
+      separação;
+    - pinta o texto/sublinhado da aba ativa com a cor do grupo dela.
+    O rótulo Análise/Ferramentas acima usa a mesma técnica (space-between)
+    pra ficar alinhado com as pontas da barra de abas."""
     st.markdown(
         f"""
-        <div style="display:flex; gap:28px; margin:0.4rem 0 -0.6rem 0;">
+        <div style="display:flex; justify-content:space-between; margin:0.4rem 0 -0.6rem 0;">
             <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
                          text-transform:uppercase; color:{_COR_GRUPO_ANALISE};">🔎 Análise</span>
             <span style="font-size:0.72rem; font-weight:700; letter-spacing:.06em;
                          text-transform:uppercase; color:{_COR_GRUPO_FERRAMENTAS};">🛠️ Ferramentas</span>
         </div>
         <style>
+        div[data-testid="stTabs"] div[role="tablist"] {{
+            display: flex !important;
+            width: 100% !important;
+        }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
+            margin-left: auto !important;
             border-left: 1px solid rgba(138,149,168,0.4);
-            margin-left: 8px;
             padding-left: 16px;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
@@ -4003,6 +4013,27 @@ FILTROS_DESCRICAO = [
 ]
 
 
+def calcular_juros(valor: float, dias_atraso) -> float:
+    """Juros de mora sobre título vencido — mesma fórmula da planilha de
+    cobrança usada pelo financeiro:
+    =IF(AND(incluir;aplicar_juros); IF(dias<=4; ROUND(ROUND(valor*0,01/30;2)*dias;2);
+    ROUND(ROUND(valor*0,02;2)+ROUND(ROUND(valor*0,01/30;2)*dias;2);2)); 0)
+
+    1% ao mês pro-rata diário (0,01/30 por dia) sempre que há atraso, mais
+    multa de 2% quando o atraso passa de 4 dias (tolerância). O AND(incluir;
+    aplicar_juros) da planilha já é replicado por quem chama esta função: só
+    soma juros pra título marcado como incluído E com o toggle "aplicar
+    juros" ligado."""
+    dias = int(dias_atraso or 0)
+    if dias <= 0:
+        return 0.0
+    juros_diario = round(round(valor * 0.01 / 30, 2) * dias, 2)
+    if dias <= 4:
+        return juros_diario
+    multa = round(valor * 0.02, 2)
+    return round(multa + juros_diario, 2)
+
+
 def normalizar_descricao(texto) -> str:
     """Troca a descrição bruta do CIGAM (item da NF ou tipo_cobranca da
     inadimplência — ex.: 'LICENCIAMENTO PEDESTAL DUPLO', 'Adesão/Config',
@@ -4132,11 +4163,18 @@ def renderizar_nota_debito():
 
     selecionados = titulos_editados[titulos_editados["Incluir"]]
 
-    col_num, col_data = st.columns(2)
+    col_num, col_data, col_juros = st.columns(3)
     with col_num:
         numero_input = st.text_input("Número da nota", placeholder="Ex: 006/2026", key="nota_debito_numero")
     with col_data:
         data_emissao_input = st.date_input("Data de emissão", value=date.today(), key="nota_debito_data")
+    with col_juros:
+        st.markdown("&nbsp;")
+        aplicar_juros = st.toggle(
+            "Cobrar juros de mora", key="nota_debito_aplicar_juros",
+            help="Multa de 2% (atraso acima de 4 dias) + juros de 1% ao mês pro-rata diário sobre "
+                 "cada título incluído — soma uma linha \"Juros de mora\" por título vencido na nota.",
+        )
 
     st.markdown("**Contato (emissor)**")
     col_nome, col_tel, col_email = st.columns(3)
@@ -4164,14 +4202,22 @@ def renderizar_nota_debito():
         elif not numero_input.strip():
             st.warning("Informe o número da nota.")
         else:
-            itens_validos = [
-                {
+            itens_validos = []
+            for _, linha in selecionados.iterrows():
+                valor_titulo = float(linha["Valor"])
+                itens_validos.append({
                     "titulo": str(linha["Título"]), "descricao": str(linha["Descrição"]),
-                    "vencimento": linha["Vencimento"], "valor": float(linha["Valor"]),
+                    "vencimento": linha["Vencimento"], "valor": valor_titulo,
                     "numero_nfse": str(linha["Nº NFS-e (opcional)"] or "").strip(),
-                }
-                for _, linha in selecionados.iterrows()
-            ]
+                })
+                if aplicar_juros:
+                    juros = calcular_juros(valor_titulo, linha["Dias em atraso"])
+                    if juros > 0:
+                        itens_validos.append({
+                            "titulo": str(linha["Título"]), "descricao": "Juros de mora",
+                            "vencimento": linha["Vencimento"], "valor": juros,
+                            "numero_nfse": "",
+                        })
 
             numero_puro, _, ano_puro = numero_input.strip().partition("/")
             ano_puro = ano_puro or str(data_emissao_input.year)

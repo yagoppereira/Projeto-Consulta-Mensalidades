@@ -150,7 +150,7 @@ def gerar_pdf_nota_debito(numero: str, data_emissao: date, contato: dict,
     """
     doc = SimpleDocTemplate(
         caminho_saida, pagesize=A4,
-        leftMargin=0.6 * inch, rightMargin=0.6 * inch, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch, topMargin=0.32 * inch, bottomMargin=0.6 * inch,
     )
     largura_util = doc.width
     elementos = []
