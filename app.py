@@ -813,25 +813,38 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     df = df_parcelas.copy()
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
 
-    # FILTRO PRINCIPAL: exclui previsão/projeção futura (ver eh_previsao)
-    if "previsao" in df.columns:
-        df = df[~df["previsao"].apply(eh_previsao)]
-
-    # MÊS DE REFERÊNCIA (data_ref) agora usa a MESMA data do critério de
-    # corte (emissão), não mais vencimento. Descobrimos com dado real
-    # (cliente HOK, contrato 1146) que usar vencimento pra agrupar por
-    # mês criava colisões: esse contrato fatura ~3-4 semanas antes do
-    # vencimento, e às vezes isso empurra a emissão de DOIS meses
-    # consecutivos pro mesmo mês de vencimento — fazendo parecer que tem
-    # "cobrança duplicada" num mês só, quando na verdade são duas
-    # cobranças de meses DIFERENTES que só coincidem no vencimento.
-    # Confirmamos isso agrupando por emissão: os "meses suspeitos" se
-    # separaram corretamente em dois meses cada. Emissão é uma data mais
-    # fiel ao período de referência de verdade do que vencimento.
+    # data de emissão real — calculada ANTES do filtro de previsão porque é
+    # usada pra dar override nele logo abaixo (também é a mesma data usada
+    # depois como mês de referência, ver comentário mais adiante)
     if "emissao" in df.columns:
         df["data_emissao"] = pd.to_datetime(df["emissao"], dayfirst=True, errors="coerce")
     else:
         df["data_emissao"] = pd.NaT
+
+    # FILTRO PRINCIPAL: exclui previsão/projeção futura (ver eh_previsao) —
+    # EXCETO quando a própria linha já tem emissão real registrada. O flag
+    # 'previsao' do CIGAM pode ficar desatualizado (True) numa parcela que
+    # JÁ foi faturada de verdade — descoberto com dado real (grupo HOK):
+    # contrato ativo, com NF emitida mês a mês de Jan/26 a Jul/26
+    # confirmada na Nota Fiscal, aparecia no gráfico como se tivesse
+    # "encerrado" em janeiro, porque a previsão continuava marcada True
+    # mesmo depois de faturado. Emissão real é prova concreta de NF de
+    # verdade e pesa mais que o flag.
+    if "previsao" in df.columns:
+        marcada_previsao = df["previsao"].apply(eh_previsao)
+        df = df[~marcada_previsao | df["data_emissao"].notna()]
+
+    # MÊS DE REFERÊNCIA (data_ref) usa a MESMA data do critério de corte
+    # (emissão), não vencimento. Descobrimos com dado real (cliente HOK,
+    # contrato 1146) que usar vencimento pra agrupar por mês criava
+    # colisões: esse contrato fatura ~3-4 semanas antes do vencimento, e
+    # às vezes isso empurra a emissão de DOIS meses consecutivos pro mesmo
+    # mês de vencimento — fazendo parecer que tem "cobrança duplicada" num
+    # mês só, quando na verdade são duas cobranças de meses DIFERENTES que
+    # só coincidem no vencimento. Confirmamos isso agrupando por emissão:
+    # os "meses suspeitos" se separaram corretamente em dois meses cada.
+    # Emissão é uma data mais fiel ao período de referência de verdade do
+    # que vencimento.
 
     # corte é ANTES do mês corrente (< mes_atual), não até ele (<= mes_atual):
     # o mês em andamento não fechou ainda, então nem todo subcontrato do
