@@ -2207,12 +2207,12 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
 
         df_equip_ponto = pd.DataFrame([
             {
+                "NF": e.get("nf", ""),
+                "Valor": formatar_moeda(e.get("valor", 0)),
+                "Tipo": str(e.get("tipo", "")).capitalize(),
+                "Variação": _marca_variacao(e),
                 "Descrição": _rotulo_equipamento(e.get("texto")),
                 "ID": _id_aparelho(e.get("texto")),
-                "Tipo": str(e.get("tipo", "")).capitalize(),
-                "Valor": formatar_moeda(e.get("valor", 0)),
-                "Variação": _marca_variacao(e),
-                "NF": e.get("nf", ""),
             }
             for e in equipamentos
         ])
@@ -3012,7 +3012,7 @@ def relatorio_cliente(
     codigos_cliente, nome_cliente, cnpj = resultado
 
     st.header(nome_cliente, anchor=False)
-    st.caption(f"CNPJ/CPF: {cnpj or 'N/D'}")
+    st.caption(f"CNPJ/CPF: {_formatar_cnpj_cpf_mascara(cnpj) if cnpj else 'N/D'}")
     if len(codigos_cliente) > 1:
         st.caption(f"Consolidando {len(codigos_cliente)} cadastros CIGAM sob o mesmo CNPJ: {codigos_cliente}")
     else:
@@ -3605,7 +3605,7 @@ def relatorio_grupo(termo: str):
             linhas_resumo.append({
                 "Código": int(codigo),
                 "Empresa": emp["Cliente_Nome"],
-                "CNPJ": emp["_cnpj_norm"],
+                "CNPJ": _formatar_cnpj_cpf_mascara(emp["_cnpj_norm"]),
                 "Município/UF": municipios_uf.get(int(codigo), ""),
                 "Situação": "Ativo" if qtd_contratos_ativos > 0 else "Inativo",
                 "Contratos ativos": qtd_contratos_ativos,
@@ -3790,7 +3790,7 @@ def relatorio_grupo(termo: str):
             if len(ativos):
                 st.markdown("**Contratos ativos**")
                 st.dataframe(
-                    renomear_para_exibicao(ativos[["codigoContrato", "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento"]]),
+                    renomear_para_exibicao(ativos[["codigoContrato", "Descricao_Material", "Descricao", "observacao", "Mensalidade", "diaVencimento"]]),
                     use_container_width=True, hide_index=True,
                 )
             else:
