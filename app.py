@@ -833,19 +833,27 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     else:
         df["data_emissao"] = pd.NaT
 
+    # corte é ANTES do mês corrente (< mes_atual), não até ele (<= mes_atual):
+    # o mês em andamento não fechou ainda, então nem todo subcontrato do
+    # grupo necessariamente já gerou a NF dele — incluir esse mês parcial
+    # faz o total (de cliente OU de grupo econômico inteiro) despencar no
+    # último ponto do gráfico, como se tivesse caído faturamento que na
+    # verdade só ainda não foi emitido. A regra de excluir previsão (acima)
+    # não resolve isso sozinha: previsão é sobre parcela FUTURA projetada,
+    # não sobre "esse mês específico ainda não fechou pra todo mundo".
     mes_atual = pd.Timestamp.now().to_period("M")
     if df["data_emissao"].notna().any():
         # tem pelo menos uma emissão real registrada nesse subcontrato ->
         # usa 'emissao' tanto pro corte (provisão futura fica de fora)
         # quanto pro mês de referência (agrupamento no gráfico)
-        df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") <= mes_atual)]
+        df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") < mes_atual)]
         df["data_ref"] = df["data_emissao"]
     elif "data" in df.columns and pd.to_datetime(df["data"], dayfirst=True, errors="coerce").notna().any():
         # nenhuma linha tem 'emissao' preenchida -> esse schema
         # provavelmente não usa esse campo; cai pra 'data' como um todo,
         # tanto pro corte quanto pro mês de referência
         df["data_lancamento"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
-        df = df[df["data_lancamento"].notna() & (df["data_lancamento"].dt.to_period("M") <= mes_atual)]
+        df = df[df["data_lancamento"].notna() & (df["data_lancamento"].dt.to_period("M") < mes_atual)]
         df["data_ref"] = df["data_lancamento"]
     else:
         # fallback final: nem emissao nem data existem -> volta a usar
@@ -853,7 +861,7 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
         # (única situação em que data_ref ainda vem de vencimento)
         df["data_ref"] = pd.to_datetime(df["vencimentoOriginal"], dayfirst=True, errors="coerce")
         df["data_ref"] = df["data_ref"].fillna(pd.to_datetime(df["vencimento"], dayfirst=True, errors="coerce"))
-        df = df[df["data_ref"].isna() | (df["data_ref"].dt.to_period("M") <= mes_atual)]
+        df = df[df["data_ref"].isna() | (df["data_ref"].dt.to_period("M") < mes_atual)]
 
     df["mes"] = df["data_ref"].dt.to_period("M")
     df["chave"] = df["fatura"].fillna(df["lancamento"].astype(str))
@@ -3759,7 +3767,11 @@ def relatorio_grupo(termo: str):
         ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else pd.DataFrame()
         equip_emp = df_bombas[df_bombas["cliente_cigam_pagante"] == cod].copy() if df_bombas is not None else pd.DataFrame()
 
-        rotulo = f"{emp['Empresa']} · {emp['CNPJ']} — {formatar_moeda(emp['Mensalidade'])}"
+        qtd_equip_rotulo = int(emp["Equipamentos"]) if pd.notna(emp.get("Equipamentos")) else 0
+        rotulo = (
+            f"{emp['Empresa']} · {emp['CNPJ']} — {formatar_moeda(emp['Mensalidade'])} · "
+            f"{qtd_equip_rotulo} equipamento(s)"
+        )
         with st.expander(rotulo, expanded=False):
             if len(ativos):
                 st.markdown("**Contratos ativos**")
