@@ -813,26 +813,27 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     df = df_parcelas.copy()
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
 
-    # data de emissão real — calculada ANTES do filtro de previsão porque é
-    # usada pra dar override nele logo abaixo (também é a mesma data usada
-    # depois como mês de referência, ver comentário mais adiante)
+    # FILTRO PRINCIPAL: exclui previsão/projeção futura (ver eh_previsao).
+    #
+    # Já tentamos um override aqui ("não exclui se a linha tiver emissão
+    # real") pra cobrir o caso de um contrato ativo aparecer como
+    # "encerrado" indevidamente — revertido: descobrimos com dado real
+    # (grupo HOK, contrato 1076/1080) que isso deixava passar parcela
+    # previsão com uma emissão preenchida em lote/copiada, sem ser uma NF
+    # de verdade — inflava um único mês pra mais de 10x o valor real
+    # (composição por item batia só uma fração do "valor" mostrado), o que
+    # o próprio ERP não confirmava. O flag `previsao` sozinho, mesmo que
+    # ocasionalmente desatualizado, causa MENOS dano do que confiar numa
+    # emissão que pode estar duplicada/copiada. Fica em aberto encontrar
+    # um sinal melhor (ex.: exigir que a fatura resolva pra um item de NF
+    # real, não só uma data de emissão) antes de tentar de novo.
+    if "previsao" in df.columns:
+        df = df[~df["previsao"].apply(eh_previsao)]
+
     if "emissao" in df.columns:
         df["data_emissao"] = pd.to_datetime(df["emissao"], dayfirst=True, errors="coerce")
     else:
         df["data_emissao"] = pd.NaT
-
-    # FILTRO PRINCIPAL: exclui previsão/projeção futura (ver eh_previsao) —
-    # EXCETO quando a própria linha já tem emissão real registrada. O flag
-    # 'previsao' do CIGAM pode ficar desatualizado (True) numa parcela que
-    # JÁ foi faturada de verdade — descoberto com dado real (grupo HOK):
-    # contrato ativo, com NF emitida mês a mês de Jan/26 a Jul/26
-    # confirmada na Nota Fiscal, aparecia no gráfico como se tivesse
-    # "encerrado" em janeiro, porque a previsão continuava marcada True
-    # mesmo depois de faturado. Emissão real é prova concreta de NF de
-    # verdade e pesa mais que o flag.
-    if "previsao" in df.columns:
-        marcada_previsao = df["previsao"].apply(eh_previsao)
-        df = df[~marcada_previsao | df["data_emissao"].notna()]
 
     # MÊS DE REFERÊNCIA (data_ref) usa a MESMA data do critério de corte
     # (emissão), não vencimento. Descobrimos com dado real (cliente HOK,
