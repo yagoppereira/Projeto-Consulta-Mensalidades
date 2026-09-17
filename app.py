@@ -2207,12 +2207,12 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
 
         df_equip_ponto = pd.DataFrame([
             {
+                "NF": e.get("nf", ""),
+                "Valor": formatar_moeda(e.get("valor", 0)),
+                "Tipo": str(e.get("tipo", "")).capitalize(),
+                "Variação": _marca_variacao(e),
                 "Descrição": _rotulo_equipamento(e.get("texto")),
                 "ID": _id_aparelho(e.get("texto")),
-                "Tipo": str(e.get("tipo", "")).capitalize(),
-                "Valor": formatar_moeda(e.get("valor", 0)),
-                "Variação": _marca_variacao(e),
-                "NF": e.get("nf", ""),
             }
             for e in equipamentos
         ])
@@ -3012,7 +3012,7 @@ def relatorio_cliente(
     codigos_cliente, nome_cliente, cnpj = resultado
 
     st.header(nome_cliente, anchor=False)
-    st.caption(f"CNPJ/CPF: {cnpj or 'N/D'}")
+    st.caption(f"CNPJ/CPF: {_formatar_cnpj_cpf_mascara(cnpj) if cnpj else 'N/D'}")
     if len(codigos_cliente) > 1:
         st.caption(f"Consolidando {len(codigos_cliente)} cadastros CIGAM sob o mesmo CNPJ: {codigos_cliente}")
     else:
@@ -3605,7 +3605,7 @@ def relatorio_grupo(termo: str):
             linhas_resumo.append({
                 "Código": int(codigo),
                 "Empresa": emp["Cliente_Nome"],
-                "CNPJ": emp["_cnpj_norm"],
+                "CNPJ": _formatar_cnpj_cpf_mascara(emp["_cnpj_norm"]),
                 "Município/UF": municipios_uf.get(int(codigo), ""),
                 "Situação": "Ativo" if qtd_contratos_ativos > 0 else "Inativo",
                 "Contratos ativos": qtd_contratos_ativos,
@@ -3790,7 +3790,7 @@ def relatorio_grupo(termo: str):
             if len(ativos):
                 st.markdown("**Contratos ativos**")
                 st.dataframe(
-                    renomear_para_exibicao(ativos[["codigoContrato", "Descricao_Material", "Descricao", "Mensalidade", "diaVencimento"]]),
+                    renomear_para_exibicao(ativos[["codigoContrato", "Descricao_Material", "Descricao", "observacao", "Mensalidade", "diaVencimento"]]),
                     use_container_width=True, hide_index=True,
                 )
             else:
@@ -4173,6 +4173,13 @@ def renderizar_nota_debito():
                 codigos, nome, cnpj = resultado_cliente
                 st.session_state["nota_debito_cliente"] = {"codigos": tuple(sorted(codigos)), "nome": nome, "cnpj": cnpj}
                 st.session_state["nota_debito_resultado"] = None
+                # limpa os campos de destinatário do cliente ANTERIOR — o
+                # widget guarda o valor pela key e ignora `value=` em
+                # reruns seguintes, então sem isso ele continuava mostrando
+                # o texto do cliente pesquisado antes, mesmo com a tabela
+                # de títulos já atualizada pro cliente novo
+                for chave in ("nota_debito_razao", "nota_debito_cnpj", "nota_debito_endereco"):
+                    st.session_state.pop(chave, None)
 
     cliente_info = st.session_state.get("nota_debito_cliente")
     if not cliente_info:
@@ -4209,7 +4216,13 @@ def renderizar_nota_debito():
     df_grade["Nº NFS-e (opcional)"] = ""
 
     titulos_editados = st.data_editor(
-        df_grade, hide_index=True, use_container_width=True, key="nota_debito_titulos_editor",
+        # key inclui os códigos do cliente — sem isso, trocar de cliente
+        # manteria as marcações de "Incluir"/Nº NFS-e do cliente anterior
+        # coladas nas MESMAS posições de linha da tabela nova (mesmo bug
+        # dos campos de destinatário, aqui bem mais grave: poderia incluir
+        # na nota um título que não é nem do cliente pesquisado)
+        df_grade, hide_index=True, use_container_width=True,
+        key=f"nota_debito_titulos_editor_{cliente_info['codigos']}",
         column_config={
             "Incluir": st.column_config.CheckboxColumn("Incluir"),
             "Título": st.column_config.TextColumn("Título", disabled=True),
