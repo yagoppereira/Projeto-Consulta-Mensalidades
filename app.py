@@ -668,6 +668,11 @@ COLUNAS_PARCELA = [
 # (em vez de imprimir uma linha por subcontrato, mostramos 1 resumo no final)
 _contador_fallback_json = {"qtd": 0}
 
+# DIAGNÓSTICO TEMPORÁRIO — ver buscar_faturamento_recorrente_bq. Remover
+# depois de confirmar em produção se o backfill de faturamento real está
+# rodando (e encontrando dado) ou falhando (e por quê).
+_debug_faturamento_real = {"ultima_falha": "ainda não chamada", "ultima_qtd_notas": None}
+
 
 @st.cache_data(show_spinner=False)
 def obter_dados_demo_bq():
@@ -960,14 +965,24 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
     )
     try:
         df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
-    except Exception:
+    except Exception as e:
         # sem acesso, ou qualquer outra falha de rede/permissão: esse
         # cruzamento é um EXTRA (valida/completa a ponta da série), não
         # uma dependência obrigatória — isso já derrubou a página INTEIRA
         # uma vez (o ThreadPoolExecutor em relatorio_cliente propaga a
         # exceção de qualquer worker), então nunca deixa vazar daqui.
-        # Sem aviso visível (detalhe técnico interno).
+        #
+        # DIAGNÓSTICO TEMPORÁRIO: o comportamento incorreto (grupo HOK
+        # considerando faturamento só até fev/2026) persistiu mesmo após
+        # trocar a fonte pra cigam__notas_fiscais e um reboot do app — pra
+        # descobrir se é permissão (ex: coluna fora do grant, diferente
+        # de nf/fatura/itensNf_json já usados em outro lugar) ou lógica,
+        # guarda a última falha aqui pra aparecer na tela (ver
+        # relatorio_cliente/relatorio_grupo, logo após o gráfico).
+        _debug_faturamento_real["ultima_falha"] = f"{type(e).__name__}: {e}"
         return pd.DataFrame(columns=colunas)
+    _debug_faturamento_real["ultima_falha"] = None
+    _debug_faturamento_real["ultima_qtd_notas"] = len(df)
     if df.empty:
         return pd.DataFrame(columns=colunas)
 
@@ -3963,6 +3978,13 @@ def relatorio_grupo(termo: str):
             incluir_total=incluir_total_grupo, mostrar_eventos_cancelamento=False,
             grupos_visiveis=grupos_marcados_grupo or None,
             filtro_situacao=filtro_situacao_grupo,
+        )
+        # DIAGNÓSTICO TEMPORÁRIO — ver _debug_faturamento_real. Remover
+        # depois de confirmar se o backfill de faturamento real está
+        # rodando (achou nota fiscal? deu erro? qual?) em produção.
+        st.caption(
+            f"🔧 debug backfill: última falha = {_debug_faturamento_real['ultima_falha']!r} · "
+            f"última qtd. de notas encontradas = {_debug_faturamento_real['ultima_qtd_notas']!r}"
         )
         if fig_grupo is not None:
             # mesmo clique-pra-detalhe da view de cliente: clicar num
