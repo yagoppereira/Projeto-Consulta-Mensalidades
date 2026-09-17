@@ -3232,8 +3232,13 @@ def relatorio_cliente(
     # mesmo material, a NF de faturamento_sig não carrega o código do
     # contrato, então não dá pra saber a qual atribuir, e nenhum dos dois
     # é completado (mais seguro deixar a ponta como está do que arriscar
-    # atribuir a NF ao grupo errado)
-    mes_atual_validacao = pd.Timestamp.now().to_period("M")
+    # atribuir a NF ao grupo errado).
+    # Teto é o ÚLTIMO MÊS FECHADO (mês corrente - 1), não o mês corrente:
+    # mesma regra já aplicada em preparar_dados_subcontrato (o mês em
+    # andamento ainda não fechou pra todo mundo, incluir ele parcial
+    # também derrubaria o total, só que por um motivo diferente do bug
+    # de previsão que esta validação corrige).
+    mes_atual_validacao = pd.Timestamp.now().to_period("M") - 1
     materiais_ativos_por_grupo = {
         cg: set(sub["Codigo_Material"].dropna().astype(str))
         for cg, sub in grupos
@@ -3795,7 +3800,10 @@ def relatorio_grupo(termo: str):
     # ------------------------------------------------------------------
     st.subheader("Histórico de mensalidade do grupo", anchor=False)
     historicos_grupo = []
-    mes_atual_validacao = pd.Timestamp.now().to_period("M")
+    # último mês FECHADO, não o corrente — mesma regra de
+    # preparar_dados_subcontrato (ver comentário equivalente em
+    # relatorio_cliente)
+    mes_atual_validacao = pd.Timestamp.now().to_period("M") - 1
     for _, emp in df_resumo.iterrows():
         cod = int(emp["Código"])
         contratos_emp = contratos_por_empresa.get(cod)
