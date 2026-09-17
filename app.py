@@ -891,10 +891,10 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def buscar_faturamento_recorrente_bq(codigos_cliente: tuple) -> pd.DataFrame:
+def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.DataFrame:
     """
     Busca o faturamento RECORRENTE real (NF de verdade já emitida) de um ou
-    mais clientes, direto de silver.faturamento_sig — não de
+    mais clientes, direto de bronze.cigam__notas_fiscais — não de
     parcelasContrato/parcelasPadrao_json.
 
     Por quê isso existe: parcelasContrato é atualizado POR LINHA DE
@@ -910,20 +910,32 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple) -> pd.DataFrame:
     sem refresh desde 23/02/2026, faturamento real contínuo e idêntico
     todo mês até pelo menos set/2026.
 
-    silver.faturamento_sig reflete a NF emitida (~1 dia de atraso, bem
-    mais fresco) — por isso serve de validação pra saber se o contrato
-    faturou de verdade no período, independente do que parcelasContrato
-    diz. Filtra por codigoMaterial usando MAPA_CODIGO_MATERIAL (mesmo
-    catálogo oficial já usado no resto do app) em vez de
+    Direto de cigam__notas_fiscais (não silver.faturamento_sig, que essa
+    service account não enxerga — só bronze.cigam__contratos,
+    bronze.cigam__empresas, bronze.cigam__notas_fiscais e
+    gold.bombas_alocadas) — reflete a NF emitida, bem mais fresco que
+    parcelasContrato. Reproduz aqui o MESMO filtro de "é faturamento de
+    verdade, não cancelado" que silver.faturamento_sig documenta aplicar
+    (dataCancelamento vazia + status fora de Erro/Cancelado/Inutilizado/
+    Denegado) e o MESMO parse de itensNf_json (documento='NF', ver
+    _buscar_itens_notas_fiscais_lote_cacheado) — dois lugares fazendo a
+    mesma extração é chato, mas essa service account não tem acesso à
+    view que já faz isso pronta.
+
+    Filtra por codigoMaterial usando MAPA_CODIGO_MATERIAL (mesmo catálogo
+    oficial já usado no resto do app, dentro do JSON de itens) em vez de
     validacoes.materiais_faturamento.incluir=TRUE (a fonte "oficial" da
-    definição de recorrente) porque essa tabela de validação não está
-    acessível com a credencial deste app — os códigos de material são os
-    mesmos dos dois lados, então o filtro por código chega no mesmo
-    resultado sem precisar do join.
+    definição de recorrente, também fora do alcance desta credencial) —
+    os códigos de material são os mesmos dos dois lados.
+
+    `desde`: data 'YYYY-MM-DD' — filtro OBRIGATÓRIO por data (a tabela
+    tem quase 700MB, sempre filtrar). Só nos interessa a PONTA da série
+    mesmo (ver _montar_parte_faturamento_real), então o caller já limita
+    isso ao último mês com parcela real.
 
     Retorna: codigo_cliente, mes (Period M), nf, codigoMaterial, valor.
     Vazio (com as colunas certas) em modo demo — não faz sentido simular
-    uma tabela de faturamento separada só pra isso.
+    uma nota fiscal separada só pra isso.
     """
     colunas = ["codigo_cliente", "mes", "nf", "codigoMaterial", "valor"]
     if MODO_DEMO or not codigos_cliente:
@@ -931,38 +943,68 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple) -> pd.DataFrame:
 
     query = f"""
     SELECT
-      SAFE_CAST(codigoCliente AS INT64) AS codigo_cliente,
-      dataEmissao_dt,
-      nf,
-      codigoMaterial,
-      valorContabil AS valor
-    FROM `{PROJECT_ID}.silver.faturamento_sig`
-    WHERE SAFE_CAST(codigoCliente AS INT64) IN UNNEST(@codigos)
-      AND origem = 'faturamento'
-      AND codigoMaterial IN UNNEST(@materiais)
+      SAFE_CAST(cliente AS INT64) AS codigo_cliente,
+      nf, dataEmissao, itensNf_json
+    FROM `{PROJECT_ID}.bronze.cigam__notas_fiscais`
+    WHERE SAFE_CAST(cliente AS INT64) IN UNNEST(@codigos)
+      AND dataEmissao >= @desde
+      AND (tipoNota = 'N' OR tipoNota IS NULL)
+      AND (dataCancelamento IS NULL OR dataCancelamento = '')
+      AND (status IS NULL OR status NOT IN ('4', '5', '6', '7'))
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente)),
-            bigquery.ArrayQueryParameter("materiais", "STRING", list(MAPA_CODIGO_MATERIAL.keys())),
+            bigquery.ScalarQueryParameter("desde", "DATE", desde),
         ]
     )
     try:
         df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
     except Exception:
-        # a service account do app pode não ter acesso a silver.faturamento_sig
-        # (dataset diferente de bronze/gold, usado só por esta função) — isso
-        # derrubava a página INTEIRA (o ThreadPoolExecutor em relatorio_cliente
-        # propaga a exceção de qualquer worker). Esse cruzamento é um EXTRA
-        # (valida/completa a ponta da série), não uma dependência obrigatória:
-        # sem acesso, ou qualquer outra falha de rede/permissão, simplesmente
-        # não completa a ponta — mesmo comportamento de antes desta função
-        # existir, sem aviso visível (detalhe técnico interno).
+        # sem acesso, ou qualquer outra falha de rede/permissão: esse
+        # cruzamento é um EXTRA (valida/completa a ponta da série), não
+        # uma dependência obrigatória — isso já derrubou a página INTEIRA
+        # uma vez (o ThreadPoolExecutor em relatorio_cliente propaga a
+        # exceção de qualquer worker), então nunca deixa vazar daqui.
+        # Sem aviso visível (detalhe técnico interno).
         return pd.DataFrame(columns=colunas)
     if df.empty:
         return pd.DataFrame(columns=colunas)
-    df["mes"] = pd.to_datetime(df["dataEmissao_dt"]).dt.to_period("M")
-    return df[["codigo_cliente", "mes", "nf", "codigoMaterial", "valor"]]
+
+    materiais_recorrentes = set(MAPA_CODIGO_MATERIAL.keys())
+    linhas = []
+    for _, row in df.iterrows():
+        if pd.isna(row.get("itensNf_json")):
+            continue
+        try:
+            itens = json.loads(row["itensNf_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not itens:
+            continue
+        mes = pd.Period(row["dataEmissao"], freq="M") if pd.notna(row["dataEmissao"]) else None
+        if mes is None:
+            continue
+        for item in itens:
+            # mesma proteção contra duplicata acessória de
+            # _buscar_itens_notas_fiscais_lote_cacheado
+            if str(item.get("documento", "")).strip().upper() != "NF":
+                continue
+            cod_material = str(item.get("codigoMaterial", "")).strip()
+            if cod_material not in materiais_recorrentes:
+                continue
+            preco = pd.to_numeric(item.get("precoUnitario"), errors="coerce")
+            qtd = pd.to_numeric(item.get("quantidade"), errors="coerce")
+            valor_item = preco * qtd if pd.notna(preco) and pd.notna(qtd) else preco
+            if pd.isna(valor_item):
+                continue
+            linhas.append({
+                "codigo_cliente": row["codigo_cliente"], "mes": mes,
+                "nf": str(row.get("nf", "")).strip(), "codigoMaterial": cod_material, "valor": valor_item,
+            })
+    if not linhas:
+        return pd.DataFrame(columns=colunas)
+    return pd.DataFrame(linhas)
 
 
 def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes) -> pd.DataFrame:
@@ -971,15 +1013,20 @@ def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes
     REAL (buscar_faturamento_recorrente_bq) em vez de parcelasContrato —
     pra tapar a ponta da série quando esta ficou desatualizada (ver
     obter_historico_unificado). Só os meses estritamente depois de
-    `depois_de` (None = nenhum limite inferior) e até `ate_mes`
-    (inclusive) — nunca mexe no que já veio de parcelasContrato."""
-    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,))
+    `depois_de` até `ate_mes` (inclusive) — nunca mexe no que já veio de
+    parcelasContrato.
+
+    `depois_de` também vira o filtro de data da consulta (cigam__notas_fiscais
+    tem quase 700MB, sempre filtrar) — sem NENHUM dado prévio de parcela
+    pra esse grupo, não dá pra escolher um corte razoável sem escanear a
+    tabela inteira, então nesse caso não busca nada (fica com o
+    comportamento de antes: sem completar a ponta)."""
+    if depois_de is None:
+        return pd.DataFrame(columns=["mes", "valor", "fatura"])
+    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 1).start_time.strftime("%Y-%m-%d"))
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
-    df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais)]
-    if depois_de is not None:
-        df_fat = df_fat[df_fat["mes"] > depois_de]
-    df_fat = df_fat[df_fat["mes"] <= ate_mes]
+    df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais) & (df_fat["mes"] <= ate_mes)]
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
     return df_fat.groupby("mes", as_index=False).agg(
