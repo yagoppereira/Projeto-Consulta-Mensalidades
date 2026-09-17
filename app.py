@@ -890,8 +890,94 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_faturamento_recorrente_bq(codigos_cliente: tuple) -> pd.DataFrame:
+    """
+    Busca o faturamento RECORRENTE real (NF de verdade já emitida) de um ou
+    mais clientes, direto de silver.faturamento_sig — não de
+    parcelasContrato/parcelasPadrao_json.
 
-def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
+    Por quê isso existe: parcelasContrato é atualizado POR LINHA DE
+    CONTRATO no bronze, não em bloco — um contrato específico pode ficar
+    meses sem ser re-extraído mesmo com a tabela inteira "em dia" (outros
+    contratos sendo atualizados normalmente). Enquanto isso, qualquer
+    parcela depois do último refresh daquele contrato continua marcada
+    'previsao' na nossa cópia, mesmo que no CIGAM real ela já tenha virado
+    uma NF de verdade — o filtro de previsão (preparar_dados_subcontrato)
+    então trata isso como "sem cobrança", fazendo o contrato (e o Total do
+    grupo) parecer que caiu ou encerrou quando na real ele seguiu
+    faturando normalmente. Caso real: grupo HOK, contrato 2605 — bronze
+    sem refresh desde 23/02/2026, faturamento real contínuo e idêntico
+    todo mês até pelo menos set/2026.
+
+    silver.faturamento_sig reflete a NF emitida (~1 dia de atraso, bem
+    mais fresco) — por isso serve de validação pra saber se o contrato
+    faturou de verdade no período, independente do que parcelasContrato
+    diz. Filtra por codigoMaterial usando MAPA_CODIGO_MATERIAL (mesmo
+    catálogo oficial já usado no resto do app) em vez de
+    validacoes.materiais_faturamento.incluir=TRUE (a fonte "oficial" da
+    definição de recorrente) porque essa tabela de validação não está
+    acessível com a credencial deste app — os códigos de material são os
+    mesmos dos dois lados, então o filtro por código chega no mesmo
+    resultado sem precisar do join.
+
+    Retorna: codigo_cliente, mes (Period M), nf, codigoMaterial, valor.
+    Vazio (com as colunas certas) em modo demo — não faz sentido simular
+    uma tabela de faturamento separada só pra isso.
+    """
+    colunas = ["codigo_cliente", "mes", "nf", "codigoMaterial", "valor"]
+    if MODO_DEMO or not codigos_cliente:
+        return pd.DataFrame(columns=colunas)
+
+    query = f"""
+    SELECT
+      SAFE_CAST(codigoCliente AS INT64) AS codigo_cliente,
+      dataEmissao_dt,
+      nf,
+      codigoMaterial,
+      valorContabil AS valor
+    FROM `{PROJECT_ID}.silver.faturamento_sig`
+    WHERE SAFE_CAST(codigoCliente AS INT64) IN UNNEST(@codigos)
+      AND origem = 'faturamento'
+      AND codigoMaterial IN UNNEST(@materiais)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("codigos", "INT64", list(codigos_cliente)),
+            bigquery.ArrayQueryParameter("materiais", "STRING", list(MAPA_CODIGO_MATERIAL.keys())),
+        ]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    df["mes"] = pd.to_datetime(df["dataEmissao_dt"]).dt.to_period("M")
+    return df[["codigo_cliente", "mes", "nf", "codigoMaterial", "valor"]]
+
+
+def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes) -> pd.DataFrame:
+    """Monta uma 'parte' (mes, valor, fatura) no mesmo formato que
+    preparar_dados_subcontrato devolve, só que a partir de faturamento
+    REAL (buscar_faturamento_recorrente_bq) em vez de parcelasContrato —
+    pra tapar a ponta da série quando esta ficou desatualizada (ver
+    obter_historico_unificado). Só os meses estritamente depois de
+    `depois_de` (None = nenhum limite inferior) e até `ate_mes`
+    (inclusive) — nunca mexe no que já veio de parcelasContrato."""
+    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,))
+    if df_fat.empty:
+        return pd.DataFrame(columns=["mes", "valor", "fatura"])
+    df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais)]
+    if depois_de is not None:
+        df_fat = df_fat[df_fat["mes"] > depois_de]
+    df_fat = df_fat[df_fat["mes"] <= ate_mes]
+    if df_fat.empty:
+        return pd.DataFrame(columns=["mes", "valor", "fatura"])
+    return df_fat.groupby("mes", as_index=False).agg(
+        valor=("valor", "sum"),
+        fatura=("nf", lambda s: ", ".join(sorted(set(str(x) for x in s if pd.notna(x) and str(x).strip())))),
+    )
+
+
+def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_real: dict = None) -> pd.DataFrame:
     """
     Recebe um codigoContrato como vem na Base_Clientes (pode ser um único
     código, ex: '7859', ou um par unificado, ex: '2135/2136'). Busca cada
@@ -913,12 +999,37 @@ def obter_historico_unificado(codigo_contrato_grupo: str) -> pd.DataFrame:
     juntos (ex: licenciamento pedestal + sonda na mesma NF, mesmo código
     de contrato) — o cálculo é feito depois de somar por mês, olhando
     todos os itens de todas as NFs daquele mês juntas.
+
+    `validar_faturamento_real` (opcional): {"codigo_cliente", "materiais",
+    "ate_mes"} — quando informado, complementa a PONTA da série (só os
+    meses depois do último dado de parcelasContrato, até "ate_mes"
+    inclusive) com faturamento real de silver.faturamento_sig, pro caso
+    de parcelasContrato estar desatualizado pra esse contrato específico
+    (ver buscar_faturamento_recorrente_bq). Só preenche a PONTA — um
+    buraco no MEIO do histórico continua marcado "incompleto" como antes,
+    não é o mesmo problema (dado desatualizado não é dado ausente no
+    meio de um período já fechado). O caller decide "ate_mes": deve ser
+    None se o contrato não está mais ativo (situacaoContrato != 'A') ou
+    se o cliente tem outro grupo ativo com o mesmo material (não dá pra
+    atribuir o faturamento a um dos dois com segurança).
     """
     subcodigos = [normalizar_codigo_contrato(c) for c in str(codigo_contrato_grupo).split("/")]
     partes = []
     for cod in subcodigos:
         df_parcelas = buscar_parcelas_bq(cod)
         partes.append(preparar_dados_subcontrato(df_parcelas))
+
+    if validar_faturamento_real and validar_faturamento_real.get("ate_mes") is not None:
+        meses_com_parcela = [p["mes"].max() for p in partes if not p.empty]
+        ultimo_mes_parcela = max(meses_com_parcela) if meses_com_parcela else None
+        parte_real = _montar_parte_faturamento_real(
+            codigo_cliente=validar_faturamento_real["codigo_cliente"],
+            materiais=validar_faturamento_real["materiais"],
+            depois_de=ultimo_mes_parcela,
+            ate_mes=validar_faturamento_real["ate_mes"],
+        )
+        if not parte_real.empty:
+            partes.append(parte_real)
 
     if not partes or all(p.empty for p in partes):
         return pd.DataFrame(columns=["mes", "valor", "fatura", "composicao_mes"])
@@ -3114,13 +3225,48 @@ def relatorio_cliente(
     grupos = montar_grupos_contrato(contratos)
     _contador_fallback_json["qtd"] = 0
 
+    # pra decidir se dá pra completar a PONTA da série com faturamento real
+    # quando parcelasContrato está desatualizado (ver "validar_faturamento_real"
+    # em obter_historico_unificado): só quando o grupo é o ÚNICO ativo desse
+    # cliente cobrindo aquele(s) Codigo_Material — com 2+ grupos ativos no
+    # mesmo material, a NF de faturamento_sig não carrega o código do
+    # contrato, então não dá pra saber a qual atribuir, e nenhum dos dois
+    # é completado (mais seguro deixar a ponta como está do que arriscar
+    # atribuir a NF ao grupo errado)
+    mes_atual_validacao = pd.Timestamp.now().to_period("M")
+    materiais_ativos_por_grupo = {
+        cg: set(sub["Codigo_Material"].dropna().astype(str))
+        for cg, sub in grupos
+        if (sub["situacaoContrato"] == "A").any() and "Codigo_Material" in sub.columns
+    }
+
+    def _validar_faturamento_real_do_grupo(cod_grupo, subset):
+        materiais = materiais_ativos_por_grupo.get(cod_grupo)
+        if not materiais:
+            return None  # grupo não está ativo, ou não tem material identificado
+        ambiguo = any(
+            outro_cg != cod_grupo and (materiais & outros_materiais)
+            for outro_cg, outros_materiais in materiais_ativos_por_grupo.items()
+        )
+        if ambiguo:
+            return None
+        if "codigo_cliente" not in subset.columns or not subset["codigo_cliente"].notna().any():
+            return None
+        return {
+            "codigo_cliente": int(subset["codigo_cliente"].dropna().iloc[0]),
+            "materiais": list(materiais),
+            "ate_mes": mes_atual_validacao,
+        }
+
     def _processar_grupo(cod_grupo, subset):
         """Todo o trabalho de UM grupo (consultas ao BigQuery + montagem
         do dict) — extraído em função separada pra dar pra rodar vários
         grupos em paralelo (são consultas de rede independentes entre
         si, não tem razão pra esperar uma terminar pra começar a outra)."""
         descricao = descricao_material_do_grupo(subset)
-        df_hist = obter_historico_unificado(cod_grupo)
+        df_hist = obter_historico_unificado(
+            cod_grupo, validar_faturamento_real=_validar_faturamento_real_do_grupo(cod_grupo, subset)
+        )
 
         # junta Descricao/observacao de TODAS as linhas desse grupo (um
         # codigoContrato pode ter várias linhas: um item por equipamento/serial,
@@ -3649,13 +3795,35 @@ def relatorio_grupo(termo: str):
     # ------------------------------------------------------------------
     st.subheader("Histórico de mensalidade do grupo", anchor=False)
     historicos_grupo = []
+    mes_atual_validacao = pd.Timestamp.now().to_period("M")
     for _, emp in df_resumo.iterrows():
         cod = int(emp["Código"])
         contratos_emp = contratos_por_empresa.get(cod)
         if contratos_emp is None or contratos_emp.empty:
             continue
-        for cod_grupo, subset in montar_grupos_contrato(contratos_emp):
-            df_hist = obter_historico_unificado(cod_grupo)
+        grupos_da_empresa = montar_grupos_contrato(contratos_emp)
+        # mesma lógica de segurança da view de cliente: só completa a
+        # ponta da série com faturamento real (ver
+        # validar_faturamento_real em obter_historico_unificado) quando o
+        # grupo é o ÚNICO ativo desta empresa cobrindo aquele material —
+        # com 2+ grupos ativos no mesmo material não dá pra saber a qual
+        # atribuir a NF (ela não carrega o código do contrato)
+        materiais_ativos_da_empresa = {
+            cg: set(sub["Codigo_Material"].dropna().astype(str))
+            for cg, sub in grupos_da_empresa
+            if (sub["situacaoContrato"] == "A").any() and "Codigo_Material" in sub.columns
+        }
+        for cod_grupo, subset in grupos_da_empresa:
+            materiais = materiais_ativos_da_empresa.get(cod_grupo)
+            validar_faturamento_real = None
+            if materiais and not any(
+                outro_cg != cod_grupo and (materiais & outros_materiais)
+                for outro_cg, outros_materiais in materiais_ativos_da_empresa.items()
+            ):
+                validar_faturamento_real = {
+                    "codigo_cliente": cod, "materiais": list(materiais), "ate_mes": mes_atual_validacao,
+                }
+            df_hist = obter_historico_unificado(cod_grupo, validar_faturamento_real=validar_faturamento_real)
             if df_hist.empty:
                 continue
             # rótulo: final do CNPJ · contrato CIGAM · o que está
