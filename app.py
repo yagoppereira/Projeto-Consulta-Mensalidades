@@ -947,7 +947,18 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple) -> pd.DataFrame:
             bigquery.ArrayQueryParameter("materiais", "STRING", list(MAPA_CODIGO_MATERIAL.keys())),
         ]
     )
-    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    try:
+        df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    except Exception:
+        # a service account do app pode não ter acesso a silver.faturamento_sig
+        # (dataset diferente de bronze/gold, usado só por esta função) — isso
+        # derrubava a página INTEIRA (o ThreadPoolExecutor em relatorio_cliente
+        # propaga a exceção de qualquer worker). Esse cruzamento é um EXTRA
+        # (valida/completa a ponta da série), não uma dependência obrigatória:
+        # sem acesso, ou qualquer outra falha de rede/permissão, simplesmente
+        # não completa a ponta — mesmo comportamento de antes desta função
+        # existir, sem aviso visível (detalhe técnico interno).
+        return pd.DataFrame(columns=colunas)
     if df.empty:
         return pd.DataFrame(columns=colunas)
     df["mes"] = pd.to_datetime(df["dataEmissao_dt"]).dt.to_period("M")
