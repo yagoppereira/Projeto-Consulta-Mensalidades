@@ -4173,13 +4173,6 @@ def renderizar_nota_debito():
                 codigos, nome, cnpj = resultado_cliente
                 st.session_state["nota_debito_cliente"] = {"codigos": tuple(sorted(codigos)), "nome": nome, "cnpj": cnpj}
                 st.session_state["nota_debito_resultado"] = None
-                # limpa os campos de destinatário do cliente ANTERIOR — o
-                # widget guarda o valor pela key e ignora `value=` em
-                # reruns seguintes, então sem isso ele continuava mostrando
-                # o texto do cliente pesquisado antes, mesmo com a tabela
-                # de títulos já atualizada pro cliente novo
-                for chave in ("nota_debito_razao", "nota_debito_cnpj", "nota_debito_endereco"):
-                    st.session_state.pop(chave, None)
 
     cliente_info = st.session_state.get("nota_debito_cliente")
     if not cliente_info:
@@ -4192,15 +4185,25 @@ def renderizar_nota_debito():
         return
 
     st.success(f"Cliente: {cliente_info['nome']}")
+    # as 3 keys incluem os códigos do cliente — popar a key fixa do
+    # session_state não bastava pra resetar o valor mostrado (o Streamlit
+    # não recriava o widget do zero de forma confiável entre um cliente e
+    # outro); com a key mudando a cada cliente, é sempre um widget NOVO,
+    # sem estado herdado do cliente pesquisado antes (mesmo ajuste já
+    # usado no data_editor de títulos, logo abaixo)
+    sufixo_widget = str(cliente_info["codigos"])
     col_razao, col_cnpj, col_endereco = st.columns(3)
     with col_razao:
-        destinatario_razao = st.text_input("Razão Social do destinatário", value=cliente_info["nome"], key="nota_debito_razao")
+        destinatario_razao = st.text_input(
+            "Razão Social do destinatário", value=cliente_info["nome"], key=f"nota_debito_razao_{sufixo_widget}")
     with col_cnpj:
         destinatario_cnpj = st.text_input(
-            "CNPJ/CPF", value=_formatar_cnpj_cpf_mascara(cliente_info.get("cnpj") or ""), key="nota_debito_cnpj")
+            "CNPJ/CPF", value=_formatar_cnpj_cpf_mascara(cliente_info.get("cnpj") or ""),
+            key=f"nota_debito_cnpj_{sufixo_widget}")
     with col_endereco:
         endereco_dw = buscar_endereco_cliente(cliente_info["codigos"])
-        destinatario_endereco = st.text_input("Endereço", value=endereco_dw, key="nota_debito_endereco")
+        destinatario_endereco = st.text_input(
+            "Endereço", value=endereco_dw, key=f"nota_debito_endereco_{sufixo_widget}")
 
     st.markdown(
         "**Títulos vencidos em aberto** — marque os que entram na nota. Título ainda não vencido "
