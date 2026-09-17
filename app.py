@@ -4173,6 +4173,13 @@ def renderizar_nota_debito():
                 codigos, nome, cnpj = resultado_cliente
                 st.session_state["nota_debito_cliente"] = {"codigos": tuple(sorted(codigos)), "nome": nome, "cnpj": cnpj}
                 st.session_state["nota_debito_resultado"] = None
+                # limpa os campos de destinatário do cliente ANTERIOR — o
+                # widget guarda o valor pela key e ignora `value=` em
+                # reruns seguintes, então sem isso ele continuava mostrando
+                # o texto do cliente pesquisado antes, mesmo com a tabela
+                # de títulos já atualizada pro cliente novo
+                for chave in ("nota_debito_razao", "nota_debito_cnpj", "nota_debito_endereco"):
+                    st.session_state.pop(chave, None)
 
     cliente_info = st.session_state.get("nota_debito_cliente")
     if not cliente_info:
@@ -4209,7 +4216,13 @@ def renderizar_nota_debito():
     df_grade["Nº NFS-e (opcional)"] = ""
 
     titulos_editados = st.data_editor(
-        df_grade, hide_index=True, use_container_width=True, key="nota_debito_titulos_editor",
+        # key inclui os códigos do cliente — sem isso, trocar de cliente
+        # manteria as marcações de "Incluir"/Nº NFS-e do cliente anterior
+        # coladas nas MESMAS posições de linha da tabela nova (mesmo bug
+        # dos campos de destinatário, aqui bem mais grave: poderia incluir
+        # na nota um título que não é nem do cliente pesquisado)
+        df_grade, hide_index=True, use_container_width=True,
+        key=f"nota_debito_titulos_editor_{cliente_info['codigos']}",
         column_config={
             "Incluir": st.column_config.CheckboxColumn("Incluir"),
             "Título": st.column_config.TextColumn("Título", disabled=True),
