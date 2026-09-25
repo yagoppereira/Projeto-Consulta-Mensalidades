@@ -1050,6 +1050,36 @@ def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes
     )
 
 
+def materiais_por_subcodigo(subset: pd.DataFrame) -> dict:
+    """Mapeia cada subcódigo (contrato individual, sem '/') de um grupo
+    pro(s) Codigo_Material que ele cobre — usado por
+    obter_historico_unificado pra completar a ponta da série POR
+    SUBCONTRATO (ver validar_faturamento_real lá).
+
+    Cobre os dois jeitos que uma linha de grupo união chega aqui: já
+    unificada na origem (codigoContrato="X/Y" e Codigo_Material="matX/matY",
+    mesma ordem — ver a junção aluguel+licenciamento em
+    obter_dados_contratos) ou pareada aqui no app com cada subcontrato na
+    sua própria linha (montar_grupos_contrato, casos encerrados). Nos dois
+    a contagem de códigos bate com a de materiais; se algum dia não bater
+    (linha que a gente não previu), associa TODOS os materiais dessa linha
+    a TODOS os subcódigos dela — mais seguro que arriscar atribuição errada
+    entre lados."""
+    mapa: dict = {}
+    for _, row in subset.iterrows():
+        cods = [normalizar_codigo_contrato(c) for c in str(row.get("codigoContrato", "")).split("/")]
+        mats = [m.strip() for m in str(row.get("Codigo_Material", "") or "").split("/")]
+        if len(cods) == len(mats):
+            for c, m in zip(cods, mats):
+                if m:
+                    mapa.setdefault(c, set()).add(m)
+        else:
+            materiais_linha = {m for m in mats if m}
+            for c in cods:
+                mapa.setdefault(c, set()).update(materiais_linha)
+    return mapa
+
+
 def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_real: dict = None) -> pd.DataFrame:
     """
     Recebe um codigoContrato como vem na Base_Clientes (pode ser um único
@@ -1073,36 +1103,59 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
     de contrato) — o cálculo é feito depois de somar por mês, olhando
     todos os itens de todas as NFs daquele mês juntas.
 
-    `validar_faturamento_real` (opcional): {"codigo_cliente", "materiais",
-    "ate_mes"} — quando informado, complementa a PONTA da série (só os
-    meses depois do último dado de parcelasContrato, até "ate_mes"
-    inclusive) com faturamento real de silver.faturamento_sig, pro caso
-    de parcelasContrato estar desatualizado pra esse contrato específico
-    (ver buscar_faturamento_recorrente_bq). Só preenche a PONTA — um
-    buraco no MEIO do histórico continua marcado "incompleto" como antes,
-    não é o mesmo problema (dado desatualizado não é dado ausente no
-    meio de um período já fechado). O caller decide "ate_mes": deve ser
-    None se o contrato não está mais ativo (situacaoContrato != 'A') ou
-    se o cliente tem outro grupo ativo com o mesmo material (não dá pra
-    atribuir o faturamento a um dos dois com segurança).
+    `validar_faturamento_real` (opcional): {"codigo_cliente",
+    "materiais_por_subcodigo", "ate_mes"} — quando informado, completa a
+    PONTA da série (só os meses depois do último dado de parcelasContrato,
+    até "ate_mes" inclusive) com faturamento real de cigam__notas_fiscais,
+    pro caso de parcelasContrato estar desatualizado pra esse contrato
+    específico (ver buscar_faturamento_recorrente_bq).
+
+    Feito POR SUBCÓDIGO, não pro grupo inteiro: num grupo união (aluguel +
+    licenciamento), cada lado tem seu próprio histórico de parcela e pode
+    ficar desatualizado em momentos diferentes. Tratar o grupo como uma
+    coisa só (um "último mês com parcela" único pro par) faz o lado em dia
+    esconder o atraso do outro — o máximo dos dois vira o corte, então o
+    lado atrasado nunca é completado, e o Total do grupo segue faltando o
+    faturamento real dele mesmo depois do backfill "funcionar". Por isso
+    "materiais_por_subcodigo" mapeia CADA subcódigo pro(s) seu(s) próprio(s)
+    Codigo_Material — cada lado é completado a partir do SEU PRÓPRIO último
+    mês de parcela, com filtro só nos SEUS materiais (nunca nos do outro
+    lado, senão um mês que o lado em dia já contou certo pela parcela conta
+    de novo aqui).
+
+    Só preenche a PONTA — um buraco no MEIO do histórico continua marcado
+    "incompleto" como antes, não é o mesmo problema (dado desatualizado não
+    é dado ausente no meio de um período já fechado). O caller decide
+    "ate_mes": deve ser None se o contrato não está mais ativo
+    (situacaoContrato != 'A') ou se o cliente tem outro grupo ativo com o
+    mesmo material (não dá pra atribuir o faturamento a um dos dois com
+    segurança).
     """
     subcodigos = [normalizar_codigo_contrato(c) for c in str(codigo_contrato_grupo).split("/")]
     partes = []
+    partes_por_subcodigo = {}
     for cod in subcodigos:
         df_parcelas = buscar_parcelas_bq(cod)
-        partes.append(preparar_dados_subcontrato(df_parcelas))
+        parte = preparar_dados_subcontrato(df_parcelas)
+        partes.append(parte)
+        partes_por_subcodigo[cod] = parte
 
     if validar_faturamento_real and validar_faturamento_real.get("ate_mes") is not None:
-        meses_com_parcela = [p["mes"].max() for p in partes if not p.empty]
-        ultimo_mes_parcela = max(meses_com_parcela) if meses_com_parcela else None
-        parte_real = _montar_parte_faturamento_real(
-            codigo_cliente=validar_faturamento_real["codigo_cliente"],
-            materiais=validar_faturamento_real["materiais"],
-            depois_de=ultimo_mes_parcela,
-            ate_mes=validar_faturamento_real["ate_mes"],
-        )
-        if not parte_real.empty:
-            partes.append(parte_real)
+        mapa_materiais_subcod = validar_faturamento_real.get("materiais_por_subcodigo") or {}
+        for cod in subcodigos:
+            materiais_cod = mapa_materiais_subcod.get(cod)
+            if not materiais_cod:
+                continue
+            parte_cod = partes_por_subcodigo.get(cod)
+            ultimo_mes_cod = parte_cod["mes"].max() if parte_cod is not None and not parte_cod.empty else None
+            parte_real = _montar_parte_faturamento_real(
+                codigo_cliente=validar_faturamento_real["codigo_cliente"],
+                materiais=materiais_cod,
+                depois_de=ultimo_mes_cod,
+                ate_mes=validar_faturamento_real["ate_mes"],
+            )
+            if not parte_real.empty:
+                partes.append(parte_real)
 
     if not partes or all(p.empty for p in partes):
         return pd.DataFrame(columns=["mes", "valor", "fatura", "composicao_mes"])
@@ -3332,7 +3385,7 @@ def relatorio_cliente(
             return None
         return {
             "codigo_cliente": int(subset["codigo_cliente"].dropna().iloc[0]),
-            "materiais": list(materiais),
+            "materiais_por_subcodigo": materiais_por_subcodigo(subset),
             "ate_mes": mes_atual_validacao,
         }
 
@@ -3902,7 +3955,9 @@ def relatorio_grupo(termo: str):
                 for outro_cg, outros_materiais in materiais_ativos_da_empresa.items()
             ):
                 validar_faturamento_real = {
-                    "codigo_cliente": cod, "materiais": list(materiais), "ate_mes": mes_atual_validacao,
+                    "codigo_cliente": cod,
+                    "materiais_por_subcodigo": materiais_por_subcodigo(subset),
+                    "ate_mes": mes_atual_validacao,
                 }
             df_hist = obter_historico_unificado(cod_grupo, validar_faturamento_real=validar_faturamento_real)
             if df_hist.empty:
