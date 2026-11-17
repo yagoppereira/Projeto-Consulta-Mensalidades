@@ -4524,11 +4524,13 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
                 # pra achar os contratos DESSAS bombas na carteira dela
                 "bombas_grupo": [
                     {"base": b, "bomba_id": str(bid), "bomba_nome": "" if pd.isna(nm) else str(nm),
-                     "id_op": "" if pd.isna(io) else str(io)}
-                    for b, bid, nm, io in zip(no_grupo["base"],
+                     "id_op": "" if pd.isna(io) else str(io),
+                     "serial": None if pd.isna(sr) else str(sr)}
+                    for b, bid, nm, io, sr in zip(no_grupo["base"],
                                               no_grupo.get("bomba_id", pd.Series(None, index=no_grupo.index)),
                                               no_grupo.get("bomba_nome", pd.Series(None, index=no_grupo.index)),
-                                              no_grupo.get("id_op_operacional", pd.Series(None, index=no_grupo.index)))
+                                              no_grupo.get("id_op_operacional", pd.Series(None, index=no_grupo.index)),
+                                              no_grupo.get("serial_equipamento", pd.Series(None, index=no_grupo.index)))
                     if pd.notna(bid)],
                 "contas_grupo": sorted(contas),
                 "contas_fora": len(fora),
@@ -4911,7 +4913,7 @@ def relatorio_grupo(termo: str):
     # distribuidora que paga bombas do grupo: a carteira dela fica fora, mas
     # os contratos DESSAS bombas entram (associação por ID/serial, empresa do
     # grupo citada ou período de 1º uso — ver associar_contratos_do_externo)
-    contratos_forcados, bombas_forcadas = {}, {}
+    contratos_forcados, bombas_forcadas, equip_forcados = {}, {}, {}
     nomes_grupo = {_nome_curto_empresa(n) for n in grupo["Cliente_Nome"]}
     linhas_extra = []
     for ext in grupo.attrs.get("pagantes_externos", []):
@@ -4928,6 +4930,12 @@ def relatorio_grupo(termo: str):
         if motivos:
             contratos_forcados[ext["codigo"]] = ligados
             bombas_forcadas[ext["codigo"]] = {b["bomba_id"] for b in ext["bombas_grupo"]}
+            # equipamento (serial) é a contagem certa pra "quantos
+            # equipamentos" — bomba_id conta canal, e duplo/triplo/
+            # quádruplo tem mais de um canal pro mesmo equipamento físico
+            equip_forcados[ext["codigo"]] = {
+                b["serial"] for b in ext["bombas_grupo"] if b.get("serial")
+            }
             texto_ligados = (" **Os contratos dela ligados a essas bombas entram no grupo:** "
                              + "; ".join(f"{sem_zeros_esquerda(c)} ({m})" for c, m in sorted(motivos.items())) + ".")
             dir_ext = diretorio_clientes[diretorio_clientes["codigo_cliente"] == ext["codigo"]]
@@ -4979,9 +4987,14 @@ def relatorio_grupo(termo: str):
             qtd_contratos_ativos = ativos["codigoContrato"].nunique() if not ativos.empty else 0
             mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
             total_grupo += mensalidade
+            # equipamento = serial único, não linha de bomba/canal — um
+            # equipamento duplo/triplo/quádruplo tem várias bombas (uma
+            # por canal) mas é 1 equipamento só (mesma régua usada no
+            # resto do app, ex.: relatorio_cliente / qtd_equip_unicos)
             qtd_equip_emp = (
-                len(bombas_forcadas[int(codigo)]) if int(codigo) in bombas_forcadas
-                else int((df_bombas["cliente_cigam_pagante"] == int(codigo)).sum()) if df_bombas is not None else 0
+                len(equip_forcados[int(codigo)]) if int(codigo) in equip_forcados
+                else int(df_bombas.loc[df_bombas["cliente_cigam_pagante"] == int(codigo), "serial_equipamento"].nunique())
+                if df_bombas is not None else 0
             )
             linhas_resumo.append({
                 "Código": int(codigo),
