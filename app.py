@@ -616,6 +616,20 @@ def _mapa_material_e_cancelamento():
     return mapa_material, mapa_cancelamento
 
 
+def _preco_total_parcela(preco_unitario, quantidade):
+    """precoUnitario × quantidade da parcela — quase sempre quantidade=1
+    (não muda nada), mas há parcela com quantidade 2+ num item só (ex.:
+    TUMPEX, 1 item 'Pedestal Duplo' com quantidade=2 = 2 equipamentos,
+    R$1.100 cada = R$2.200, não R$1.100)."""
+    preco = pd.to_numeric(preco_unitario, errors="coerce")
+    qtd = pd.to_numeric(quantidade, errors="coerce")
+    if pd.isna(preco):
+        return None
+    if pd.isna(qtd) or qtd == 0:
+        return preco
+    return preco * qtd
+
+
 @st.cache_data(ttl=1800, show_spinner="Buscando contratos do cliente (direto do BigQuery)...")
 def buscar_itens_contrato_do_dw(codigos_cliente: tuple) -> pd.DataFrame:
     """
@@ -692,7 +706,16 @@ def buscar_itens_contrato_do_dw(codigos_cliente: tuple) -> pd.DataFrame:
                         "diaVencimento": row.get("diaVencimento"),
                         "Codigo_Material": str(p.get("codigoMaterial", "")).strip(),
                         "Quantidade": p.get("quantidade"),
-                        "Preco_Unitario": p.get("precoUnitario"),
+                        # valor da LINHA (preço unitário × quantidade), não só
+                        # o preço unitário — a maior parte das parcelas tem
+                        # quantidade 1 e isso não muda nada, mas achamos
+                        # parcela com quantidade 2+ (ex.: TUMPEX, 2 pedestais
+                        # duplos no mesmo item) cobrando só 1 unidade na
+                        # mensalidade de todo mundo que lê esta coluna
+                        # (gráfico, grupo econômico, composição) — em todo
+                        # lugar ela é tratada como "quanto esse item pesa na
+                        # mensalidade", não como preço unitário de catálogo
+                        "Preco_Unitario": _preco_total_parcela(p.get("precoUnitario"), p.get("quantidade")),
                         "Descricao": p.get("descricao"),
                         # 1º mês cobrado pela parcela — dataInicio do contrato
                         # não serve (vem igual à dataTermino de propósito)
