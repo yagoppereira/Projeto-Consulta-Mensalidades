@@ -89,6 +89,19 @@ MAPA_CODIGO_MATERIAL = {
     "90000100023": "LICENCIAMENTO DATA BI",
 }
 
+# NFs cancelada no CIGAM mas sem dataCancelamento/status de cancelamento
+# sincronizado no DW — o extrator só reconsulta uma NF numa janela de 3
+# dias após a emissão, então cancelamento posterior a isso só chega aqui
+# depois de um backfill manual do time de dados. Enquanto isso não
+# acontece, a NF continua entrando normal em qualquer leitura de
+# cigam__notas_fiscais (inclusive silver.faturamento_sig) e infla a
+# composição/mensalidade de quem a usa. Lista mantida à mão: acrescente
+# o número (nf ou fatura, como aparece no relatório) assim que confirmar
+# o cancelamento, e remova quando o backfill sincronizar de verdade.
+NFS_CANCELADAS_MANUAL = {
+    "200120540",  # Belmont Mineração 0001-97 — aluguel unificado, confirmado cancelado em 18/11/2026
+}
+
 
 def formatar_mes_ano(periodo: pd.Period) -> str:
     return f"{MESES_PT[periodo.month - 1].capitalize()}/{str(periodo.year)[2:]}"
@@ -2835,6 +2848,21 @@ def _md_seguro(texto):
     st.markdown(str(texto).replace("$", "&#36;"), unsafe_allow_html=True)
 
 
+def _rotulo_nf_com_datas(numero_nf: str, datas: dict = None) -> str:
+    """'200120540' vira '200120540 (lanç. 02/11/26, venc. 23/11/26)' quando
+    acha o título em silver.lancamentos_receber; sem título encontrado (NF
+    fora do financeiro, ou ainda não sincronizada), devolve só o número."""
+    if not datas:
+        return numero_nf
+    lanc, venc = datas.get("emissao"), datas.get("vencimento")
+    partes = []
+    if pd.notna(lanc):
+        partes.append(f"lanç. {lanc:%d/%m/%y}")
+    if pd.notna(venc):
+        partes.append(f"venc. {venc:%d/%m/%y}")
+    return f"{numero_nf} ({', '.join(partes)})" if partes else numero_nf
+
+
 def renderizar_card_detalhe_ponto(dado_ponto: dict):
     """Renderiza UM card de detalhe (cabeçalho + composição + tabela de
     equipamentos) pro dado_ponto estruturado (ver customdata em
@@ -2862,7 +2890,10 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             linhas_cab.insert(0, f"<div style='height:6px; background:{dado_ponto['cor']}; "
                                  "border-radius:3px; margin-bottom:8px;'></div>")
         if dado_ponto.get("nfs"):
-            linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
+            numeros_nf = [n.strip() for n in str(dado_ponto["nfs"]).split(",") if n.strip()]
+            lancamentos = buscar_lancamentos_nf_lote(tuple(numeros_nf))
+            nfs_txt = ", ".join(_rotulo_nf_com_datas(n, lancamentos.get(n)) for n in numeros_nf)
+            linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {nfs_txt}</div>")
         if dado_ponto.get("primeira_cobranca"):
             onde = " no grupo" if dado_ponto.get("empresa") else ""
             linhas_cab.append(
@@ -3596,6 +3627,8 @@ def buscar_itens_nota_fiscal(numero_nf: str) -> pd.DataFrame:
     """
     if not numero_nf or not str(numero_nf).strip():
         return pd.DataFrame()
+    if str(numero_nf).strip() in NFS_CANCELADAS_MANUAL:
+        return pd.DataFrame()
     if MODO_DEMO:
         _, itens_demo = obter_dados_demo_bq()
         itens = itens_demo.get(str(numero_nf).strip())
@@ -3626,6 +3659,44 @@ def buscar_itens_nota_fiscal(numero_nf: str) -> pd.DataFrame:
     df_itens = pd.DataFrame(itens)
     colunas = [c for c in ["codigoMaterial", "quantidade", "precoUnitario", "descricao", "notaFiscal"] if c in df_itens.columns]
     return df_itens[colunas]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_lancamentos_nf_lote(numeros_nf: tuple) -> dict:
+    """
+    Lançamento (emissão) e vencimento de cada NF, a partir de
+    silver.lancamentos_receber — é o título financeiro gerado pela NF, não
+    a NF em si (cigam__notas_fiscais não guarda vencimento). Só o título
+    original (codigoTipo='R'); baixa/recebimento ('E'/'c') do mesmo
+    lançamento não interessa aqui. Indexado por nf e por fatura, igual ao
+    de buscar_itens_notas_fiscais_lote (mesmo número, dois nomes).
+
+    Retorna {numero: {"emissao": date|None, "vencimento": date|None}}.
+    """
+    numeros_validos = tuple(sorted(set(str(n).strip() for n in numeros_nf if n and str(n).strip())))
+    if not numeros_validos:
+        return {}
+    if MODO_DEMO:
+        return {}
+    query = f"""
+    SELECT nf, fatura,
+           PARSE_DATE('%d/%m/%Y', emissao) AS emissao,
+           PARSE_DATE('%d/%m/%Y', dataVencimento) AS vencimento
+    FROM `{PROJECT_ID}.silver.lancamentos_receber`
+    WHERE (nf IN UNNEST(@numeros) OR fatura IN UNNEST(@numeros))
+      AND codigoTipo = 'R'
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("numeros", "STRING", list(numeros_validos))]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    resultado = {}
+    for _, row in df.iterrows():
+        datas = {"emissao": row.get("emissao"), "vencimento": row.get("vencimento")}
+        for chave in (str(row.get("nf", "")).strip(), str(row.get("fatura", "")).strip()):
+            if chave:
+                resultado.setdefault(chave, datas)
+    return resultado
 
 
 def buscar_itens_notas_fiscais_lote(numeros_nf: list) -> dict:
@@ -3748,6 +3819,9 @@ def _buscar_itens_por_coluna(coluna: str, numeros: list) -> dict:
 
     resultado = {}
     for _, row in df.iterrows():
+        if str(row.get("nf", "")).strip() in NFS_CANCELADAS_MANUAL \
+                or str(row.get("fatura", "")).strip() in NFS_CANCELADAS_MANUAL:
+            continue
         if pd.isna(row.get("itensNf_json")):
             continue
         try:
