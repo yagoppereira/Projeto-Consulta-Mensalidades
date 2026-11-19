@@ -1266,14 +1266,11 @@ def marcar_sinal(resumo: pd.DataFrame, referencia) -> pd.DataFrame:
     return r
 
 
-def _chave_posto(nome, cidade, uf) -> tuple:
-    """Ordem de PROXIMIDADE dos postos: UF → cidade → nome. O cadastro não
-    tem coordenada, então o mais perto que dá de "postos vizinhos juntos" é
-    agrupar por estado e cidade. Posto sem UF/cidade vai pro fim."""
-    def _txt(v):
-        return _normalizar_texto(v) if isinstance(v, str) and v.strip() else ""
-    u, c, n = _txt(uf), _txt(cidade), _txt(nome)
-    return (u == "", u, c == "", c, n)
+def _chave_posto(nome, tem_ativa: bool) -> tuple:
+    """Ordem dos postos: os que têm bomba instalada hoje primeiro, depois por
+    nome; bomba fora do cadastro (sem posto) no fim."""
+    n = _normalizar_texto(nome) if isinstance(nome, str) and nome.strip() else ""
+    return (n == "", not tem_ativa, n)
 
 
 def rotulo_posto(nome, cidade, uf) -> str:
@@ -1285,18 +1282,26 @@ def rotulo_posto(nome, cidade, uf) -> str:
 
 
 def postos_do_resumo(resumo: pd.DataFrame) -> dict:
-    """bomba_id → (rótulo do posto, posição na ordem de proximidade)."""
-    linhas = {}
-    for _, r in resumo.iterrows():
-        rot = rotulo_posto(r.get("posto_nome"), r.get("posto_cidade"), r.get("posto_uf"))
-        linhas[r["bomba_id"]] = (rot, _chave_posto(r.get("posto_nome"), r.get("posto_cidade"), r.get("posto_uf")))
-    ordem = {rot: i for i, (rot, _) in enumerate(sorted(set(linhas.values()), key=lambda x: x[1]))}
-    return {b: (rot, ordem[rot]) for b, (rot, _) in linhas.items()}
+    """bomba_id → (rótulo do posto, posição do posto na ordem da aba)."""
+    rotulos = {r["bomba_id"]: rotulo_posto(r.get("posto_nome"), r.get("posto_cidade"), r.get("posto_uf"))
+               for _, r in resumo.iterrows()}
+    nomes = dict(zip(resumo["bomba_id"], resumo["posto_nome"]))
+    ativos = {rotulos[b] for b, sit in zip(resumo["bomba_id"], resumo["situacao"]) if sit in SITUACOES_ATIVAS}
+    chaves = {}
+    for b, rot in rotulos.items():
+        chaves.setdefault(rot, _chave_posto(nomes.get(b), rot in ativos))
+    ordem = {rot: i for i, rot in enumerate(sorted(chaves, key=lambda r: chaves[r]))}
+    return {b: (rot, ordem[rot]) for b, rot in rotulos.items()}
 
 
-def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None) -> pd.DataFrame:
-    """Uma linha por bomba da timeline, na ordem de exibição, agrupada pelo
-    PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
+def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None,
+                   agrupar: str = "pagante") -> pd.DataFrame:
+    """Uma linha por bomba da timeline, na ordem de exibição.
+    agrupar="posto": um bloco por POSTO (postos com bomba instalada hoje
+    primeiro, depois por nome; bomba fora do cadastro no fim) e, dentro do
+    posto, pagante → equipamento — os equipamentos do mesmo posto ficam
+    juntos, como um pré-filtro visual.
+    agrupar="pagante": agrupada pelo PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
     mesma ordem das cores), "sem alocação" por último entre as instaladas;
     depois as bombas retiradas, as que hoje estão em outro cliente e as fora
     do cadastro. Dentro do grupo, pela data do primeiro uso. Sem alocação
@@ -1313,21 +1318,29 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.Data
         if isinstance(e, str) and e:
             equip_de[b] = f"equip {e}"
     grupos = grupos_das_bombas(resumo)
+    postos = postos_do_resumo(resumo)
+    sem_posto = rotulo_posto(None, None, None)
     linhas = []
     for bomba, g in periodos.groupby("bomba_id"):
-        grupo, rank = grupos.get(bomba, (GRUPO_FORA_CADASTRO, 1001))
-        linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank, "inicio": g["inicio"].min()})
+        pagante, rank_pagante = grupos.get(bomba, (GRUPO_FORA_CADASTRO, 1001))
+        posto, rank_posto = postos.get(bomba, (sem_posto, 10 ** 6))
+        if agrupar == "posto":
+            # no eixo, só o nome do posto (cidade/UF ficam no filtro)
+            nome_posto = info.at[bomba, "posto_nome"] if bomba in info.index else None
+            grupo = _truncar(nome_posto, 40) if isinstance(nome_posto, str) and nome_posto.strip() else posto
+            linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank_posto, "sub": rank_pagante,
+                           "inicio": g["inicio"].min()})
+        else:
+            linhas.append({"bomba_id": bomba, "grupo": pagante, "rank": rank_pagante, "sub": rank_posto,
+                           "inicio": g["inicio"].min()})
     df = pd.DataFrame(linhas)
     if df.empty:
         return df
     df["equip"] = [equip_de.get(b, f"bomba {b}") for b in df["bomba_id"]]
-    # dentro do pagante, POSTO a posto na ordem de proximidade (UF → cidade);
-    # canais de um equipamento seguem juntos (mesmo posto)
-    postos = postos_do_resumo(resumo)
-    df["posto_ordem"] = [postos.get(b, ("", 10 ** 6))[1] for b in df["bomba_id"]]
-    df["posto_ordem"] = df.groupby(["grupo", "equip"])["posto_ordem"].transform("min")
+    # canais de um equipamento seguem juntos dentro do bloco
+    df["sub"] = df.groupby(["grupo", "equip"])["sub"].transform("min")
     df["inicio_equip"] = df.groupby(["grupo", "equip"])["inicio"].transform("min")
-    return df.sort_values(["rank", "grupo", "posto_ordem", "inicio_equip", "equip", "inicio"]).reset_index(drop=True)
+    return df.sort_values(["rank", "grupo", "sub", "inicio_equip", "equip", "inicio"]).reset_index(drop=True)
 
 
 def alertas_de_pagante(resumo: pd.DataFrame) -> list:
@@ -1402,13 +1415,14 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     return cores
 
 
-def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None, canais=None):
+def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None, canais=None,
+                    agrupar: str = "pagante"):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
     quebrado em pausas longas, agrupada pelo pagante de hoje (o posto vai no
     hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
     (alocação CIGAM); pagante com conta própria no sistema ganha contorno
     vermelho e ⚠ no nome."""
-    ordem = ordem_timeline(periodos, resumo, canais)
+    ordem = ordem_timeline(periodos, resumo, canais, agrupar)
     info = resumo.set_index("bomba_id")
     tem_alocacao = "pagante_rotulo" in resumo
     alerta = info["pagante_fora_do_grupo"].to_dict() if tem_alocacao else {}
@@ -1427,7 +1441,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
 
     def _prefixo_posto(b, nome_bomba):
         posto = postos.get(b)
-        if not varios_postos or not isinstance(posto, str) or not posto.strip():
+        if agrupar == "posto" or not varios_postos or not isinstance(posto, str) or not posto.strip():
             return ""
         if _normalizar_texto(posto) in _normalizar_texto(nome_bomba):
             return ""
@@ -1759,9 +1773,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             "Pagante hoje / situação", opcoes_grupo, default=[], placeholder="Todos",
             key=f"eq_grupos_{base}_{cliente_id}")
     with col_po:
-        # postos na ordem de proximidade (UF → cidade → nome)
+        # postos com bomba instalada hoje primeiro, depois por nome
         postos_escolhidos = st.multiselect(
-            "Posto", [v[0] for v in opcoes_posto], default=[], placeholder="Todos — ordem por UF e cidade",
+            "Posto", [v[0] for v in opcoes_posto], default=[], placeholder="Todos",
             format_func=lambda p: f"{p} ({qtd_por_posto.get(p, 0)} bomba(s))",
             key=f"eq_postos_{base}_{cliente_id}")
     candidatas = [b for b in resumo["bomba_id"]
@@ -1846,15 +1860,27 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
 
     # --- linha do tempo: todas as bombas do filtro ---
     periodos = _periodos_de_uso(uso_f, resumo)
+    agrupar = "posto"
     if not periodos.empty:
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
-        st.markdown(f"**Períodos de uso por bomba**, agrupados por quem paga hoje e, dentro dele, por posto (UF → "
-                    f"cidade) · um segmento por serial; pausas de mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem "
-                    "abastecer quebram o segmento")
+        col_tt, col_ag = st.columns([3, 1.4], vertical_alignment="bottom")
+        with col_ag:
+            agrupar_rotulo = st.segmented_control(
+                "Agrupar linha do tempo por", ["Posto", "Pagante"], default="Posto",
+                key=f"eq_agrupar_{base}_{cliente_id}") or "Posto"
+        agrupar = agrupar_rotulo.lower()
+        with col_tt:
+            st.markdown(
+                f"**Períodos de uso por bomba**, agrupados por "
+                + ("posto (os equipamentos do mesmo posto juntos) e, dentro dele, por quem paga hoje"
+                   if agrupar == "posto" else "quem paga hoje e, dentro dele, por posto")
+                + f" · um segmento por serial; pausas de mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer "
+                  "quebram o segmento")
         st.caption("O número após # (ex.: CA003 #787084) é o **ID da bomba no sistema CTA** — identifica o canal "
                    "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
-                   "abaixo. Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba).")
+                   "abaixo." + ("" if agrupar == "posto" else
+                                " Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba)."))
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
                        "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
@@ -1874,10 +1900,15 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             st.caption("Nenhuma bomba do filtro abasteceu no período.")
         else:
             st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
-                                            transferencias_f, canais_f),
+                                            transferencias_f, canais_f, agrupar),
                             use_container_width=True)
 
-    st.markdown("**Bombas do cliente** (todo o período" + (", com o filtro" if filtro_ativo else "") + ")")
+    st.markdown("**Bombas do cliente** (todo o período" + (", com o filtro" if filtro_ativo else "")
+                + (", posto a posto" if agrupar == "posto" else "") + ")")
+    if agrupar == "posto":
+        # mesma ordem da linha do tempo: posto a posto, maior volume primeiro
+        resumo_f = resumo_f.assign(_posto=resumo_f["bomba_id"].map(lambda b: postos_bomba.get(b, ("", 10 ** 6))[1])) \
+            .sort_values(["_posto", "litros_total"], ascending=[True, False]).drop(columns="_posto")
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
         "equipamento_tipo": "Equipamento", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
