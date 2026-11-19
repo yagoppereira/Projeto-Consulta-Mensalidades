@@ -84,6 +84,10 @@ COR_OUTROS_PAGANTES = CORES_BOMBAS[6]
 
 # timeline: mais de N dias sem abastecer quebra o período de uso
 DIAS_SEM_USO_QUEBRA_PERIODO = 30
+# equipamento instalado no cadastro só conta como ATIVO (sinalizando) se
+# abasteceu nos últimos N dias — o cadastro sozinho mantém equipamento parado
+# como "instalado" indefinidamente
+DIAS_SINAL_ATIVO = 30
 # acima disso a timeline mostra só as N bombas de maior volume do filtro
 # (cliente grande chega a 200+ bombas, ~6000px de gráfico) — o filtro de
 # pagante/bomba no topo da aba é o caminho pra ver as outras
@@ -1237,6 +1241,59 @@ def rotulo_de_busca(linha) -> str:
     return " · ".join(partes)
 
 
+def marcar_sinal(resumo: pd.DataFrame, referencia) -> pd.DataFrame:
+    """Sinal de cada bomba HOJE, pelo último abastecimento: `sinalizando`
+    (instalada e abasteceu nos últimos DIAS_SINAL_ATIVO dias até
+    `referencia`), `dias_sem_sinal` e o texto `sinal` da tabela. Bomba que não
+    está instalada hoje fica com "—"."""
+    r = resumo.copy()
+    ref = pd.Timestamp(referencia).normalize()
+    ultimo = pd.to_datetime(r["ultimo_abastecimento"])
+    r["dias_sem_sinal"] = (ref - ultimo).dt.days
+    instalada = r["situacao"].isin(SITUACOES_ATIVAS)
+    r["sinalizando"] = instalada & r["dias_sem_sinal"].le(DIAS_SINAL_ATIVO)
+    textos = []
+    for ok, inst, dias, ult in zip(r["sinalizando"], instalada, r["dias_sem_sinal"], ultimo):
+        if not inst:
+            textos.append("—")
+        elif pd.isna(ult):
+            textos.append("Nunca abasteceu")
+        elif ok:
+            textos.append("Sinalizando")
+        else:
+            textos.append(f"Sem sinal há {int(dias)} dias")
+    r["sinal"] = textos
+    return r
+
+
+def _chave_posto(nome, cidade, uf) -> tuple:
+    """Ordem de PROXIMIDADE dos postos: UF → cidade → nome. O cadastro não
+    tem coordenada, então o mais perto que dá de "postos vizinhos juntos" é
+    agrupar por estado e cidade. Posto sem UF/cidade vai pro fim."""
+    def _txt(v):
+        return _normalizar_texto(v) if isinstance(v, str) and v.strip() else ""
+    u, c, n = _txt(uf), _txt(cidade), _txt(nome)
+    return (u == "", u, c == "", c, n)
+
+
+def rotulo_posto(nome, cidade, uf) -> str:
+    """"Posto · Cidade/UF" (só o que existir); sem posto, o aviso."""
+    if not (isinstance(nome, str) and nome.strip()):
+        return "Sem posto (bomba fora do cadastro)"
+    local = "/".join(v.strip() for v in (cidade, uf) if isinstance(v, str) and v.strip())
+    return nome.strip() + (f" · {local}" if local else "")
+
+
+def postos_do_resumo(resumo: pd.DataFrame) -> dict:
+    """bomba_id → (rótulo do posto, posição na ordem de proximidade)."""
+    linhas = {}
+    for _, r in resumo.iterrows():
+        rot = rotulo_posto(r.get("posto_nome"), r.get("posto_cidade"), r.get("posto_uf"))
+        linhas[r["bomba_id"]] = (rot, _chave_posto(r.get("posto_nome"), r.get("posto_cidade"), r.get("posto_uf")))
+    ordem = {rot: i for i, (rot, _) in enumerate(sorted(set(linhas.values()), key=lambda x: x[1]))}
+    return {b: (rot, ordem[rot]) for b, (rot, _) in linhas.items()}
+
+
 def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None) -> pd.DataFrame:
     """Uma linha por bomba da timeline, na ordem de exibição, agrupada pelo
     PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
@@ -1264,8 +1321,13 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.Data
     if df.empty:
         return df
     df["equip"] = [equip_de.get(b, f"bomba {b}") for b in df["bomba_id"]]
+    # dentro do pagante, POSTO a posto na ordem de proximidade (UF → cidade);
+    # canais de um equipamento seguem juntos (mesmo posto)
+    postos = postos_do_resumo(resumo)
+    df["posto_ordem"] = [postos.get(b, ("", 10 ** 6))[1] for b in df["bomba_id"]]
+    df["posto_ordem"] = df.groupby(["grupo", "equip"])["posto_ordem"].transform("min")
     df["inicio_equip"] = df.groupby(["grupo", "equip"])["inicio"].transform("min")
-    return df.sort_values(["rank", "grupo", "inicio_equip", "equip", "inicio"]).reset_index(drop=True)
+    return df.sort_values(["rank", "grupo", "posto_ordem", "inicio_equip", "equip", "inicio"]).reset_index(drop=True)
 
 
 def alertas_de_pagante(resumo: pd.DataFrame) -> list:
@@ -1358,10 +1420,28 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         for _, c in canais.iterrows():
             for b in c["bombas"]:
                 tipo_canal[b] = _tipo_por_canais(c["canais"])
-    rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
-               + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
-               for b, n in info["bomba_nome"].items()}
+    # com mais de um posto, o nome do posto abre o rótulo (as bombas já vêm
+    # ordenadas posto a posto) — a não ser que o nome da bomba já o contenha
     postos = info["posto_nome"].to_dict()
+    varios_postos = info.loc[info.index.isin(ordem["bomba_id"]), "posto_nome"].dropna().nunique() > 1
+
+    def _prefixo_posto(b, nome_bomba):
+        posto = postos.get(b)
+        if not varios_postos or not isinstance(posto, str) or not posto.strip():
+            return ""
+        if _normalizar_texto(posto) in _normalizar_texto(nome_bomba):
+            return ""
+        return f"{_truncar(_sem_prefixo_do_cliente(posto, nome_cliente), 24)} › "
+
+    sem_sinal = {b: int(d) for b, ok, inst, d in zip(
+        info.index, info.get("sinalizando", pd.Series(True, index=info.index)),
+        info["situacao"].isin(SITUACOES_ATIVAS), info.get("dias_sem_sinal", pd.Series(0, index=info.index)))
+        if inst and not ok and pd.notna(d)}
+    rotulos = {b: ("⚠ " if alerta.get(b) else "") + _prefixo_posto(b, n)
+               + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
+               + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
+               + (f" · sem sinal há {sem_sinal[b]}d" if b in sem_sinal else "")
+               for b, n in info["bomba_nome"].items()}
     ids_op = info["id_op"].to_dict() if "id_op" in info else {}
     grupos = dict(zip(ordem["bomba_id"], ordem["grupo"]))
 
@@ -1626,6 +1706,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         alocacao = alocacao_do_cliente(bombas_alocadas, carregar_cadastro_bombas(client_bq, project_id),
                                        base, cliente_id, ativas)
     resumo = anexar_alocacao(resumo, alocacao) if alocacao is not None else resumo
+    # sinal HOJE: o fato atualiza 1x por dia, então "hoje" é a data de hoje;
+    # no demo os dados são fixos e a referência é o último dia deles
+    referencia_sinal = (uso["data"].max() if modo_demo and not uso.empty
+                        else pd.Timestamp.today().normalize())
+    resumo = marcar_sinal(resumo, referencia_sinal)
 
     # percurso de cada serial fora das bombas do cliente (outros clientes e
     # outras bases): é o que mostra transferência não documentada
@@ -1659,8 +1744,12 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     rotulos_busca = {r["bomba_id"]: rotulo_de_busca(r) for _, r in resumo.iterrows()}
     anos = sorted(uso_b["data"].dt.year.unique().tolist()) if not uso_b.empty else []
 
+    postos_bomba = postos_do_resumo(resumo)
+    opcoes_posto = sorted({v for v in postos_bomba.values()}, key=lambda v: v[1])
+    qtd_por_posto = pd.Series([v[0] for v in postos_bomba.values()]).value_counts().to_dict()
+
     st.markdown("**Filtros** · valem para os números, os gráficos, as tabelas e as transferências abaixo")
-    col_p, col_g, col_b = st.columns([1, 2.4, 3.6])
+    col_p, col_g, col_po, col_b = st.columns([1, 2.1, 2.1, 2.8])
     with col_p:
         periodo = st.selectbox("Período", ["Todo o período"] + [str(a) for a in reversed(anos)],
                                key=f"eq_periodo_{base}_{cliente_id}")
@@ -1669,8 +1758,15 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         grupos_escolhidos = st.multiselect(
             "Pagante hoje / situação", opcoes_grupo, default=[], placeholder="Todos",
             key=f"eq_grupos_{base}_{cliente_id}")
+    with col_po:
+        # postos na ordem de proximidade (UF → cidade → nome)
+        postos_escolhidos = st.multiselect(
+            "Posto", [v[0] for v in opcoes_posto], default=[], placeholder="Todos — ordem por UF e cidade",
+            format_func=lambda p: f"{p} ({qtd_por_posto.get(p, 0)} bomba(s))",
+            key=f"eq_postos_{base}_{cliente_id}")
     candidatas = [b for b in resumo["bomba_id"]
-                  if not grupos_escolhidos or grupos_bomba.get(b, ("", 0))[0] in grupos_escolhidos]
+                  if (not grupos_escolhidos or grupos_bomba.get(b, ("", 0))[0] in grupos_escolhidos)
+                  and (not postos_escolhidos or postos_bomba.get(b, ("", 0))[0] in postos_escolhidos)]
     candidatas.sort(key=lambda b: -volume_total.get(b, 0.0))
     with col_b:
         # a chave muda com os grupos: trocar o pagante limpa a escolha de
@@ -1678,9 +1774,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         bombas_escolhidas = st.multiselect(
             "Bombas", candidatas, default=[], format_func=lambda b: rotulos_busca.get(b, b),
             placeholder="Todas — busque por nome, nº da bomba, serial atual ou ID operacional",
-            key=f"eq_bombas_{base}_{cliente_id}_{'|'.join(sorted(grupos_escolhidos))}")
+            key=f"eq_bombas_{base}_{cliente_id}_{'|'.join(sorted(grupos_escolhidos))}_{'|'.join(sorted(postos_escolhidos))}")
     filtradas = set(bombas_escolhidas) if bombas_escolhidas else set(candidatas)
-    filtro_ativo = bool(grupos_escolhidos or bombas_escolhidas)
+    filtro_ativo = bool(grupos_escolhidos or postos_escolhidos or bombas_escolhidas)
     if filtro_ativo:
         st.caption(f"Filtro ativo: {len(filtradas)} de {resumo['bomba_id'].nunique()} bombas.")
 
@@ -1701,10 +1797,19 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
 
     # --- números do período (com o filtro) ---
     equipados = resumo_f[resumo_f["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])]
+    # ATIVO = instalado no cadastro E abastecendo: equipamento (serial) conta
+    # se qualquer canal dele abasteceu nos últimos DIAS_SINAL_ATIVO dias
+    eq_sinal = equipados.groupby("equipamento_id")["sinalizando"].any() if not equipados.empty else pd.Series(dtype=bool)
+    qtd_sinal, qtd_cadastro = int(eq_sinal.sum()), int(len(eq_sinal))
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Bombas com uso no período", len(ranking))
-    m2.metric("Equipamentos instalados hoje", int(equipados["equipamento_id"].nunique()),
-              help="Seriais distintos nas bombas do cliente hoje — um equipamento duplo atende 2 bombas.")
+    m2.metric("Equipamentos ativos hoje", qtd_sinal,
+              delta=(f"{qtd_cadastro - qtd_sinal} instalado(s) sem sinal" if qtd_cadastro > qtd_sinal else None),
+              delta_color="off", delta_arrow="off",
+              help=f"Equipamentos (seriais distintos — um duplo atende 2 bombas) instalados no cadastro que "
+                   f"abasteceram nos últimos {DIAS_SINAL_ATIVO} dias (até {referencia_sinal:%d/%m/%Y}). "
+                   f"{qtd_cadastro} estão instalados no cadastro; os sem sinal aparecem na coluna 'Sinal' da "
+                   "tabela de bombas e com 'sem sinal' na linha do tempo.")
     m3.metric("Volume no período", _fmt_litros(uso_periodo["litros"].sum()))
     if not uso_periodo.empty:
         m4.metric("Período com abastecimento",
@@ -1744,8 +1849,12 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     if not periodos.empty:
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
-        st.markdown(f"**Períodos de uso por bomba**, agrupados por quem paga hoje · um segmento por serial; pausas de "
-                    f"mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer quebram o segmento")
+        st.markdown(f"**Períodos de uso por bomba**, agrupados por quem paga hoje e, dentro dele, por posto (UF → "
+                    f"cidade) · um segmento por serial; pausas de mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem "
+                    "abastecer quebram o segmento")
+        st.caption("O número após # (ex.: CA003 #787084) é o **ID da bomba no sistema CTA** — identifica o canal "
+                   "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
+                   "abaixo. Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba).")
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
                        "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
@@ -1772,7 +1881,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
         "equipamento_tipo": "Equipamento", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
-        "pagante_rotulo": "Pagante hoje (CIGAM)", "local_rotulo": "Local hoje (CIGAM)",
+        "sinal": "Sinal", "pagante_rotulo": "Pagante hoje (CIGAM)", "local_rotulo": "Local hoje (CIGAM)",
         "primeiro_abastecimento": "Primeiro abastecimento", "ultimo_abastecimento": "Último abastecimento",
         "dias_com_uso": "Dias com uso", "litros_total": "Volume total (L)",
         "media_por_dia_de_uso": "Média por dia de uso (L)", "trocas_serial": "Trocas de serial",
