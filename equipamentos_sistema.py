@@ -1899,22 +1899,27 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             except (Forbidden, NotFound, BadRequest):
                 cad_busca = None
         tabela_busca = postos_dos_candidatos(opcoes, cad_busca, aloc_busca)
-        col_txt, col_tg = st.columns([4, 1.3], vertical_alignment="bottom")
-        with col_tg:
-            # padrão: só os clientes do sistema (uma linha cada); ligado, abre
-            # os postos de cada cliente embaixo dele
-            mostrar_postos = st.toggle("Mostrar os postos", value=False, key=f"eq_mostrar_postos_{termo}",
-                                       help="Lista os postos de cada cliente para abrir o cliente já filtrado num "
-                                            "posto. Os postos onde a empresa buscada paga bombas vêm primeiro.")
-        with col_txt:
-            st.markdown(f"**{len(candidatos)} clientes encontrados** — marque a linha para abrir"
-                        + (" (o cliente inteiro ou só o posto)" if mostrar_postos else ""))
-        if not mostrar_postos:
-            tabela_busca = tabela_busca[tabela_busca["Empresa (cliente no sistema)"] != ""]
-        tabela_busca = tabela_busca.reset_index(drop=True)
+        # padrão: só os clientes do sistema (uma linha cada). Os postos abrem
+        # POR CLIENTE: escolher o cliente nas pílulas mostra os postos dele
+        # embaixo da linha dele (os outros continuam recolhidos)
+        varios = tabela_busca[tabela_busca["Posto"].str.startswith("Todos os ")]
+        nomes_cli = {int(i): f"{e.split(' · ')[0]} ({p.split(' ')[2]})"
+                     for i, e, p in zip(varios["_i"], varios["Empresa (cliente no sistema)"], varios["Posto"])}
+        st.markdown(f"**{len(candidatos)} clientes encontrados** — marque a linha para abrir o cliente"
+                    + ("; para ver os postos de um cliente, escolha-o abaixo" if nomes_cli else ""))
+        abertos = set()
+        if nomes_cli:
+            abertos = set(st.pills(
+                "Ver os postos de", list(nomes_cli), selection_mode="multi", default=[],
+                format_func=lambda i: nomes_cli[i], key=f"eq_abrir_postos_{termo}",
+                help="Mostra os postos do cliente embaixo dele; marcar um posto abre o cliente já filtrado nele. "
+                     "Os postos onde a empresa buscada paga bombas vêm primeiro.") or [])
+        tabela_busca = tabela_busca[(tabela_busca["Empresa (cliente no sistema)"] != "")
+                                    | tabela_busca["_i"].isin(abertos)].reset_index(drop=True)
+        chave_abertos = "-".join(str(i) for i in sorted(abertos))
         evento = st.dataframe(
             tabela_busca.drop(columns=["_i", "_posto"]), hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="single-row", key=f"eq_escolha_{termo}_{int(mostrar_postos)}",
+            on_select="rerun", selection_mode="single-row", key=f"eq_escolha_{termo}_{chave_abertos}",
             height=min(420, 38 + 35 * len(tabela_busca)),
             column_config={"Bombas": st.column_config.NumberColumn(format="%d")})
         linhas_sel = list(getattr(getattr(evento, "selection", None), "rows", []) or [])
@@ -1924,7 +1929,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         escolhido = opcoes.iloc[int(sel["_i"])]
         # aplica o posto escolhido no filtro Posto só quando a escolha muda —
         # depois a pessoa pode limpar o filtro à vontade
-        marca = (termo, int(mostrar_postos), int(linhas_sel[0]))
+        marca = (termo, chave_abertos, int(linhas_sel[0]))
         if st.session_state.get("eq_busca_aplicada") != marca:
             st.session_state["eq_busca_aplicada"] = marca
             st.session_state[f"eq_postos_{escolhido['base']}_{escolhido['cliente_id']}"] = \
