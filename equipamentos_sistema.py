@@ -108,13 +108,18 @@ def _normalizar_texto(texto) -> str:
 
 UFS_BRASIL = frozenset("AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split())
 _MINUSCULAS_NO_NOME = {"de", "da", "do", "das", "dos", "e"}
-# "cidades" digitadas no cadastro que não são cidade (nome de estado, país,
-# "matriz"...). Rio de Janeiro e São Paulo ficam de fora: também são cidades.
-_CIDADE_INVALIDA = frozenset({
-    "BRASIL", "MATRIZ", "FILIAL", "SEDE", "CENTRO", "ACRE", "ALAGOAS", "AMAPA", "AMAZONAS", "BAHIA", "CEARA",
-    "DISTRITO FEDERAL", "ESPIRITO SANTO", "GOIAS", "MARANHAO", "MATO GROSSO", "MATO GROSSO DO SUL", "MINAS GERAIS",
-    "PARA", "PARAIBA", "PARANA", "PERNAMBUCO", "PIAUI", "RIO GRANDE DO NORTE", "RIO GRANDE DO SUL", "RONDONIA",
-    "RORAIMA", "SANTA CATARINA", "SERGIPE", "TOCANTINS"})
+# o campo cidade do posto às vezes traz o ESTADO por extenso: vira a sigla
+# (Rio de Janeiro e São Paulo ficam de fora: também são cidades)
+_ESTADOS_POR_EXTENSO = {
+    "ACRE": "AC", "ALAGOAS": "AL", "AMAPA": "AP", "AMAZONAS": "AM", "BAHIA": "BA", "CEARA": "CE",
+    "DISTRITO FEDERAL": "DF", "ESPIRITO SANTO": "ES", "GOIAS": "GO", "MARANHAO": "MA", "MATO GROSSO": "MT",
+    "MATO GROSSO DO SUL": "MS", "MINAS GERAIS": "MG", "PARA": "PA", "PARAIBA": "PB", "PARANA": "PR",
+    "PERNAMBUCO": "PE", "PIAUI": "PI", "RIO GRANDE DO NORTE": "RN", "RIO GRANDE DO SUL": "RS", "RONDONIA": "RO",
+    "RORAIMA": "RR", "SANTA CATARINA": "SC", "SERGIPE": "SE", "TOCANTINS": "TO"}
+# "cidades" que não dizem onde fica: descartadas (a UF, se houver, continua)
+_CIDADE_SEM_LOCAL = frozenset({"BRASIL", "MATRIZ", "FILIAL", "SEDE", "CENTRO"})
+# sinais de que o campo cidade recebeu um ENDEREÇO (quadra, lote, rua...)
+_PADRAO_ENDERECO = re.compile(r"\b(QD|QUADRA|LT|LOTE|CJ|CONJ|RUA|AV|AVENIDA|ROD|RODOVIA|KM|N[OoºÂ°]|BR|SP|GO)\s*\d", re.I)
 # palavras que muitas cidades dividem: sozinhas não provam que o nome já
 # traz a cidade ("Fazenda Santa Marta" não é "Santa Maria das Barreiras")
 _PALAVRAS_COMUNS_CIDADE = frozenset({
@@ -123,19 +128,35 @@ _PALAVRAS_COMUNS_CIDADE = frozenset({
     "MATRIZ", "FILIAL", "POSTO", "TANQUE", "COMBOIO", "FAZENDA", "OBRA", "BASE"})
 
 
-def _cidade_legivel(cidade) -> str:
-    """Cidade do posto como texto de rótulo. É campo livre no cadastro, então
-    só passa o que parece cidade: sem dígito (endereço, "GOIATUBA 2"), sem
-    nome de estado/país/"matriz" e sem o "/UF" que às vezes vem colado.
+def ler_cidade_do_posto(cidade) -> tuple:
+    """O campo cidade do posto é texto livre; em vez de descartar o que vem
+    sujo, aproveita o que diz ONDE fica o aparelho. Devolve (cidade, uf_do_texto):
+    - "Rio Verde/MT" → ("Rio Verde", "MT") — a UF colada vira UF;
+    - "GOIATUBA 2" → ("Goiatuba", None); "2Campos" → ("Campos", None) — número sai;
+    - "ALAGOAS" → ("", "AL") — estado por extenso vira só a UF;
+    - "brasil", "MATRIZ", endereço ("SCIA QD 8 CJ 16...") → ("", None).
     Tudo maiúsculo ou tudo minúsculo vira "Porto Feliz"."""
     c = re.sub(r"\s+", " ", cidade.strip()) if isinstance(cidade, str) else ""
-    c = re.sub(r"\s*[/-]\s*[A-Za-z]{2}$", "", c).strip()
-    if not re.search(r"[^\W\d_]", c) or re.search(r"\d", c) or _normalizar_texto(c) in _CIDADE_INVALIDA:
-        return ""
+    uf_txt = None
+    m = re.search(r"\s*[/-]\s*([A-Za-z]{2})$", c)
+    if m and m.group(1).upper() in UFS_BRASIL:
+        uf_txt, c = m.group(1).upper(), c[:m.start()].strip()
+    if _PADRAO_ENDERECO.search(c):
+        return "", uf_txt
+    c = re.sub(r"\s+", " ", re.sub(r"\d+", " ", c)).strip(" -/.,")
+    norm = _normalizar_texto(c)
+    if norm in _ESTADOS_POR_EXTENSO:
+        return "", uf_txt or _ESTADOS_POR_EXTENSO[norm]
+    if norm in _CIDADE_SEM_LOCAL or len(re.sub(r"[^A-Z]", "", norm)) < 3:
+        return "", uf_txt
     if c.isupper() or c.islower():
         c = " ".join(p.lower() if i and p.lower() in _MINUSCULAS_NO_NOME else p.capitalize()
                      for i, p in enumerate(c.split(" ")))
-    return c
+    return c, uf_txt
+
+
+def _cidade_legivel(cidade) -> str:
+    return ler_cidade_do_posto(cidade)[0]
 
 
 def _so_letras(texto) -> str:
@@ -170,18 +191,20 @@ def _nome_ja_tem_local(nome: str, cidade: str, uf: str) -> bool:
 def sufixo_local(nome, cidade, uf) -> str:
     """" - Cidade/UF" para o nome da bomba, no modelo "Posto - Cidade/UF" das
     planilhas do financeiro. Sai da CIDADE e da UF do POSTO no cadastro do
-    sistema CTA (silver.cadastro_bombas), não do CIGAM. Vazio quando o posto
-    não tem cidade aproveitável (só a UF diz pouco) ou quando o nome já diz
-    onde a bomba está (_nome_ja_tem_local) — evita "Força Ambiental -
-    Saquarema/RJ - Saquarema/RJ"."""
-    cid = _cidade_legivel(cidade)
-    if not cid:
+    sistema CTA (silver.cadastro_bombas), não do CIGAM — limpos por
+    ler_cidade_do_posto. Sem cidade aproveitável, fica só a UF (" - SP"): pra
+    revisão, saber o estado já ajuda. Se a UF escrita no campo cidade
+    diverge da UF do posto, as duas aparecem. Vazio quando não há nem cidade
+    nem UF, ou quando o nome já diz onde a bomba está (_nome_ja_tem_local) —
+    evita "Força Ambiental - Saquarema/RJ - Saquarema/RJ"."""
+    cid, uf_txt = ler_cidade_do_posto(cidade)
+    uf_posto = uf.strip().upper() if isinstance(uf, str) else ""
+    uf_posto = uf_posto if uf_posto in UFS_BRASIL else ""
+    u = uf_txt or uf_posto
+    if not (cid or u) or _nome_ja_tem_local(nome, cid, u):
         return ""
-    u = uf.strip().upper() if isinstance(uf, str) else ""
-    u = u if u in UFS_BRASIL else ""
-    if _nome_ja_tem_local(nome, cid, u):
-        return ""
-    return f" - {cid}" + (f"/{u}" if u else "")
+    conflito = f" (UF do posto: {uf_posto})" if uf_txt and uf_posto and uf_txt != uf_posto else ""
+    return " - " + "/".join(x for x in (cid, u) if x) + conflito
 
 
 def _norm_busca(texto) -> str:
@@ -1970,7 +1993,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         st.caption("O número após # (ex.: CA003 #787084) é o **ID da bomba no sistema CTA** — identifica o canal "
                    "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
                    "abaixo. O \" - Cidade/UF\" depois do nome vem da cidade do **posto** no cadastro do sistema CTA "
-                   "(campo livre, sem validação; não é o endereço do CIGAM) — posto sem cidade fica só com o nome."
+                   "(campo livre, sem validação; não é o endereço do CIGAM). Posto sem cidade aproveitável mostra só a UF."
                    + ("" if agrupar == "posto" else
                                 " Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba)."))
         if "pagante_rotulo" in resumo:
