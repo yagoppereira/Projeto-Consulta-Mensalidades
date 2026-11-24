@@ -106,6 +106,42 @@ def _normalizar_texto(texto) -> str:
     return unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode().upper().strip()
 
 
+UFS_BRASIL = frozenset("AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split())
+_MINUSCULAS_NO_NOME = {"de", "da", "do", "das", "dos", "e"}
+
+
+def _cidade_legivel(cidade) -> str:
+    """Cidade do posto como texto de rótulo. É campo livre no cadastro:
+    vazio ou só número/pontuação não serve; tudo maiúsculo ou tudo
+    minúsculo vira "Porto Feliz" (o resto fica como foi digitado)."""
+    c = re.sub(r"\s+", " ", cidade.strip()) if isinstance(cidade, str) else ""
+    if not re.search(r"[^\W\d_]", c):
+        return ""
+    if c.isupper() or c.islower():
+        c = " ".join(p.lower() if i and p.lower() in _MINUSCULAS_NO_NOME else p.capitalize()
+                     for i, p in enumerate(c.split(" ")))
+    return c
+
+
+def sufixo_local(nome, cidade, uf) -> str:
+    """" - Cidade/UF" para o nome da bomba, no modelo "Posto - Cidade/UF" das
+    planilhas do financeiro. Sai da CIDADE e da UF do POSTO no cadastro do
+    sistema CTA (silver.cadastro_bombas), não do CIGAM. Vazio quando o posto
+    não tem cidade (só a UF diz pouco) ou quando o nome já traz a cidade ou
+    a UF ("... - Serra/ES - S10")."""
+    cid = _cidade_legivel(cidade)
+    if not cid:
+        return ""
+    u = uf.strip().upper() if isinstance(uf, str) else ""
+    u = u if u in UFS_BRASIL else ""
+    texto = str(nome or "")
+    if _normalizar_texto(cid) in _normalizar_texto(texto):
+        return ""
+    if u and re.search(rf"(?:^|[/\-\s]){u}(?:$|[\s/\-.,)])", texto.upper()):
+        return ""
+    return f" - {cid}" + (f"/{u}" if u else "")
+
+
 def _norm_busca(texto) -> str:
     """Nome pra comparar na busca: sem acento, maiúsculo, pontuação vira
     espaço — "FORCA AMBIENTAL LTDA." (CIGAM) e "Força Ambiental" (sistema)
@@ -407,7 +443,8 @@ TIPO_SAIU = "Saiu para outro cliente"
 def _rotulo_local(linha, base_cliente: str, cliente_id: str) -> str:
     """Bomba do próprio cliente: só a bomba. Fora dele: bomba · cliente
     (a base vai em coluna própria)."""
-    nome = _truncar(linha.get("bomba_nome"), 40) or "bomba fora do cadastro"
+    nome = (_truncar(linha.get("bomba_nome"), 40) or "bomba fora do cadastro") + sufixo_local(
+        linha.get("bomba_nome"), linha.get("posto_cidade"), linha.get("posto_uf"))
     if linha["base"] == base_cliente and str(linha.get("cliente_id")) == str(cliente_id):
         return f"{nome} (#{linha['bomba_id']})"
     cliente = _truncar(linha.get("cliente_nome"), 30) or "cliente desconhecido"
@@ -491,7 +528,9 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
         def _onde(inst, do_proprio):
             # no próprio cliente o que importa é a BOMBA; fora dele, o cliente
             if do_proprio:
-                bombas = " + ".join(f"{_truncar(r.get('bomba_nome'), 30) or 'bomba'} (#{r['bomba_id']})"
+                bombas = " + ".join(f"{_truncar(r.get('bomba_nome'), 30) or 'bomba'}"
+                                    f"{sufixo_local(r.get('bomba_nome'), r.get('posto_cidade'), r.get('posto_uf'))}"
+                                    f" (#{r['bomba_id']})"
                                     for r in inst["linhas"])
                 return bombas + (f" [{_tipo_por_canais(inst['canais'])}]" if inst["canais"] > 1 else "")
             outra_base = "" if inst["chave"][0] == base else \
@@ -993,7 +1032,13 @@ def montar_resumo_bombas(cadastro: pd.DataFrame, uso: pd.DataFrame, por_serial: 
     resumo["litros_total"] = resumo["litros_total"].fillna(0.0)
     resumo["dias_com_uso"] = resumo["dias_com_uso"].fillna(0).astype(int)
     resumo["media_por_dia_de_uso"] = (resumo["litros_total"] / resumo["dias_com_uso"].where(resumo["dias_com_uso"] > 0)).round(1)
-    resumo["rotulo"] = [_rotulo_bomba(b, n) for b, n in zip(resumo["bomba_id"], resumo["bomba_nome"])]
+    # "Nome - Cidade/UF (#id)": cidade e UF do posto no cadastro do sistema
+    # (ver sufixo_local) — o mesmo modelo "Posto - Cidade/UF" do financeiro
+    vazio = pd.Series(None, index=resumo.index, dtype=object)
+    resumo["rotulo"] = [
+        _rotulo_bomba(b, (n.strip() + sufixo_local(n, c, u)) if isinstance(n, str) and n.strip() else n)
+        for b, n, c, u in zip(resumo["bomba_id"], resumo["bomba_nome"],
+                              resumo.get("posto_cidade", vazio), resumo.get("posto_uf", vazio))]
     resumo["situacao"] = resumo.apply(lambda l: _situacao(l, cliente_id), axis=1)
     resumo["instalacao"] = resumo["tanque_movel"].map({True: "Móvel (comboio)", False: "Fixa (pedestal)"})
     # tipo do equipamento instalado HOJE: nº de bombas ativas do cliente com o
@@ -1437,6 +1482,8 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
     # com mais de um posto, o nome do posto abre o rótulo (as bombas já vêm
     # ordenadas posto a posto) — a não ser que o nome da bomba já o contenha
     postos = info["posto_nome"].to_dict()
+    cidades = info["posto_cidade"].to_dict() if "posto_cidade" in info else {}
+    ufs = info["posto_uf"].to_dict() if "posto_uf" in info else {}
     varios_postos = info.loc[info.index.isin(ordem["bomba_id"]), "posto_nome"].dropna().nunique() > 1
 
     def _prefixo_posto(b, nome_bomba):
@@ -1452,7 +1499,8 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         info["situacao"].isin(SITUACOES_ATIVAS), info.get("dias_sem_sinal", pd.Series(0, index=info.index)))
         if inst and not ok and pd.notna(d)}
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _prefixo_posto(b, n)
-               + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
+               + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38)
+                               + (sufixo_local(n, cidades.get(b), ufs.get(b)) if isinstance(n, str) and n.strip() else ""))
                + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
                + (f" · sem sinal há {sem_sinal[b]}d" if b in sem_sinal else "")
                for b, n in info["bomba_nome"].items()}
@@ -1879,7 +1927,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
                   "quebram o segmento")
         st.caption("O número após # (ex.: CA003 #787084) é o **ID da bomba no sistema CTA** — identifica o canal "
                    "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
-                   "abaixo." + ("" if agrupar == "posto" else
+                   "abaixo. O \" - Cidade/UF\" depois do nome vem da cidade do **posto** no cadastro do sistema CTA "
+                   "(campo livre, sem validação; não é o endereço do CIGAM) — posto sem cidade fica só com o nome."
+                   + ("" if agrupar == "posto" else
                                 " Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba)."))
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
