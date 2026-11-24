@@ -1112,10 +1112,14 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
         postos.sort(key=lambda p: (-p["hits"], -p["bombas"], p["nome"]))
         equip_cliente = _fmt_equip(*_contar(cand["base"], g)) if not g.empty else _fmt_equip(0, 0)
         if len(postos) == 1:
+            # um posto só: o cabeçalho já mostra o posto; a linha do posto vem
+            # embaixo (aparece só quando o cliente é aberto nos botões)
             p = postos[0]
-            linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": empresa, "Posto": p["nome"],
+            linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa, "Posto": p["nome"],
                            "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"],
                            "Por que apareceu": motivo})
+            linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
+                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Por que apareceu": p["liga"]})
             continue
         linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
                        "Posto": f"Todos os {len(postos)} postos" if postos else "Sem bomba instalada",
@@ -1937,18 +1941,21 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             ref_busca = pd.Timestamp.today().normalize()
         tabela_busca = postos_dos_candidatos(opcoes, cad_busca, aloc_busca, ultimo_uso, ref_busca)
 
-        # a escolha fica guardada (cliente, posto): a tabela mostra ▶ na linha
-        # aberta e o botão do cliente acende, então as duas partes contam a
-        # mesma coisa mesmo depois que a tabela é redesenhada
+        # a escolha fica guardada (cliente, posto): o botão do cliente aberto
+        # acende, então as duas partes contam a mesma coisa mesmo depois que
+        # a tabela é redesenhada
         estado = st.session_state.setdefault(f"eq_busca_estado_{termo}", {"cliente": None, "posto": None, "versao": 0})
         chave_pilulas = f"eq_abrir_postos_{termo}"
         pendente = st.session_state.pop(f"{chave_pilulas}_pendente", None)
         if pendente is not None:
             st.session_state[chave_pilulas] = pendente
 
-        varios = tabela_busca[tabela_busca["Posto"].str.startswith("Todos os ")]
-        nomes_cli = {int(i): f"{e.split(' · ')[0]} ({p.split(' ')[2]})"
-                     for i, e, p in zip(varios["_i"], varios["Empresa (cliente no sistema)"], varios["Posto"])}
+        # um botão por cliente que tem posto, na ordem da tabela, com o nº de postos
+        sub = tabela_busca[(tabela_busca["Empresa (cliente no sistema)"] == "") & tabela_busca["_posto"].notna()]
+        qtd_postos = sub.groupby("_i").size().to_dict()
+        cab = tabela_busca[tabela_busca["Empresa (cliente no sistema)"] != ""]
+        nomes_cli = {int(i): f"{e.split(' · ')[0]} ({qtd_postos[i]})"
+                     for i, e in zip(cab["_i"], cab["Empresa (cliente no sistema)"]) if i in qtd_postos}
         st.markdown(f"**{len(candidatos)} clientes encontrados** — marque a linha para abrir o cliente"
                     + ("; os botões abrem os postos de cada um" if nomes_cli else ""))
         abertos = set()
@@ -1961,17 +1968,12 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
                      "bombas vêm primeiro.") or [])
         tabela_busca = tabela_busca[(tabela_busca["Empresa (cliente no sistema)"] != "")
                                     | tabela_busca["_i"].isin(abertos)].reset_index(drop=True)
-        eh_cliente = tabela_busca["Empresa (cliente no sistema)"] != ""
-        aberto = (tabela_busca["_i"] == estado["cliente"]) & (
-            (eh_cliente & (estado["posto"] is None)) | (~eh_cliente & (tabela_busca["_posto"] == estado["posto"])))
-        tabela_busca.insert(2, "Aberto", aberto.map({True: "▶", False: ""}))
         chave_abertos = "-".join(str(i) for i in sorted(abertos))
         evento = st.dataframe(
             tabela_busca.drop(columns=["_i", "_posto"]), hide_index=True, use_container_width=True,
             on_select="rerun", selection_mode="single-row",
             key=f"eq_escolha_{termo}_{chave_abertos}_{estado['versao']}",
-            height=min(420, 38 + 35 * len(tabela_busca)),
-            column_config={"Aberto": st.column_config.TextColumn("", width=28)})
+            height=min(420, 38 + 35 * len(tabela_busca)))
         linhas_sel = list(getattr(getattr(evento, "selection", None), "rows", []) or [])
         if linhas_sel:
             sel = tabela_busca.iloc[linhas_sel[0]]
