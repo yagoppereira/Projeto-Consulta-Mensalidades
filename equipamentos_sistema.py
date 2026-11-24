@@ -108,14 +108,29 @@ def _normalizar_texto(texto) -> str:
 
 UFS_BRASIL = frozenset("AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split())
 _MINUSCULAS_NO_NOME = {"de", "da", "do", "das", "dos", "e"}
+# "cidades" digitadas no cadastro que não são cidade (nome de estado, país,
+# "matriz"...). Rio de Janeiro e São Paulo ficam de fora: também são cidades.
+_CIDADE_INVALIDA = frozenset({
+    "BRASIL", "MATRIZ", "FILIAL", "SEDE", "CENTRO", "ACRE", "ALAGOAS", "AMAPA", "AMAZONAS", "BAHIA", "CEARA",
+    "DISTRITO FEDERAL", "ESPIRITO SANTO", "GOIAS", "MARANHAO", "MATO GROSSO", "MATO GROSSO DO SUL", "MINAS GERAIS",
+    "PARA", "PARAIBA", "PARANA", "PERNAMBUCO", "PIAUI", "RIO GRANDE DO NORTE", "RIO GRANDE DO SUL", "RONDONIA",
+    "RORAIMA", "SANTA CATARINA", "SERGIPE", "TOCANTINS"})
+# palavras que muitas cidades dividem: sozinhas não provam que o nome já
+# traz a cidade ("Fazenda Santa Marta" não é "Santa Maria das Barreiras")
+_PALAVRAS_COMUNS_CIDADE = frozenset({
+    "SANTA", "SANTO", "SANTOS", "NOVA", "NOVO", "PORTO", "MONTE", "CAMPO", "CAMPOS", "VILA", "SERRA", "BELO", "BELA",
+    "ALTO", "ALTA", "BARRA", "PONTE", "LAGOA", "PEDRA", "CIDADE", "JARDIM", "VISTA", "BOM", "BOA", "GRANDE",
+    "MATRIZ", "FILIAL", "POSTO", "TANQUE", "COMBOIO", "FAZENDA", "OBRA", "BASE"})
 
 
 def _cidade_legivel(cidade) -> str:
-    """Cidade do posto como texto de rótulo. É campo livre no cadastro:
-    vazio ou só número/pontuação não serve; tudo maiúsculo ou tudo
-    minúsculo vira "Porto Feliz" (o resto fica como foi digitado)."""
+    """Cidade do posto como texto de rótulo. É campo livre no cadastro, então
+    só passa o que parece cidade: sem dígito (endereço, "GOIATUBA 2"), sem
+    nome de estado/país/"matriz" e sem o "/UF" que às vezes vem colado.
+    Tudo maiúsculo ou tudo minúsculo vira "Porto Feliz"."""
     c = re.sub(r"\s+", " ", cidade.strip()) if isinstance(cidade, str) else ""
-    if not re.search(r"[^\W\d_]", c):
+    c = re.sub(r"\s*[/-]\s*[A-Za-z]{2}$", "", c).strip()
+    if not re.search(r"[^\W\d_]", c) or re.search(r"\d", c) or _normalizar_texto(c) in _CIDADE_INVALIDA:
         return ""
     if c.isupper() or c.islower():
         c = " ".join(p.lower() if i and p.lower() in _MINUSCULAS_NO_NOME else p.capitalize()
@@ -123,21 +138,48 @@ def _cidade_legivel(cidade) -> str:
     return c
 
 
+def _so_letras(texto) -> str:
+    return re.sub(r"[^A-Z0-9]+", " ", _normalizar_texto(texto)).strip()
+
+
+def _nome_ja_tem_local(nome: str, cidade: str, uf: str) -> bool:
+    """O nome da bomba já diz onde ela está? Sim quando traz: "/UF" de
+    qualquer estado ("... - Ijuí/RS"); " - UF" do próprio posto; a cidade
+    inteira, mesmo sem acento/pontuação ("Varzea/Grande"); uma palavra
+    própria da cidade ("VIA CAXIAS" ~ Duque de Caxias); ou a cidade com erro
+    de digitação ("Monte Carmelo" ~ "Monte Caramelo")."""
+    texto = str(nome or "")
+    if re.search(r"/\s*(" + "|".join(sorted(UFS_BRASIL)) + r")\b", texto.upper()):
+        return True
+    if uf and re.search(rf"(?:^|[\-\s]){uf}(?:$|[\s/\-.,)])", texto.upper()):
+        return True
+    n, c = _so_letras(texto), _so_letras(cidade)
+    if not c:
+        return False
+    if f" {c} " in f" {n} ":
+        return True
+    palavras_nome = set(n.split())
+    if any(len(w) >= 4 and w not in _PALAVRAS_COMUNS_CIDADE and w in palavras_nome for w in c.split()):
+        return True
+    import difflib
+    pal, k = n.split(), len(c.split())
+    janelas = {" ".join(pal[i:i + t]) for t in (k - 1, k, k + 1) if t > 0 for i in range(len(pal) - t + 1)}
+    return any(difflib.SequenceMatcher(None, c, j).ratio() >= 0.85 for j in janelas)
+
+
 def sufixo_local(nome, cidade, uf) -> str:
     """" - Cidade/UF" para o nome da bomba, no modelo "Posto - Cidade/UF" das
     planilhas do financeiro. Sai da CIDADE e da UF do POSTO no cadastro do
     sistema CTA (silver.cadastro_bombas), não do CIGAM. Vazio quando o posto
-    não tem cidade (só a UF diz pouco) ou quando o nome já traz a cidade ou
-    a UF ("... - Serra/ES - S10")."""
+    não tem cidade aproveitável (só a UF diz pouco) ou quando o nome já diz
+    onde a bomba está (_nome_ja_tem_local) — evita "Força Ambiental -
+    Saquarema/RJ - Saquarema/RJ"."""
     cid = _cidade_legivel(cidade)
     if not cid:
         return ""
     u = uf.strip().upper() if isinstance(uf, str) else ""
     u = u if u in UFS_BRASIL else ""
-    texto = str(nome or "")
-    if _normalizar_texto(cid) in _normalizar_texto(texto):
-        return ""
-    if u and re.search(rf"(?:^|[/\-\s]){u}(?:$|[\s/\-.,)])", texto.upper()):
+    if _nome_ja_tem_local(nome, cid, u):
         return ""
     return f" - {cid}" + (f"/{u}" if u else "")
 
