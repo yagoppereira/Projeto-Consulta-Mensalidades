@@ -1008,16 +1008,54 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
     return achados.sort_values(["_prioridade", "qtd_bombas", "cliente_nome"], ascending=[True, False, True])
 
 
-def _rotulo_cliente(linha) -> str:
-    partes = [f"{linha['cliente_nome']}", f"id {linha['cliente_id']}", BASES_SISTEMA.get(linha["base"], linha["base"])]
-    if linha.get("cnpj"):
-        partes.append(f"CNPJ {linha['cnpj']}")
-    partes.append(f"{int(linha['qtd_bombas'])} bomba(s)")
-    if linha.get("trr_interno"):
-        partes.append("operação interna CTA")
-    if linha.get("_motivo"):
-        partes.append(f"achado por: {linha['_motivo']}")
-    return " · ".join(partes)
+def _motivo_curto(motivo: str) -> str:
+    """Motivo da busca sem o nome da empresa do CIGAM, que é o que a pessoa
+    acabou de digitar: "CIGAM 000580 PETROVERA ... paga 2 bomba(s)" →
+    "CIGAM 000580 paga 2 bomba(s)"."""
+    return re.sub(r"(CIGAM \d+) [^;]*? (paga|é local de|\(mesmo CNPJ\))", r"\1 \2", str(motivo or ""))
+
+
+MAX_POSTOS_POR_CLIENTE_NA_BUSCA = 15
+TODOS_OS_POSTOS = "— todos os postos —"
+
+
+def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame) -> pd.DataFrame:
+    """Resultado da busca POR POSTO: para cada cliente achado, uma linha
+    "todos os postos" e uma por posto (com bomba instalada primeiro), com
+    cidade/UF e nº de bombas. É o que a pessoa reconhece ("o posto de Macaé
+    da Intersea") — o porquê do achado fica numa coluna curta. Escolher um
+    posto abre o cliente já filtrado nele."""
+    cad = cadastro.copy() if cadastro is not None else pd.DataFrame()
+    if not cad.empty:
+        cad = cad[cad["equipamento_id"].notna()]
+        cad["_posto"] = [rotulo_posto(n, c, u) for n, c, u in zip(cad["posto_nome"], cad["posto_cidade"], cad["posto_uf"])]
+        cad["_local"] = ["/".join(x for x in (c, u) if isinstance(x, str) and x.strip())
+                         for c, u in zip(cad["posto_cidade"].map(_cidade_legivel), cad["posto_uf"].fillna("").str.strip())]
+    linhas = []
+    for i, (_, cand) in enumerate(candidatos.iterrows()):
+        empresa = f"{cand['cliente_nome']} · {BASES_SISTEMA.get(cand['base'], cand['base'])}"
+        motivo = _motivo_curto(cand.get("_motivo"))
+        g = cad[(cad["base"] == cand["base"]) & (cad["cliente_id"].astype(str) == str(cand["cliente_id"]))] \
+            if not cad.empty else cad
+        postos = (g.groupby(["_posto", "posto_nome"], dropna=False)
+                  .agg(local=("_local", "first"), bombas=("bomba_id", "nunique")).reset_index()
+                  .sort_values(["bombas", "_posto"], ascending=[False, True])) if not g.empty else pd.DataFrame()
+        locais = [l for l in dict.fromkeys(postos["local"]) if l] if not postos.empty else []
+        linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
+                       "Posto": TODOS_OS_POSTOS + (f" ({len(postos)})" if len(postos) else " (sem bomba instalada)"),
+                       "Cidade/UF": ", ".join(locais[:3]) + (f" +{len(locais) - 3}" if len(locais) > 3 else ""),
+                       "Bombas": int(postos["bombas"].sum()) if not postos.empty else 0,
+                       "Por que apareceu": motivo})
+        for _, ps in postos.head(MAX_POSTOS_POR_CLIENTE_NA_BUSCA).iterrows():
+            linhas.append({"_i": i, "_posto": ps["_posto"], "Empresa (cliente no sistema)": "",
+                           "Posto": _sem_prefixo_do_cliente(ps["posto_nome"], cand["cliente_nome"]) or ps["_posto"],
+                           "Cidade/UF": ps["local"], "Bombas": int(ps["bombas"]), "Por que apareceu": ""})
+        if len(postos) > MAX_POSTOS_POR_CLIENTE_NA_BUSCA:
+            linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": "",
+                           "Posto": f"… mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} posto(s) — escolha "
+                                    "'todos os postos' e use o filtro Posto", "Cidade/UF": "", "Bombas": None,
+                           "Por que apareceu": ""})
+    return pd.DataFrame(linhas)
 
 
 # --- 3. Processamento ------------------------------------------------------
@@ -1405,7 +1443,7 @@ def postos_do_resumo(resumo: pd.DataFrame) -> dict:
 
 
 def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None,
-                   agrupar: str = "pagante") -> pd.DataFrame:
+                   agrupar: str = "pagante", nome_cliente: str = None) -> pd.DataFrame:
     """Uma linha por bomba da timeline, na ordem de exibição.
     agrupar="posto": um bloco por POSTO (postos com bomba instalada hoje
     primeiro, depois por nome; bomba fora do cadastro no fim) e, dentro do
@@ -1437,7 +1475,10 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.Data
         if agrupar == "posto":
             # no eixo, só o nome do posto (cidade/UF ficam no filtro)
             nome_posto = info.at[bomba, "posto_nome"] if bomba in info.index else None
-            grupo = _truncar(nome_posto, 40) if isinstance(nome_posto, str) and nome_posto.strip() else posto
+            # "OURO NEGRO TRANSPORTES E TURISMO - Rio das ostras/RJ" → "Rio das ostras/RJ":
+            # o cliente já está no título da aba
+            grupo = (_truncar(_sem_prefixo_do_cliente(nome_posto, nome_cliente), 40)
+                     if isinstance(nome_posto, str) and nome_posto.strip() else posto)
             linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank_posto, "sub": rank_pagante,
                            "inicio": g["inicio"].min()})
         else:
@@ -1532,7 +1573,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
     hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
     (alocação CIGAM); pagante com conta própria no sistema ganha contorno
     vermelho e ⚠ no nome."""
-    ordem = ordem_timeline(periodos, resumo, canais, agrupar)
+    ordem = ordem_timeline(periodos, resumo, canais, agrupar, nome_cliente)
     info = resumo.set_index("bomba_id")
     tem_alocacao = "pagante_rotulo" in resumo
     alerta = info["pagante_fora_do_grupo"].to_dict() if tem_alocacao else {}
@@ -1563,13 +1604,28 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         info.index, info.get("sinalizando", pd.Series(True, index=info.index)),
         info["situacao"].isin(SITUACOES_ATIVAS), info.get("dias_sem_sinal", pd.Series(0, index=info.index)))
         if inst and not ok and pd.notna(d)}
+    def _nome_na_linha(b, n):
+        """Nome da bomba sem o que já está escrito ao lado: o cliente (título
+        da aba) e, agrupando por posto, o nome do posto (rótulo do bloco) —
+        "OURO NEGRO ... - SJB/RJ S10" no posto "OURO NEGRO ... - SJB/RJ" vira
+        "S10"; se não sobra nada, fica "Bomba"."""
+        curto = _sem_prefixo_do_cliente(n, nome_cliente)
+        posto = postos.get(b)
+        if agrupar == "posto" and isinstance(posto, str) and posto.strip():
+            posto_curto = _sem_prefixo_do_cliente(posto, nome_cliente)
+            if _normalizar_texto(curto) == _normalizar_texto(posto_curto):
+                return "Bomba"
+            curto = _sem_prefixo_do_cliente(curto, posto_curto)
+        return _truncar(curto, 38)
+
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _prefixo_posto(b, n)
-               + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38)
+               + _rotulo_bomba(b, _nome_na_linha(b, n)
                                + (sufixo_local(n, cidades.get(b), ufs.get(b)) if isinstance(n, str) and n.strip() else ""))
                + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
                + (f" · sem sinal há {sem_sinal[b]}d" if b in sem_sinal else "")
                for b, n in info["bomba_nome"].items()}
     ids_op = info["id_op"].to_dict() if "id_op" in info else {}
+    moveis = info["tanque_movel"].to_dict() if "tanque_movel" in info else {}
     grupos = dict(zip(ordem["bomba_id"], ordem["grupo"]))
 
     def eixo_y(bombas):
@@ -1592,6 +1648,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
     def _hover(p, extra):
         return [
             f"<b>{rotulos.get(b, b)}</b><br>Posto: {postos.get(b) or '—'}"
+            + (" · comboio: local = posto de cadastro" if moveis.get(b) is True else "")
             + (f" · ID operacional {ids_op[b]}" if isinstance(ids_op.get(b), str) else "")
             + f"<br>Serial {s or '—'} · {extra(b)}<br>"
             f"{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
@@ -1770,18 +1827,39 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         return
     if len(candidatos) == 1:
         escolhido = candidatos.iloc[0]
-        st.caption(f"Achado por: {escolhido['_motivo']}")
+        st.caption(f"Achado por: {_motivo_curto(escolhido['_motivo'])}")
     else:
+        # um cliente por bloco e os POSTOS dele (cidade, nº de bombas):
+        # escolher o posto já abre o cliente filtrado nele
         opcoes = candidatos.head(200)
-        idx = st.selectbox(
-            f"{len(candidatos)} clientes encontrados — escolha um",
-            options=list(range(len(opcoes))), index=None,
-            format_func=lambda i: _rotulo_cliente(opcoes.iloc[i]),
-            placeholder="Selecione o cliente", key=f"eq_escolha_{termo}",
-        )
-        if idx is None:
+        if modo_demo:
+            cad_busca = parque_demo[0].rename(columns={"cliente_id_atual": "cliente_id"}).assign(base="cta")
+        else:
+            try:
+                cad_busca = carregar_cadastro_bombas(client_bq, project_id)
+            except (Forbidden, NotFound, BadRequest):
+                cad_busca = None
+        tabela_busca = postos_dos_candidatos(opcoes, cad_busca)
+        st.markdown(f"**{len(candidatos)} clientes encontrados** — clique no posto (ou em 'todos os postos') "
+                    "para abrir")
+        evento = st.dataframe(
+            tabela_busca.drop(columns=["_i", "_posto"]), hide_index=True, use_container_width=True,
+            on_select="rerun", selection_mode="single-row", key=f"eq_escolha_{termo}",
+            height=min(420, 38 + 35 * len(tabela_busca)),
+            column_config={"Bombas": st.column_config.NumberColumn(format="%d")})
+        linhas_sel = list(getattr(getattr(evento, "selection", None), "rows", []) or [])
+        if not linhas_sel:
             return
-        escolhido = opcoes.iloc[idx]
+        sel = tabela_busca.iloc[linhas_sel[0]]
+        escolhido = opcoes.iloc[int(sel["_i"])]
+        # aplica o posto escolhido no filtro Posto só quando a escolha muda —
+        # depois a pessoa pode limpar o filtro à vontade
+        marca = (termo, int(linhas_sel[0]))
+        if st.session_state.get("eq_busca_aplicada") != marca:
+            st.session_state["eq_busca_aplicada"] = marca
+            st.session_state[f"eq_postos_{escolhido['base']}_{escolhido['cliente_id']}"] = \
+                [sel["_posto"]] if isinstance(sel["_posto"], str) else []
+        st.caption(f"Achado por: {_motivo_curto(escolhido['_motivo'])}")
 
     base, cliente_id = escolhido["base"], escolhido["cliente_id"]
     if modo_demo:
@@ -1886,9 +1964,14 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             "Pagante hoje / situação", opcoes_grupo, default=[], placeholder="Todos",
             key=f"eq_grupos_{base}_{cliente_id}")
     with col_po:
-        # postos com bomba instalada hoje primeiro, depois por nome
+        # postos com bomba instalada hoje primeiro, depois por nome; um posto
+        # vindo da busca que não exista mais nas opções é descartado
+        chave_postos = f"eq_postos_{base}_{cliente_id}"
+        if chave_postos in st.session_state:
+            validos = {v[0] for v in opcoes_posto}
+            st.session_state[chave_postos] = [p for p in st.session_state[chave_postos] if p in validos]
         postos_escolhidos = st.multiselect(
-            "Posto", [v[0] for v in opcoes_posto], default=[], placeholder="Todos",
+            "Posto", [v[0] for v in opcoes_posto], placeholder="Todos",
             format_func=lambda p: f"{p} ({qtd_por_posto.get(p, 0)} bomba(s))",
             key=f"eq_postos_{base}_{cliente_id}")
     candidatas = [b for b in resumo["bomba_id"]
@@ -1994,6 +2077,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
                    "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
                    "abaixo. O \" - Cidade/UF\" depois do nome vem da cidade do **posto** no cadastro do sistema CTA "
                    "(campo livre, sem validação; não é o endereço do CIGAM). Posto sem cidade aproveitável mostra só a UF."
+                   + (" **Comboio (móvel):** a Cidade/UF é a do posto em que ele está cadastrado, não onde está "
+                      "agora — pode ter mudado de obra sem atualização no cadastro."
+                      if resumo_f.get("tanque_movel", pd.Series(dtype=object)).eq(True).any() else "")
                    + ("" if agrupar == "posto" else
                                 " Com mais de um posto, o nome do posto abre o rótulo (Posto › Bomba)."))
         if "pagante_rotulo" in resumo:
