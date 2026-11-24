@@ -959,6 +959,7 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
     so_numero = bool(digitos) and re.fullmatch(r"[\d.\-/\s]+", termo) is not None
     termo_norm = _norm_busca(termo)
     motivos = {}  # (base, cliente_id) -> [(prioridade, texto)]
+    cigam_casados = {}  # (base, cliente_id) -> {código CIGAM que paga/é local de bomba dele}
 
     def _marcar(df, prioridade, texto):
         for base, cid, txt in zip(df["base"], df["cliente_id"], texto if not isinstance(texto, str) else [texto] * len(df)):
@@ -992,6 +993,8 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
         for (base, cid), g in achadas.groupby(["base", "cliente_id"]):
             for _, linha in g.iterrows():
                 motivos.setdefault((base, cid), []).append(_motivo_chave(linha))
+                if linha["tipo"] == "cigam":
+                    cigam_casados.setdefault((base, cid), set()).add(str(linha["chave"]))
 
     if not motivos:
         return diretorio.iloc[0:0].assign(_motivo="", _prioridade=0)
@@ -1005,6 +1008,7 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
     pares = list(zip(achados["base"], achados["cliente_id"]))
     achados["_prioridade"] = [resumo_motivos[k][0] for k in pares]
     achados["_motivo"] = [resumo_motivos[k][1] for k in pares]
+    achados["_cigam"] = [tuple(sorted(cigam_casados.get(k, ()))) for k in pares]
     return achados.sort_values(["_prioridade", "qtd_bombas", "cliente_nome"], ascending=[True, False, True])
 
 
@@ -1012,50 +1016,97 @@ def _motivo_curto(motivo: str) -> str:
     """Motivo da busca sem o nome da empresa do CIGAM, que é o que a pessoa
     acabou de digitar: "CIGAM 000580 PETROVERA ... paga 2 bomba(s)" →
     "CIGAM 000580 paga 2 bomba(s)"."""
-    return re.sub(r"(CIGAM \d+) [^;]*? (paga|é local de|\(mesmo CNPJ\))", r"\1 \2", str(motivo or ""))
+    texto = re.sub(r"(CIGAM \d+) [^;]*? (paga|é local de|\(mesmo CNPJ\))", r"\1 \2", str(motivo or ""))
+    texto = re.sub(r"(CIGAM \d+) \(mesmo CNPJ\)", r"mesmo CNPJ do \1", texto)
+    return texto.replace("nome no sistema", "nome").replace(" bomba(s)", "")
 
 
 MAX_POSTOS_POR_CLIENTE_NA_BUSCA = 15
 TODOS_OS_POSTOS = "— todos os postos —"
 
 
-def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame) -> pd.DataFrame:
-    """Resultado da busca POR POSTO: para cada cliente achado, uma linha
-    "todos os postos" e uma por posto (com bomba instalada primeiro), com
-    cidade/UF e nº de bombas. É o que a pessoa reconhece ("o posto de Macaé
-    da Intersea") — o porquê do achado fica numa coluna curta. Escolher um
-    posto abre o cliente já filtrado nele."""
+def _resumo_cidades(locais: list) -> str:
+    """Cidades dos postos de um cliente num texto curto: "São Gonçalo,
+    Paciência, Saquarema +6 (RJ)" quando é tudo da mesma UF, senão
+    "Macaé/RJ, Itajubá/MG +2". Posto só com UF não entra (já está no fim)."""
+    pares = list(dict.fromkeys((c, u) for c, u in locais if c or u))
+    cidades = [(c, u) for c, u in pares if c]
+    ufs = {u for _, u in pares if u}
+    if not cidades:
+        return ", ".join(sorted(ufs))
+    if len(ufs) <= 1:
+        nomes = list(dict.fromkeys(c for c, _ in cidades))
+        txt = ", ".join(nomes[:3]) + (f" +{len(nomes) - 3}" if len(nomes) > 3 else "")
+        return txt + (f" ({next(iter(ufs))})" if ufs else "")
+    nomes = list(dict.fromkeys(f"{c}/{u}" if u else c for c, u in cidades))
+    return ", ".join(nomes[:3]) + (f" +{len(nomes) - 3}" if len(nomes) > 3 else "")
+
+
+def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
+                          bombas_alocadas: pd.DataFrame = None) -> pd.DataFrame:
+    """Resultado da busca POR POSTO: por cliente achado, uma linha "todos os
+    N postos" e uma por posto, com cidade/UF e nº de bombas. Cliente de um
+    posto só tem uma linha. Quando a busca casou por empresa do CIGAM (quem
+    paga/é local), o posto mostra quantas bombas DELE essa empresa paga e
+    esses postos vêm primeiro — é onde está o que a pessoa procurou.
+    Cidade/UF fica em branco quando o nome do posto já diz o local."""
     cad = cadastro.copy() if cadastro is not None else pd.DataFrame()
     if not cad.empty:
-        cad = cad[cad["equipamento_id"].notna()]
+        cad = cad[cad["equipamento_id"].notna()].copy()
+        cad["cliente_id"] = cad["cliente_id"].astype(str)
+        cad["bomba_id"] = cad["bomba_id"].astype(str)
         cad["_posto"] = [rotulo_posto(n, c, u) for n, c, u in zip(cad["posto_nome"], cad["posto_cidade"], cad["posto_uf"])]
-        cad["_local"] = ["/".join(x for x in (c, u) if isinstance(x, str) and x.strip())
-                         for c, u in zip(cad["posto_cidade"].map(_cidade_legivel), cad["posto_uf"].fillna("").str.strip())]
+        cad["_cid"] = cad["posto_cidade"].map(_cidade_legivel)
+        cad["_uf"] = cad["posto_uf"].map(lambda u: u.strip().upper() if isinstance(u, str) and u.strip().upper()
+                                         in UFS_BRASIL else "")
+    aloc = {}
+    if bombas_alocadas is not None and not bombas_alocadas.empty:
+        for base, b, pg, lc in zip(bombas_alocadas["base"], bombas_alocadas["bomba_id"].astype(str),
+                                   bombas_alocadas["cliente_cigam_pagante"], bombas_alocadas["cliente_cigam_local"]):
+            aloc[(base, b)] = tuple(f"{int(c):06d}" if pd.notna(c) and str(c).strip().isdigit() else None for c in (pg, lc))
     linhas = []
     for i, (_, cand) in enumerate(candidatos.iterrows()):
         empresa = f"{cand['cliente_nome']} · {BASES_SISTEMA.get(cand['base'], cand['base'])}"
         motivo = _motivo_curto(cand.get("_motivo"))
-        g = cad[(cad["base"] == cand["base"]) & (cad["cliente_id"].astype(str) == str(cand["cliente_id"]))] \
-            if not cad.empty else cad
-        postos = (g.groupby(["_posto", "posto_nome"], dropna=False)
-                  .agg(local=("_local", "first"), bombas=("bomba_id", "nunique")).reset_index()
-                  .sort_values(["bombas", "_posto"], ascending=[False, True])) if not g.empty else pd.DataFrame()
-        locais = [l for l in dict.fromkeys(postos["local"]) if l] if not postos.empty else []
+        codigos = set(cand.get("_cigam") or ())
+        quem = ("CIGAM " + "/".join(sorted(codigos))) if codigos else ""
+        g = cad[(cad["base"] == cand["base"]) & (cad["cliente_id"] == str(cand["cliente_id"]))] if not cad.empty else cad
+        postos = []
+        for (rot, nome), gp in (g.groupby(["_posto", "posto_nome"], dropna=False) if not g.empty else []):
+            pagas = locais = 0
+            for b in gp["bomba_id"].unique():
+                pg, lc = aloc.get((cand["base"], b), (None, None))
+                pagas += pg in codigos
+                locais += lc in codigos and pg not in codigos
+            cid, uf = gp["_cid"].iloc[0], gp["_uf"].iloc[0]
+            nome_curto = _sem_prefixo_do_cliente(nome, cand["cliente_nome"]) or rot
+            postos.append({"rot": rot, "nome": nome_curto, "cid": cid, "uf": uf, "bombas": gp["bomba_id"].nunique(),
+                           "hits": pagas + locais,
+                           "local": "" if _nome_ja_tem_local(nome_curto, cid, uf) else "/".join(x for x in (cid, uf) if x),
+                           "liga": "; ".join(x for x in (
+                               f"{quem} paga {pagas} aqui" if pagas else "", f"{quem} é local de {locais} aqui" if locais else "")
+                               if x)})
+        postos.sort(key=lambda p: (-p["hits"], -p["bombas"], p["nome"]))
+        total = sum(p["bombas"] for p in postos)
+        if len(postos) == 1:
+            p = postos[0]
+            linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": empresa, "Posto": p["nome"],
+                           "Cidade/UF": p["local"], "Bombas": p["bombas"],
+                           "Por que apareceu": motivo})
+            continue
         linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
-                       "Posto": TODOS_OS_POSTOS + (f" ({len(postos)})" if len(postos) else " (sem bomba instalada)"),
-                       "Cidade/UF": ", ".join(locais[:3]) + (f" +{len(locais) - 3}" if len(locais) > 3 else ""),
-                       "Bombas": int(postos["bombas"].sum()) if not postos.empty else 0,
-                       "Por que apareceu": motivo})
-        for _, ps in postos.head(MAX_POSTOS_POR_CLIENTE_NA_BUSCA).iterrows():
-            linhas.append({"_i": i, "_posto": ps["_posto"], "Empresa (cliente no sistema)": "",
-                           "Posto": _sem_prefixo_do_cliente(ps["posto_nome"], cand["cliente_nome"]) or ps["_posto"],
-                           "Cidade/UF": ps["local"], "Bombas": int(ps["bombas"]), "Por que apareceu": ""})
+                       "Posto": f"Todos os {len(postos)} postos" if postos else "Sem bomba instalada",
+                       "Cidade/UF": _resumo_cidades([(p["cid"], p["uf"]) for p in postos]),
+                       "Bombas": total, "Por que apareceu": motivo})
+        for p in postos[:MAX_POSTOS_POR_CLIENTE_NA_BUSCA]:
+            linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
+                           "Cidade/UF": p["local"], "Bombas": p["bombas"], "Por que apareceu": p["liga"]})
         if len(postos) > MAX_POSTOS_POR_CLIENTE_NA_BUSCA:
             linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": "",
-                           "Posto": f"… mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} posto(s) — escolha "
-                                    "'todos os postos' e use o filtro Posto", "Cidade/UF": "", "Bombas": None,
-                           "Por que apareceu": ""})
-    return pd.DataFrame(linhas)
+                           "Posto": f"   … mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} postos (abra 'Todos' e "
+                                    "use o filtro Posto)", "Cidade/UF": "", "Bombas": None, "Por que apareceu": ""})
+    return pd.DataFrame(linhas, columns=["_i", "_posto", "Empresa (cliente no sistema)", "Posto", "Cidade/UF",
+                                         "Bombas", "Por que apareceu"])
 
 
 # --- 3. Processamento ------------------------------------------------------
@@ -1584,7 +1635,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
     if canais is not None and not canais.empty:
         for _, c in canais.iterrows():
             for b in c["bombas"]:
-                tipo_canal[b] = _tipo_por_canais(c["canais"])
+                tipo_canal[b] = int(c["canais"])
     # com mais de um posto, o nome do posto abre o rótulo (as bombas já vêm
     # ordenadas posto a posto) — a não ser que o nome da bomba já o contenha
     postos = info["posto_nome"].to_dict()
@@ -1614,14 +1665,19 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         if agrupar == "posto" and isinstance(posto, str) and posto.strip():
             posto_curto = _sem_prefixo_do_cliente(posto, nome_cliente)
             if _normalizar_texto(curto) == _normalizar_texto(posto_curto):
-                return "Bomba"
+                return ""
             curto = _sem_prefixo_do_cliente(curto, posto_curto)
         return _truncar(curto, 38)
 
+    def _rotulo_linha(b, nome):
+        # nome vazio (= o posto do bloco) fica só o ID: "Bomba (#id)" não diz nada
+        return f"{nome} (#{b})" if nome else f"#{b}"
+
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _prefixo_posto(b, n)
-               + _rotulo_bomba(b, _nome_na_linha(b, n)
-                               + (sufixo_local(n, cidades.get(b), ufs.get(b)) if isinstance(n, str) and n.strip() else ""))
-               + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
+               + _rotulo_linha(b, (lambda nl: nl + sufixo_local(n, cidades.get(b), ufs.get(b)) if nl else "")(
+                   _nome_na_linha(b, n) if isinstance(n, str) and n.strip() else ""))
+               # bombas do mesmo equipamento (duplo/triplo/quádruplo): #2/#3/#4
+               + (f" · #{tipo_canal[b]}" if b in tipo_canal else "")
                + (f" · sem sinal há {sem_sinal[b]}d" if b in sem_sinal else "")
                for b, n in info["bomba_nome"].items()}
     ids_op = info["id_op"].to_dict() if "id_op" in info else {}
@@ -1715,7 +1771,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
                      f"{c['inicio']:%d/%m/%Y} → {c['fim']:%d/%m/%Y}")
             fig.add_trace(go.Scatter(
                 x=[c["inicio"]] * len(visiveis_c), y=eixo_y(visiveis_c), mode="lines+markers",
-                name="Mesmo equipamento (duplo)", legendgroup="duplo", showlegend=primeira,
+                name="Mesmo equipamento (#2 duplo, #3 triplo…)", legendgroup="duplo", showlegend=primeira,
                 hovertext=[texto] * len(visiveis_c), hoverinfo="text",
                 line=dict(color=COR_DUPLO, width=2.5),
                 marker=dict(symbol="line-ew", size=10, line=dict(width=2.5, color=COR_DUPLO)),
@@ -1832,16 +1888,19 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         # um cliente por bloco e os POSTOS dele (cidade, nº de bombas):
         # escolher o posto já abre o cliente filtrado nele
         opcoes = candidatos.head(200)
+        aloc_busca = bombas_alocadas
         if modo_demo:
             cad_busca = parque_demo[0].rename(columns={"cliente_id_atual": "cliente_id"}).assign(base="cta")
+            aloc_busca = gerar_alocacao_demo().rename(columns={"pagante_codigo": "cliente_cigam_pagante",
+                                                                "local_codigo": "cliente_cigam_local"}).assign(base="cta")
         else:
             try:
                 cad_busca = carregar_cadastro_bombas(client_bq, project_id)
             except (Forbidden, NotFound, BadRequest):
                 cad_busca = None
-        tabela_busca = postos_dos_candidatos(opcoes, cad_busca)
-        st.markdown(f"**{len(candidatos)} clientes encontrados** — clique no posto (ou em 'todos os postos') "
-                    "para abrir")
+        tabela_busca = postos_dos_candidatos(opcoes, cad_busca, aloc_busca)
+        st.markdown(f"**{len(candidatos)} clientes encontrados** — marque a linha do posto (ou 'Todos os postos') "
+                    "para abrir; os postos onde a empresa buscada paga bombas vêm primeiro")
         evento = st.dataframe(
             tabela_busca.drop(columns=["_i", "_posto"]), hide_index=True, use_container_width=True,
             on_select="rerun", selection_mode="single-row", key=f"eq_escolha_{termo}",
@@ -2073,9 +2132,10 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
                    if agrupar == "posto" else "quem paga hoje e, dentro dele, por posto")
                 + f" · um segmento por serial; pausas de mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer "
                   "quebram o segmento")
-        st.caption("O número após # (ex.: CA003 #787084) é o **ID da bomba no sistema CTA** — identifica o canal "
-                   "(a bomba), não o equipamento: o serial do equipamento aparece ao passar o mouse e na tabela "
-                   "abaixo. O \" - Cidade/UF\" depois do nome vem da cidade do **posto** no cadastro do sistema CTA "
+        st.caption("O número entre parênteses (ex.: CA003 (#787084)) é o **ID da bomba no sistema CTA** — "
+                   "identifica o canal (a bomba), não o equipamento: o serial aparece ao passar o mouse e na tabela "
+                   "abaixo. **#2, #3, #4** no fim = bombas do mesmo equipamento (duplo, triplo, quádruplo); linha "
+                   "só com o ID = bomba com o mesmo nome do posto. O \" - Cidade/UF\" depois do nome vem da cidade do **posto** no cadastro do sistema CTA "
                    "(campo livre, sem validação; não é o endereço do CIGAM). Posto sem cidade aproveitável mostra só a UF."
                    + (" **Comboio (móvel):** a Cidade/UF é a do posto em que ele está cadastrado, não onde está "
                       "agora — pode ter mudado de obra sem atualização no cadastro."
