@@ -1042,14 +1042,35 @@ def _resumo_cidades(locais: list) -> str:
     return ", ".join(nomes[:3]) + (f" +{len(nomes) - 3}" if len(nomes) > 3 else "")
 
 
+def _fmt_equip(ativos: int, instalados: int) -> str:
+    """"1 de 2" — equipamentos ativos (sinalizando) de instalados, a mesma
+    régua do card "Equipamentos ativos hoje" e do filtro Posto."""
+    return f"{ativos} de {instalados}" if instalados else "nenhum instalado"
+
+
 def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
-                          bombas_alocadas: pd.DataFrame = None) -> pd.DataFrame:
+                          bombas_alocadas: pd.DataFrame = None, ultimo_uso: dict = None,
+                          referencia=None) -> pd.DataFrame:
     """Resultado da busca POR POSTO: por cliente achado, uma linha "todos os
     N postos" e uma por posto, com cidade/UF e nº de bombas. Cliente de um
     posto só tem uma linha. Quando a busca casou por empresa do CIGAM (quem
     paga/é local), o posto mostra quantas bombas DELE essa empresa paga e
     esses postos vêm primeiro — é onde está o que a pessoa procurou.
-    Cidade/UF fica em branco quando o nome do posto já diz o local."""
+    Cidade/UF fica em branco quando o nome do posto já diz o local.
+    "Equipamentos ativos" = equipamentos (seriais distintos — um duplo conta
+    uma vez) instalados no cadastro, e quantos deles abasteceram nos últimos
+    DIAS_SINAL_ATIVO dias (`ultimo_uso`: (base, bomba_id) → último dia de
+    uso) — a mesma conta do card da aba, pra não haver dois números."""
+    ultimo_uso = ultimo_uso or {}
+    limite = (pd.Timestamp(referencia).normalize() - pd.Timedelta(days=DIAS_SINAL_ATIVO)) if referencia is not None else None
+
+    def _contar(base, g):
+        inst = g["equipamento_id"].nunique()
+        if limite is None:
+            return 0, inst
+        ativos = {e for e, b in zip(g["equipamento_id"], g["bomba_id"])
+                  if (u := ultimo_uso.get((base, b))) is not None and u >= limite}
+        return len(ativos), inst
     cad = cadastro.copy() if cadastro is not None else pd.DataFrame()
     if not cad.empty:
         cad = cad[cad["equipamento_id"].notna()].copy()
@@ -1080,33 +1101,36 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
                 locais += lc in codigos and pg not in codigos
             cid, uf = gp["_cid"].iloc[0], gp["_uf"].iloc[0]
             nome_curto = _sem_prefixo_do_cliente(nome, cand["cliente_nome"]) or rot
-            postos.append({"rot": rot, "nome": nome_curto, "cid": cid, "uf": uf, "bombas": gp["bomba_id"].nunique(),
+            ativos, inst = _contar(cand["base"], gp)
+            postos.append({"rot": rot, "nome": nome_curto, "cid": cid, "uf": uf, "bombas": inst,
+                           "equip": _fmt_equip(ativos, inst),
                            "hits": pagas + locais,
                            "local": "" if _nome_ja_tem_local(nome_curto, cid, uf) else "/".join(x for x in (cid, uf) if x),
                            "liga": "; ".join(x for x in (
                                f"{quem} paga {pagas} aqui" if pagas else "", f"{quem} é local de {locais} aqui" if locais else "")
                                if x)})
         postos.sort(key=lambda p: (-p["hits"], -p["bombas"], p["nome"]))
-        total = sum(p["bombas"] for p in postos)
+        equip_cliente = _fmt_equip(*_contar(cand["base"], g)) if not g.empty else _fmt_equip(0, 0)
         if len(postos) == 1:
             p = postos[0]
             linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": empresa, "Posto": p["nome"],
-                           "Cidade/UF": p["local"], "Bombas": p["bombas"],
+                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"],
                            "Por que apareceu": motivo})
             continue
         linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
                        "Posto": f"Todos os {len(postos)} postos" if postos else "Sem bomba instalada",
                        "Cidade/UF": _resumo_cidades([(p["cid"], p["uf"]) for p in postos]),
-                       "Bombas": total, "Por que apareceu": motivo})
+                       "Equipamentos ativos": equip_cliente, "Por que apareceu": motivo})
         for p in postos[:MAX_POSTOS_POR_CLIENTE_NA_BUSCA]:
             linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
-                           "Cidade/UF": p["local"], "Bombas": p["bombas"], "Por que apareceu": p["liga"]})
+                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Por que apareceu": p["liga"]})
         if len(postos) > MAX_POSTOS_POR_CLIENTE_NA_BUSCA:
             linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": "",
                            "Posto": f"   … mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} postos (abra 'Todos' e "
-                                    "use o filtro Posto)", "Cidade/UF": "", "Bombas": None, "Por que apareceu": ""})
+                                    "use o filtro Posto)", "Cidade/UF": "", "Equipamentos ativos": "",
+                           "Por que apareceu": ""})
     return pd.DataFrame(linhas, columns=["_i", "_posto", "Empresa (cliente no sistema)", "Posto", "Cidade/UF",
-                                         "Bombas", "Por que apareceu"])
+                                         "Equipamentos ativos", "Por que apareceu"])
 
 
 # --- 3. Processamento ------------------------------------------------------
@@ -1898,42 +1922,72 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
                 cad_busca = carregar_cadastro_bombas(client_bq, project_id)
             except (Forbidden, NotFound, BadRequest):
                 cad_busca = None
-        tabela_busca = postos_dos_candidatos(opcoes, cad_busca, aloc_busca)
-        # padrão: só os clientes do sistema (uma linha cada). Os postos abrem
-        # POR CLIENTE: escolher o cliente nas pílulas mostra os postos dele
-        # embaixo da linha dele (os outros continuam recolhidos)
+        # último dia de uso por bomba, pra contar equipamento ATIVO na mesma
+        # régua do card da aba (carga compartilhada de 12 h; no demo, o uso fixo)
+        if modo_demo:
+            uso_demo = parque_demo[1].dropna(subset=["bomba_id"])
+            ultimo_uso = {("cta", b): d for b, d in uso_demo.groupby("bomba_id")["data"].max().items()}
+            ref_busca = uso_demo["data"].max()
+        else:
+            try:
+                pas = carregar_passagens_seriais(client_bq, project_id)
+                ultimo_uso = pas.groupby(["base", "bomba_id"])["fim"].max().to_dict()
+            except (Forbidden, NotFound, BadRequest):
+                ultimo_uso = {}
+            ref_busca = pd.Timestamp.today().normalize()
+        tabela_busca = postos_dos_candidatos(opcoes, cad_busca, aloc_busca, ultimo_uso, ref_busca)
+
+        # a escolha fica guardada (cliente, posto): a tabela mostra ▶ na linha
+        # aberta e o botão do cliente acende, então as duas partes contam a
+        # mesma coisa mesmo depois que a tabela é redesenhada
+        estado = st.session_state.setdefault(f"eq_busca_estado_{termo}", {"cliente": None, "posto": None, "versao": 0})
+        chave_pilulas = f"eq_abrir_postos_{termo}"
+        pendente = st.session_state.pop(f"{chave_pilulas}_pendente", None)
+        if pendente is not None:
+            st.session_state[chave_pilulas] = pendente
+
         varios = tabela_busca[tabela_busca["Posto"].str.startswith("Todos os ")]
         nomes_cli = {int(i): f"{e.split(' · ')[0]} ({p.split(' ')[2]})"
                      for i, e, p in zip(varios["_i"], varios["Empresa (cliente no sistema)"], varios["Posto"])}
         st.markdown(f"**{len(candidatos)} clientes encontrados** — marque a linha para abrir o cliente"
-                    + ("; para ver os postos de um cliente, escolha-o abaixo" if nomes_cli else ""))
+                    + ("; os botões abrem os postos de cada um" if nomes_cli else ""))
         abertos = set()
         if nomes_cli:
             abertos = set(st.pills(
-                "Ver os postos de", list(nomes_cli), selection_mode="multi", default=[],
-                format_func=lambda i: nomes_cli[i], key=f"eq_abrir_postos_{termo}",
+                "Ver os postos de", list(nomes_cli), selection_mode="multi",
+                format_func=lambda i: nomes_cli[i], key=chave_pilulas,
                 help="Mostra os postos do cliente embaixo dele; marcar um posto abre o cliente já filtrado nele. "
-                     "Os postos onde a empresa buscada paga bombas vêm primeiro.") or [])
+                     "Abrir um cliente pela tabela acende o botão dele. Os postos onde a empresa buscada paga "
+                     "bombas vêm primeiro.") or [])
         tabela_busca = tabela_busca[(tabela_busca["Empresa (cliente no sistema)"] != "")
                                     | tabela_busca["_i"].isin(abertos)].reset_index(drop=True)
+        eh_cliente = tabela_busca["Empresa (cliente no sistema)"] != ""
+        aberto = (tabela_busca["_i"] == estado["cliente"]) & (
+            (eh_cliente & (estado["posto"] is None)) | (~eh_cliente & (tabela_busca["_posto"] == estado["posto"])))
+        tabela_busca.insert(2, "Aberto", aberto.map({True: "▶", False: ""}))
         chave_abertos = "-".join(str(i) for i in sorted(abertos))
         evento = st.dataframe(
             tabela_busca.drop(columns=["_i", "_posto"]), hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="single-row", key=f"eq_escolha_{termo}_{chave_abertos}",
+            on_select="rerun", selection_mode="single-row",
+            key=f"eq_escolha_{termo}_{chave_abertos}_{estado['versao']}",
             height=min(420, 38 + 35 * len(tabela_busca)),
-            column_config={"Bombas": st.column_config.NumberColumn(format="%d")})
+            column_config={"Aberto": st.column_config.TextColumn("", width=28)})
         linhas_sel = list(getattr(getattr(evento, "selection", None), "rows", []) or [])
-        if not linhas_sel:
+        if linhas_sel:
+            sel = tabela_busca.iloc[linhas_sel[0]]
+            i_sel = int(sel["_i"])
+            # linha do CLIENTE abre o cliente inteiro; linha de POSTO, só o posto
+            posto_sel = sel["_posto"] if (sel["Empresa (cliente no sistema)"] == ""
+                                          and isinstance(sel["_posto"], str)) else None
+            estado.update(cliente=i_sel, posto=posto_sel, versao=estado["versao"] + 1)
+            esc = opcoes.iloc[i_sel]
+            st.session_state[f"eq_postos_{esc['base']}_{esc['cliente_id']}"] = [posto_sel] if posto_sel else []
+            if i_sel in nomes_cli and i_sel not in abertos:
+                st.session_state[f"{chave_pilulas}_pendente"] = sorted(abertos | {i_sel})
+            st.rerun()
+        if estado["cliente"] is None or estado["cliente"] >= len(opcoes):
             return
-        sel = tabela_busca.iloc[linhas_sel[0]]
-        escolhido = opcoes.iloc[int(sel["_i"])]
-        # aplica o posto escolhido no filtro Posto só quando a escolha muda —
-        # depois a pessoa pode limpar o filtro à vontade
-        marca = (termo, chave_abertos, int(linhas_sel[0]))
-        if st.session_state.get("eq_busca_aplicada") != marca:
-            st.session_state["eq_busca_aplicada"] = marca
-            st.session_state[f"eq_postos_{escolhido['base']}_{escolhido['cliente_id']}"] = \
-                [sel["_posto"]] if isinstance(sel["_posto"], str) else []
+        escolhido = opcoes.iloc[estado["cliente"]]
         st.caption(f"Achado por: {_motivo_curto(escolhido['_motivo'])}")
 
     base, cliente_id = escolhido["base"], escolhido["cliente_id"]
@@ -2026,7 +2080,14 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
 
     postos_bomba = postos_do_resumo(resumo)
     opcoes_posto = sorted({v for v in postos_bomba.values()}, key=lambda v: v[1])
-    qtd_por_posto = pd.Series([v[0] for v in postos_bomba.values()]).value_counts().to_dict()
+    # rótulo do filtro na MESMA régua da busca e do card: equipamentos ativos
+    # (sinalizando) de instalados no posto
+    inst_hoje = resumo[resumo["situacao"].isin(SITUACOES_ATIVAS) & resumo["equipamento_id"].notna()]
+    equip_por_posto = {}
+    for posto_rot, g in inst_hoje.assign(_p=inst_hoje["bomba_id"].map(lambda b: postos_bomba.get(b, ("", 0))[0])) \
+            .groupby("_p"):
+        sinal = g.groupby("equipamento_id")["sinalizando"].any()
+        equip_por_posto[posto_rot] = _fmt_equip(int(sinal.sum()), int(len(sinal)))
 
     st.markdown("**Filtros** · valem para os números, os gráficos, as tabelas e as transferências abaixo")
     col_p, col_g, col_po, col_b = st.columns([1, 2.1, 2.1, 2.8])
@@ -2047,7 +2108,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             st.session_state[chave_postos] = [p for p in st.session_state[chave_postos] if p in validos]
         postos_escolhidos = st.multiselect(
             "Posto", [v[0] for v in opcoes_posto], placeholder="Todos",
-            format_func=lambda p: f"{p} ({qtd_por_posto.get(p, 0)} bomba(s))",
+            format_func=lambda p: f"{p} ({equip_por_posto.get(p, 'nenhum instalado')} equip. ativos)",
             key=f"eq_postos_{base}_{cliente_id}")
     candidatas = [b for b in resumo["bomba_id"]
                   if (not grupos_escolhidos or grupos_bomba.get(b, ("", 0))[0] in grupos_escolhidos)
