@@ -1184,6 +1184,35 @@ def derivar_trocas(por_serial: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(linhas, columns=["bomba_id", "data", "serial_anterior", "serial_novo"])
 
 
+# o que no nome do tanque/bomba indica comboio: a palavra, caminhão, "CB"/"CMB",
+# "móvel" ou uma placa de veículo ("NVN9D01", "AZJ-5J83", "PLACA: JVR-4G96")
+_NOME_DIZ_MOVEL = re.compile(r"COMBOIO|CAMINHAO|\bCB\b|\bCMB|MOVEL|\b[A-Z]{3}[ -]?[0-9][A-Z0-9][0-9]{2}\b")
+_NOME_DIZ_FIXO = re.compile(r"FIXO|FIXA|PEDESTAL")
+
+
+def instalacao_com_adendo(movel, tanque_nome, bomba_nome, posto_nome) -> str:
+    """Instalação como está no CADASTRO do sistema (móvel = tanque registrado
+    como comboio), com um adendo quando o nome do tanque/bomba aponta o
+    contrário — o app não corrige a marca, só avisa que vale conferir:
+      - móvel, mas o nome diz fixo/pedestal ou o tanque tem o nome do posto
+        e nada de comboio/placa ("PIRECAL Guarani/GO") → "nome sugere fixo";
+      - fixa, mas o nome fala em comboio, caminhão ou placa → "nome sugere comboio"."""
+    if movel is None or (isinstance(movel, float) and pd.isna(movel)):
+        return "—"
+    nomes = _normalizar_texto(f"{tanque_nome or ''} {bomba_nome or ''}")
+    diz_movel = bool(_NOME_DIZ_MOVEL.search(nomes))
+    if bool(movel):
+        tanque_e_posto = (isinstance(tanque_nome, str) and isinstance(posto_nome, str) and tanque_nome.strip()
+                          and re.findall(r"[A-Z0-9]+", _normalizar_texto(tanque_nome))
+                          == re.findall(r"[A-Z0-9]+", _normalizar_texto(posto_nome)))
+        if not diz_movel and (_NOME_DIZ_FIXO.search(nomes) or tanque_e_posto):
+            return "Móvel (cadastro) · nome sugere fixo"
+        return "Móvel (comboio)"
+    if diz_movel and not _NOME_DIZ_FIXO.search(nomes):
+        return "Fixa (cadastro) · nome sugere comboio"
+    return "Fixa (pedestal)"
+
+
 def _fmt_mes_curto(d) -> str:
     return f"{d:%m/%y}"
 
@@ -1222,7 +1251,9 @@ def montar_resumo_bombas(cadastro: pd.DataFrame, uso: pd.DataFrame, por_serial: 
         for b, n, c, u in zip(resumo["bomba_id"], resumo["bomba_nome"],
                               resumo.get("posto_cidade", vazio), resumo.get("posto_uf", vazio))]
     resumo["situacao"] = resumo.apply(lambda l: _situacao(l, cliente_id), axis=1)
-    resumo["instalacao"] = resumo["tanque_movel"].map({True: "Móvel (comboio)", False: "Fixa (pedestal)"})
+    resumo["instalacao"] = [instalacao_com_adendo(m, t, n, p) for m, t, n, p in zip(
+        resumo["tanque_movel"], resumo.get("tanque_nome", pd.Series(None, index=resumo.index, dtype=object)),
+        resumo["bomba_nome"], resumo.get("posto_nome", pd.Series(None, index=resumo.index, dtype=object)))]
     # tipo do equipamento instalado HOJE: nº de bombas ativas do cliente com o
     # mesmo equipamento_id (2 = duplo), e o canal desta bomba nele
     ativa = resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"]) & resumo["equipamento_id"].notna()
@@ -2365,6 +2396,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
             "Média por dia de uso (L)": st.column_config.NumberColumn(format="localized"),
         },
     )
+
+    if resumo_f["instalacao"].astype(str).str.contains("nome sugere").any():
+        st.caption("**Instalação** vem do cadastro do sistema CTA: tanque registrado como comboio = móvel. "
+                   "\"nome sugere fixo/comboio\" = o nome do tanque ou da bomba aponta o contrário do cadastro "
+                   "(ex.: tanque com o nome do posto marcado como comboio).")
 
     equipamentos = montar_resumo_equipamentos(por_serial_f, resumo)
     if not equipamentos.empty and percursos:
