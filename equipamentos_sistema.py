@@ -1064,13 +1064,26 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
     ultimo_uso = ultimo_uso or {}
     limite = (pd.Timestamp(referencia).normalize() - pd.Timedelta(days=DIAS_SINAL_ATIVO)) if referencia is not None else None
 
-    def _contar(base, g):
-        inst = g["equipamento_id"].nunique()
+    def _ativos(base, g) -> set:
         if limite is None:
-            return 0, inst
-        ativos = {e for e, b in zip(g["equipamento_id"], g["bomba_id"])
-                  if (u := ultimo_uso.get((base, b))) is not None and u >= limite}
-        return len(ativos), inst
+            return set()
+        return {e for e, b in zip(g["equipamento_id"], g["bomba_id"])
+                if (u := ultimo_uso.get((base, b))) is not None and u >= limite}
+
+    def _contar(base, g):
+        return len(_ativos(base, g)), g["equipamento_id"].nunique()
+
+    def _seriais(base, g) -> str:
+        """Seriais dos equipamentos instalados no posto: os ativos primeiro e,
+        se houver, os instalados sem sinal entre parênteses."""
+        ativos = _ativos(base, g)
+        por_equip = g.dropna(subset=["equipamento_id"]).drop_duplicates("equipamento_id")
+        serial = {e: (str(s_).split(".")[0] if pd.notna(s_) else f"equip. {e}")
+                  for e, s_ in zip(por_equip["equipamento_id"], por_equip.get("serial_equipamento", pd.Series(
+                      None, index=por_equip.index)))}
+        on = sorted(serial[e] for e in serial if e in ativos)
+        off = sorted(serial[e] for e in serial if e not in ativos)
+        return ", ".join(on) + (f"{' · ' if on else ''}sem sinal: {', '.join(off)}" if off else "")
     cad = cadastro.copy() if cadastro is not None else pd.DataFrame()
     if not cad.empty:
         cad = cad[cad["equipamento_id"].notna()].copy()
@@ -1103,7 +1116,7 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
             nome_curto = _sem_prefixo_do_cliente(nome, cand["cliente_nome"]) or rot
             ativos, inst = _contar(cand["base"], gp)
             postos.append({"rot": rot, "nome": nome_curto, "cid": cid, "uf": uf, "bombas": inst,
-                           "equip": _fmt_equip(ativos, inst),
+                           "equip": _fmt_equip(ativos, inst), "seriais": _seriais(cand["base"], gp),
                            "hits": pagas + locais,
                            "local": "" if _nome_ja_tem_local(nome_curto, cid, uf) else "/".join(x for x in (cid, uf) if x),
                            "liga": "; ".join(x for x in (
@@ -1119,7 +1132,8 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
                            "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"],
                            "Por que apareceu": motivo})
             linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
-                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Por que apareceu": p["liga"]})
+                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Seriais ativos": p["seriais"],
+                           "Por que apareceu": p["liga"]})
             continue
         linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
                        "Posto": f"Todos os {len(postos)} postos" if postos else "Sem bomba instalada",
@@ -1127,14 +1141,16 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
                        "Equipamentos ativos": equip_cliente, "Por que apareceu": motivo})
         for p in postos[:MAX_POSTOS_POR_CLIENTE_NA_BUSCA]:
             linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
-                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Por que apareceu": p["liga"]})
+                           "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Seriais ativos": p["seriais"],
+                           "Por que apareceu": p["liga"]})
         if len(postos) > MAX_POSTOS_POR_CLIENTE_NA_BUSCA:
             linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": "",
                            "Posto": f"   … mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} postos (abra 'Todos' e "
                                     "use o filtro Posto)", "Cidade/UF": "", "Equipamentos ativos": "",
                            "Por que apareceu": ""})
     return pd.DataFrame(linhas, columns=["_i", "_posto", "Empresa (cliente no sistema)", "Posto", "Cidade/UF",
-                                         "Equipamentos ativos", "Por que apareceu"])
+                                         "Equipamentos ativos", "Seriais ativos", "Por que apareceu"]).fillna(
+        {"Seriais ativos": ""})
 
 
 # --- 3. Processamento ------------------------------------------------------
