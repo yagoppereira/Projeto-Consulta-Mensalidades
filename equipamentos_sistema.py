@@ -1951,11 +1951,24 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
             hoverinfo="text",
         ))
 
-    _layout_base(fig, 150 + 30 * len(ordem))
+    # a legenda fica ACIMA do gráfico e precisa de espaço próprio: com poucas
+    # bombas (gráfico baixo) e vários pagantes ela não cabia na margem e o
+    # Plotly a empurrava pra cima das barras. A margem de cima cresce com o nº
+    # de linhas que a legenda ocupa (estimado pela largura dos nomes numa área
+    # de ~900 px, pra sobrar folga em telas estreitas)
+    nomes_legenda = [tr.name for tr in fig.data if tr.name and tr.showlegend is not False]
+    linhas_legenda, largura_linha = 1, 0
+    for nome in nomes_legenda:
+        w = 7 * len(nome) + 45
+        if largura_linha and largura_linha + w > 900:
+            linhas_legenda, largura_linha = linhas_legenda + 1, 0
+        largura_linha += w
+    margem_topo = 16 + 24 * linhas_legenda
+    _layout_base(fig, 150 + 30 * len(ordem) + margem_topo)
     fig.update_layout(
         barmode="overlay", hovermode="closest",
-        margin=dict(l=10, r=30, t=10, b=40),
-        # legenda só explica as cores; quem filtra é o "Mostrar na linha do tempo"
+        margin=dict(l=10, r=30, t=margem_topo, b=40),
+        # legenda só explica as cores; quem filtra é o painel de filtros
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
                     itemclick=False, itemdoubleclick=False),
         xaxis=dict(type="date"),
@@ -2308,7 +2321,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
         col_tt, col_ag = st.columns([3, 1.4], vertical_alignment="bottom")
-        with col_ag:
+        with col_ag, st.container(horizontal=True, horizontal_alignment="right"):
+            # na ponta direita, alinhado à borda do gráfico
             agrupar_rotulo = st.segmented_control(
                 "Agrupar linha do tempo por", ["Posto", "Pagante"], default="Posto",
                 key=f"eq_agrupar_{base}_{cliente_id}") or "Posto"
