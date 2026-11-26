@@ -973,6 +973,12 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
             _marcar(diretorio[diretorio["cnpj"].str[:8] == digitos], 1, "raiz do CNPJ no sistema")
     elif termo_norm:
         _marcar(diretorio[_casa_inicio_de_palavra(diretorio["_nome_norm"], termo_norm)], 0, "nome no sistema")
+        # TRR (distribuidor do cliente no sistema CTA): "Petrolux" traz todos
+        # os clientes cadastrados sob ele — é como se acha bomba alocada no
+        # cliente errado dentro do mesmo distribuidor
+        if "trr_nome" in diretorio:
+            por_trr = diretorio[_casa_inicio_de_palavra(diretorio["trr_nome"].map(_norm_busca), termo_norm)]
+            _marcar(por_trr, 2, [t if _normalizar_texto(t).startswith("TRR") else f"TRR {t}" for t in por_trr["trr_nome"]])
 
     if chaves is not None and not chaves.empty:
         if so_numero:
@@ -1101,6 +1107,7 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
     linhas = []
     for i, (_, cand) in enumerate(candidatos.iterrows()):
         empresa = f"{cand['cliente_nome']} · {BASES_SISTEMA.get(cand['base'], cand['base'])}"
+        trr = cand.get("trr_nome") if isinstance(cand.get("trr_nome"), str) else ""
         motivo = _motivo_curto(cand.get("_motivo"))
         codigos = set(cand.get("_cigam") or ())
         quem = ("CIGAM " + "/".join(sorted(codigos))) if codigos else ""
@@ -1128,14 +1135,15 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
             # um posto só: o cabeçalho já mostra o posto; a linha do posto vem
             # embaixo (aparece só quando o cliente é aberto nos botões)
             p = postos[0]
-            linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa, "Posto": p["nome"],
+            linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa, "TRR": trr,
+                           "Posto": p["nome"],
                            "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"],
                            "Por que apareceu": motivo})
             linhas.append({"_i": i, "_posto": p["rot"], "Empresa (cliente no sistema)": "", "Posto": "   " + p["nome"],
                            "Cidade/UF": p["local"], "Equipamentos ativos": p["equip"], "Seriais ativos": p["seriais"],
                            "Por que apareceu": p["liga"]})
             continue
-        linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa,
+        linhas.append({"_i": i, "_posto": None, "Empresa (cliente no sistema)": empresa, "TRR": trr,
                        "Posto": f"Todos os {len(postos)} postos" if postos else "Sem bomba instalada",
                        "Cidade/UF": _resumo_cidades([(p["cid"], p["uf"]) for p in postos]),
                        "Equipamentos ativos": equip_cliente, "Por que apareceu": motivo})
@@ -1148,9 +1156,9 @@ def postos_dos_candidatos(candidatos: pd.DataFrame, cadastro: pd.DataFrame,
                            "Posto": f"   … mais {len(postos) - MAX_POSTOS_POR_CLIENTE_NA_BUSCA} postos (abra 'Todos' e "
                                     "use o filtro Posto)", "Cidade/UF": "", "Equipamentos ativos": "",
                            "Por que apareceu": ""})
-    return pd.DataFrame(linhas, columns=["_i", "_posto", "Empresa (cliente no sistema)", "Posto", "Cidade/UF",
+    return pd.DataFrame(linhas, columns=["_i", "_posto", "Empresa (cliente no sistema)", "TRR", "Posto", "Cidade/UF",
                                          "Equipamentos ativos", "Seriais ativos", "Por que apareceu"]).fillna(
-        {"Seriais ativos": ""})
+        {"Seriais ativos": "", "TRR": ""})
 
 
 # --- 3. Processamento ------------------------------------------------------
@@ -2007,7 +2015,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     (ver o comentário de custo no topo da seção de dados)."""
     st.caption(
         "Busque com o que tiver em mãos: **nome ou código do CIGAM**, **CNPJ/CPF** (do CIGAM ou do sistema, "
-        "ou só a raiz de 8 dígitos), **nº da bomba**, **serial** ou o nome/cliente_id do sistema. A busca "
+        "ou só a raiz de 8 dígitos), **nº da bomba**, **serial**, o nome/cliente_id do sistema ou o **TRR** "
+        "(distribuidor do cliente no sistema CTA — traz todos os clientes dele). A busca "
         "traduz para o cliente do **sistema CTA** que opera as bombas e mostra todas as que abasteceram nos "
         "postos dele, os seriais (equipamentos) que passaram por elas, quando trocaram, o período e o volume."
     )
@@ -2015,7 +2024,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         col_busca, col_btn = st.columns([5, 1], vertical_alignment="bottom")
         with col_busca:
             termo = st.text_input("Cliente", placeholder="Ex.: FORCA AMBIENTAL LTDA · 002112 · 20.217.115/0001-40 · "
-                                                           "bomba 547952619 · serial 12632")
+                                                           "bomba 547952619 · serial 12632 · Petrolux (TRR)")
         with col_btn:
             clicou = st.form_submit_button("Buscar", use_container_width=True, type="primary")
     if clicou:
@@ -2149,7 +2158,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     st.caption(" · ".join(filter(None, [
         f"Base {BASES_SISTEMA.get(base, base)}", f"cliente_id {cliente_id}",
         f"CNPJ {escolhido['cnpj']}" if escolhido.get("cnpj") else None,
-        f"TRR {escolhido['trr_nome']}" if escolhido.get("trr_nome") else None,
+        f"TRR (distribuidor no sistema CTA) {escolhido['trr_nome']}" if escolhido.get("trr_nome") else None,
     ])))
 
     if uso.empty and cadastro.empty:
