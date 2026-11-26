@@ -1417,18 +1417,101 @@ def rotulo_pagante_curto(rotulo, limite: int = 34) -> str:
     return _truncar(rotulo, limite + 14)
 
 
+_SEPARADORES = " -–—:/|·,."
+
+
+def _texto_alinhado(texto: str) -> str:
+    """Versão sem acento e maiúscula do texto com o MESMO comprimento (1
+    caractere por caractere), pra achar um trecho ignorando acento/caixa e
+    cortar a mesma posição no texto original."""
+    return "".join((unicodedata.normalize("NFKD", c).encode("ascii", "ignore").decode().upper() or "?")[:1]
+                   for c in texto)
+
+
+def _sem_trecho(texto, trecho, so_no_inicio: bool = False) -> str:
+    """Tira `trecho` de `texto` ignorando acento, caixa, espaço e pontuação
+    entre as palavras ("PIRECAL- Vila Propício/GO" casa com "Pirecal - Vila
+    Propicio/GO") e limpa os separadores que sobram. Só palavra inteira."""
+    texto = "" if texto is None or (isinstance(texto, float) and pd.isna(texto)) else str(texto).strip()
+    palavras = re.findall(r"[A-Z0-9]+", _normalizar_texto(trecho))
+    if not texto or not palavras:
+        return texto
+    padrao = r"(?<![A-Z0-9])" + r"[^A-Z0-9]*".join(map(re.escape, palavras)) + r"(?![A-Z0-9])"
+    m = re.search(("^[" + re.escape(_SEPARADORES) + "]*" if so_no_inicio else "") + padrao, _texto_alinhado(texto))
+    if not m:
+        return texto
+    resto = texto[:m.start()] + " " + texto[m.end():]
+    resto = re.sub(r"\s+", " ", resto)
+    resto = re.sub(r"(^|\s)/\s*[A-Za-z]{2}\b", r"\1", resto)       # "/SP" que sobrou da cidade tirada
+    resto = re.sub(r"\s*[-–—]\s*(?:[-–—]\s*)+", " - ", resto)   # "A -  - B" → "A - B"
+    return resto.strip(_SEPARADORES + " ")
+
+
+_SUFIXOS_SOCIETARIOS = frozenset({"LTDA", "SA", "S", "A", "EIRELI", "ME", "EPP", "CIA", "E", "DE", "DO", "DA"})
+
+
+def _palavras_do_cliente(nome_cliente) -> frozenset:
+    return frozenset(re.findall(r"[A-Z0-9]+", _normalizar_texto(nome_cliente))) | _SUFIXOS_SOCIETARIOS
+
+
 def _sem_prefixo_do_cliente(nome, nome_cliente) -> str:
-    """Tira do nome da bomba o nome do cliente quando ele vem na frente
-    ("Força Ambiental - Saquarema/RJ" → "Saquarema/RJ"): repete em quase
-    toda linha e empurra o que diferencia as bombas pra fora do rótulo."""
+    """Tira do começo do nome da bomba/posto as palavras que são do nome do
+    cliente ("RODOZINHO TRANSPORTES - Rio Negro/SC" → "Rio Negro/SC";
+    "PIRECAL Guarani/GO" → "Guarani/GO"), ignorando acento, caixa e
+    pontuação. Só corta se a primeira palavra é do cliente e ao menos uma
+    das cortadas o identifica (não é "LTDA", "DE"...). Se não sobra nada,
+    devolve o nome como estava."""
     nome = "" if nome is None or (isinstance(nome, float) and pd.isna(nome)) else str(nome).strip()
-    cliente = _normalizar_texto(nome_cliente)
-    if not cliente or not _normalizar_texto(nome).startswith(cliente):
+    if not nome or not isinstance(nome_cliente, str) or not nome_cliente.strip():
         return nome
-    # o nome normalizado tem o mesmo nº de caracteres do original na parte
-    # sem acento; recorta pelo tamanho e limpa o separador
-    resto = nome[len(str(nome_cliente).strip()):].lstrip(" -–—:/|").strip()
+    palavras = _palavras_do_cliente(nome_cliente)
+    fim_corte, identifica = None, False
+    for m in re.finditer(r"[A-Z0-9]+", _texto_alinhado(nome)):
+        if m.group() not in palavras:
+            break
+        fim_corte = m.end()
+        identifica |= m.group() not in _SUFIXOS_SOCIETARIOS and len(m.group()) >= 3
+    if fim_corte is None or not identifica:
+        return nome
+    resto = nome[fim_corte:].strip(_SEPARADORES + " ")
     return resto or nome
+
+
+def nome_curto_bomba(nome, nome_cliente, nome_posto=None) -> str:
+    """Nome da bomba sem o que a tela já mostra ao lado: o cliente (título da
+    aba) e, quando informado, o posto (rótulo do bloco), em qualquer ponto do
+    nome — "CL1875 - Pirecal Taguatinga/TO" no posto "PIRECAL Taguatinga/TO"
+    vira "CL1875"; "Tietê/SP - Comboio S10" no posto "Tietê/SP - Matriz",
+    "Comboio S10". Pode voltar vazio: a bomba se chama como o posto."""
+    def _palavras(t):
+        return re.findall(r"[A-Z0-9]+", _normalizar_texto(t))
+
+    curto = _sem_prefixo_do_cliente(nome, nome_cliente)
+    if isinstance(nome_posto, str) and nome_posto.strip():
+        posto_curto = _sem_prefixo_do_cliente(nome_posto, nome_cliente)
+        if _palavras(curto) == _palavras(posto_curto):
+            return ""
+        # o posto inteiro, e depois cada pedaço dele ("Tietê/SP", "Matriz"),
+        # inclusive sem o "/UF" ("São Gonçalo 1" no posto "São Gonçalo/RJ")
+        pedacos = [posto_curto] + [x.strip() for x in re.split(r"\s+[-–—]\s+", posto_curto)]
+        pedacos += [re.sub(r"\s*/\s*[A-Za-z]{2}$", "", x) for x in pedacos]
+        for pedaco in dict.fromkeys(pedacos):
+            if len(re.sub(r"[^A-Za-z]", "", pedaco)) >= 3:
+                curto = _sem_trecho(curto, pedaco)
+        if not curto:
+            return ""
+    # pedaço (entre " - ") que só tem palavras do cliente: "CL1875 - Pirecal" → "CL1875"
+    palavras_cli = _palavras_do_cliente(nome_cliente)
+    pedacos = re.split(r"\s+[-–—]\s+", curto)
+    mantidos = [x for x in pedacos if not (_palavras(x) and set(_palavras(x)) <= palavras_cli)]
+    return " - ".join(mantidos) if mantidos else curto
+
+
+def rotulo_bloco_posto(nome_posto, nome_cliente, cidade=None, uf=None) -> str:
+    """Rótulo do bloco de um posto na linha do tempo: o nome sem o cliente e,
+    quando o nome não diz onde fica, " - Cidade/UF" do cadastro do posto."""
+    curto = _sem_prefixo_do_cliente(nome_posto, nome_cliente)
+    return curto + sufixo_local(nome_posto, cidade, uf)
 
 
 def grupos_das_bombas(resumo: pd.DataFrame) -> dict:
@@ -1556,7 +1639,9 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.Data
             nome_posto = info.at[bomba, "posto_nome"] if bomba in info.index else None
             # "OURO NEGRO TRANSPORTES E TURISMO - Rio das ostras/RJ" → "Rio das ostras/RJ":
             # o cliente já está no título da aba
-            grupo = (_truncar(_sem_prefixo_do_cliente(nome_posto, nome_cliente), 40)
+            grupo = (_truncar(rotulo_bloco_posto(nome_posto, nome_cliente, info.at[bomba, "posto_cidade"]
+                                                 if "posto_cidade" in info else None,
+                                                 info.at[bomba, "posto_uf"] if "posto_uf" in info else None), 44)
                      if isinstance(nome_posto, str) and nome_posto.strip() else posto)
             linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank_posto, "sub": rank_pagante,
                            "inicio": g["inicio"].min()})
@@ -1684,25 +1769,18 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         info["situacao"].isin(SITUACOES_ATIVAS), info.get("dias_sem_sinal", pd.Series(0, index=info.index)))
         if inst and not ok and pd.notna(d)}
     def _nome_na_linha(b, n):
-        """Nome da bomba sem o que já está escrito ao lado: o cliente (título
-        da aba) e, agrupando por posto, o nome do posto (rótulo do bloco) —
-        "OURO NEGRO ... - SJB/RJ S10" no posto "OURO NEGRO ... - SJB/RJ" vira
-        "S10"; se não sobra nada, fica "Bomba"."""
-        curto = _sem_prefixo_do_cliente(n, nome_cliente)
-        posto = postos.get(b)
-        if agrupar == "posto" and isinstance(posto, str) and posto.strip():
-            posto_curto = _sem_prefixo_do_cliente(posto, nome_cliente)
-            if _normalizar_texto(curto) == _normalizar_texto(posto_curto):
-                return ""
-            curto = _sem_prefixo_do_cliente(curto, posto_curto)
-        return _truncar(curto, 38)
+        """Nome da bomba sem o que já está escrito ao lado (ver
+        nome_curto_bomba): o cliente e, agrupando por posto, o posto do bloco.
+        Vazio = a bomba se chama como o posto."""
+        return _truncar(nome_curto_bomba(n, nome_cliente, postos.get(b) if agrupar == "posto" else None), 38)
 
     def _rotulo_linha(b, nome):
         # nome vazio (= o posto do bloco) fica só o ID: "Bomba (#id)" não diz nada
         return f"{nome} (#{b})" if nome else f"#{b}"
 
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _prefixo_posto(b, n)
-               + _rotulo_linha(b, (lambda nl: nl + sufixo_local(n, cidades.get(b), ufs.get(b)) if nl else "")(
+               + _rotulo_linha(b, (lambda nl: nl + (sufixo_local(n, cidades.get(b), ufs.get(b))
+                                                   if agrupar != "posto" else "") if nl else "")(
                    _nome_na_linha(b, n) if isinstance(n, str) and n.strip() else ""))
                # bombas do mesmo equipamento (duplo/triplo/quádruplo): #2/#3/#4
                + (f" · #{tipo_canal[b]}" if b in tipo_canal else "")
