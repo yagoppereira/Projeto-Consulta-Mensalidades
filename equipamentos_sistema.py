@@ -30,6 +30,7 @@
 # ============================================================================
 
 import concurrent.futures
+import html
 import re
 import unicodedata
 
@@ -1785,6 +1786,48 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     return cores
 
 
+def legenda_html(fig) -> str:
+    """Legenda do gráfico como HTML (uma faixa de itens que quebra linha
+    sozinha), montada dos próprios traços: barra = quadrado na cor (com
+    contorno quando a barra tem contorno, hachura quando tem padrão), linha =
+    traço na cor/estilo, estrela = ☆. Usada no lugar da legenda do Plotly,
+    que se sobrepunha às barras."""
+    itens, vistos = [], set()
+    for tr in fig.data:
+        nome = getattr(tr, "name", None)
+        if not nome or tr.showlegend is False or nome in vistos:
+            continue
+        vistos.add(nome)
+        if tr.type == "bar":
+            cor = tr.marker.color
+            cor = cor[0] if isinstance(cor, (list, tuple)) and cor else cor
+            borda = tr.marker.line.color if tr.marker.line and (tr.marker.line.width or 0) > 0 else None
+            hachura = bool(tr.marker.pattern and tr.marker.pattern.shape)
+            fundo = (f"repeating-linear-gradient(45deg, {cor} 0 3px, {COR_FUNDO_GRAFICO} 3px 5px)"
+                     if hachura else (cor or COR_SERIAL_ANTERIOR))
+            simbolo = (f"<span style='display:inline-block;width:12px;height:12px;background:{fundo};"
+                       f"border:{'2px solid ' + borda if borda and borda != cor else '0'};"
+                       "border-radius:2px;vertical-align:-1px'></span>")
+        elif "markers" in (tr.mode or "") and getattr(tr.marker, "symbol", None) == "star":
+            simbolo = "<span style='font-size:14px;line-height:1'>☆</span>"
+        elif (tr.mode or "") == "markers":
+            # marcador de legenda (ex.: quadrado com contorno vermelho do pagante sinalizado)
+            cor = tr.marker.color if isinstance(tr.marker.color, str) else COR_FUNDO_GRAFICO
+            borda = tr.marker.line.color if tr.marker.line and (tr.marker.line.width or 0) > 0 else None
+            simbolo = (f"<span style='display:inline-block;width:12px;height:12px;background:{cor};"
+                       f"border:{'2px solid ' + borda if borda else '0'};border-radius:2px;vertical-align:-1px'></span>")
+        else:
+            cor = tr.line.color if tr.line and tr.line.color else COR_TEXTO_GRAFICO
+            estilo = "dotted" if tr.line and tr.line.dash in ("dot", "dash") else "solid"
+            simbolo = (f"<span style='display:inline-block;width:20px;border-top:2px {estilo} {cor};"
+                       "vertical-align:4px'></span>")
+        itens.append(f"<span style='white-space:nowrap;margin-right:16px'>{simbolo} {html.escape(nome)}</span>")
+    if not itens:
+        return ""
+    return ("<div style='display:flex;flex-wrap:wrap;row-gap:4px;font-size:0.82em;"
+            f"padding:6px 2px 2px 2px'>{''.join(itens)}</div>")
+
+
 def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None, canais=None,
                     agrupar: str = "pagante"):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
@@ -1975,26 +2018,14 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
             hoverinfo="text",
         ))
 
-    # a legenda fica ACIMA do gráfico e precisa de espaço próprio: com poucas
-    # bombas (gráfico baixo) e vários pagantes ela não cabia na margem e o
-    # Plotly a empurrava pra cima das barras. A margem de cima cresce com o nº
-    # de linhas que a legenda ocupa (estimado pela largura dos nomes numa área
-    # de ~900 px, pra sobrar folga em telas estreitas)
-    nomes_legenda = [tr.name for tr in fig.data if tr.name and tr.showlegend is not False]
-    linhas_legenda, largura_linha = 1, 0
-    for nome in nomes_legenda:
-        w = 7 * len(nome) + 45
-        if largura_linha and largura_linha + w > 900:
-            linhas_legenda, largura_linha = linhas_legenda + 1, 0
-        largura_linha += w
-    margem_topo = 16 + 24 * linhas_legenda
-    _layout_base(fig, 150 + 30 * len(ordem) + margem_topo)
+    # a legenda NÃO fica dentro do gráfico: o Plotly decide sozinho onde pôr
+    # uma legenda horizontal e, conforme a largura da tela e o nº de itens, ela
+    # caía por cima das barras. Ela sai do gráfico (legenda_html) e o app a
+    # desenha logo acima, como texto, sempre no mesmo lugar
+    _layout_base(fig, 150 + 30 * len(ordem))
     fig.update_layout(
-        barmode="overlay", hovermode="closest",
-        margin=dict(l=10, r=30, t=margem_topo, b=40),
-        # legenda só explica as cores; quem filtra é o painel de filtros
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
-                    itemclick=False, itemdoubleclick=False),
+        barmode="overlay", hovermode="closest", showlegend=False,
+        margin=dict(l=10, r=30, t=10, b=40),
         xaxis=dict(type="date"),
         yaxis=dict(autorange="reversed", automargin=True, showgrid=False, showdividers=True,
                    dividercolor=COR_GRADE, dividerwidth=1),
@@ -2387,9 +2418,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         if periodos.empty:
             st.caption("Nenhuma bomba do filtro abasteceu no período.")
         else:
-            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
-                                            transferencias_f, canais_f, agrupar),
-                            use_container_width=True)
+            fig_periodos = plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
+                                           transferencias_f, canais_f, agrupar)
+            # legenda como texto, acima do gráfico (ver legenda_html)
+            st.markdown(legenda_html(fig_periodos), unsafe_allow_html=True)
+            st.plotly_chart(fig_periodos, use_container_width=True)
 
     st.markdown("**Bombas do cliente** (todo o período" + (", com o filtro" if filtro_ativo else "")
                 + (", posto a posto" if agrupar == "posto" else "") + ")")
